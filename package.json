@@ -1,0 +1,41 @@
+{
+  "name": "equilibra-swap",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EquilibraSwap - Asymmetric AMM with concentrated liquidity",
+  "scripts": {
+    "compile": "hardhat clean && hardhat compile --show-stack-traces",
+    "test": "ts-node scripts/test.ts",
+    "test:ci": "ts-node scripts/test.ts all",
+    "coverage": "SOLIDITY_COVERAGE=true hardhat coverage",
+    "deploy": "npx hardhat run ./scripts/deploy/core.ts --network $npm_config_network",
+    "deploy:pools": "npx hardhat run ./scripts/deploy/create-pool.ts --network $npm_config_network",
+    "deploy:verify": "npx hardhat run ./scripts/deploy/verify.ts --network $npm_config_network",
+    "lint-fix": "prettier --write --plugin=prettier-plugin-solidity 'contracts/**/*.sol' && prettier --write 'scripts/**/*.ts' && prettier --write 'test/**/*.ts'",
+    "simulator:clean": "cargo clean --manifest-path simulator/Cargo.toml",
+    "simulator:run": "cargo run --manifest-path simulator/Cargo.toml --bin equilibra-offchain-app --release",
+    "simulator:test": "cargo test --manifest-path simulator/Cargo.toml --release",
+    "simulator:fetch-prices": "ts-node scripts/fetch-prices-binance-long.ts",
+    "audit": "npm run audit:prod",
+    "audit:prod": "npm audit --omit=dev --audit-level=high",
+    "audit:all": "npm audit --audit-level=high",
+    "audit:rust": "cargo audit --file simulator/Cargo.lock"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.2",
+    "dotenv": "^17.2.4",
+    "hardhat": "^2.28.5",
+    "prettier-plugin-solidity": "^2.2.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "@prb/math": "^4.1.1",
+    "solady": "^0.1.26"
+  },
+  "allowScripts": {
+    "keccak@3.0.4": true,
+    "secp256k1@4.0.4": true
+  }
+}

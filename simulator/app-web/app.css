@@ -1,0 +1,1044 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #21262d;
+  --line: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --ok: #2dcc70;
+  --warn: #f2a83b;
+  --bad: #e25555;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.brand {
+  grid-column: 1;
+  justify-self: start;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--muted);
+}
+
+.topbar nav {
+  grid-column: 2;
+  justify-self: center;
+  display: flex;
+  gap: 14px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+}
+
+.topbar nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 14px 28px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.topbar nav a.active,
+.topbar nav a:hover {
+  color: var(--text);
+  border-color: #3f4854;
+  background: var(--panel-2);
+}
+
+.topbar-aux {
+  grid-column: 3;
+  justify-self: end;
+}
+
+.topbar-aux .run-history-link {
+  color: var(--text);
+  text-decoration: none;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.topbar-aux .run-history-link:hover {
+  border-color: #3f4854;
+  background: var(--panel-2);
+}
+
+#app {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.page-title {
+  margin: 4px 0 14px;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  min-width: 0;
+}
+
+.preset-zone {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f141b;
+}
+
+.preset-zone-equilibra {
+  border-color: #2d5b85;
+  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.2);
+}
+
+.preset-zone-curve {
+  border-color: #6c3d86;
+  box-shadow: inset 0 0 0 1px rgba(163, 113, 247, 0.2);
+}
+
+.card h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+
+.section-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.setup-top-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.15fr);
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 4px;
+}
+
+.setup-period-col,
+.setup-runtime-col {
+  min-width: 0;
+}
+
+.setup-runtime-col {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  align-content: start;
+}
+
+.runtime-controls-row {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(0, 1fr)
+    minmax(0, 0.95fr);
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.field-compact {
+  margin: 0;
+}
+
+.field-compact label {
+  font-size: 11px;
+  min-height: 26px;
+  display: flex;
+  align-items: flex-end;
+  line-height: 1.1;
+}
+
+.field-compact input,
+.field-compact select {
+  padding: 6px 8px;
+  min-height: 34px;
+}
+
+.period-preset-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.period-controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.period-date-grid {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.period-date-grid .field {
+  width: 190px;
+  max-width: 190px;
+  margin: 0;
+}
+
+.period-date-input {
+  width: 190px;
+  max-width: 190px;
+  padding: 6px 8px;
+}
+
+.period-preset-actions-right {
+  margin-top: 0;
+  justify-content: flex-start;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.period-preset-btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.period-preset-btn:hover {
+  border-color: #3f4854;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.section-head h3 {
+  margin: 0;
+}
+
+.section-head .check {
+  margin: 0;
+}
+
+/* Per-AMM section collapse toggle. Only rendered for UniswapV2 and
+ * Curve — Equilibra has no toggle and is always expanded. */
+.section-toggle {
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  color: inherit;
+  font-weight: 700;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.section-toggle:hover {
+  border-color: #3f4854;
+}
+
+/* Hide every direct child of the AMM section EXCEPT the head row
+ * (which carries the collapse toggle, title, and on/off checkbox).
+ * Works regardless of how many body wrappers the section has —
+ * Curve has multiple sibling divs (mode select + preset pair grid),
+ * UniswapV2 has a single section-grid. */
+.preset-zone.is-collapsed > *:not(.section-head) {
+  display: none;
+}
+
+.preset-zone.is-collapsed .section-head {
+  margin-bottom: 0;
+}
+
+.amm-title {
+  font-weight: 700;
+}
+
+.amm-title-equilibra {
+  color: #2dcc70;
+}
+
+.amm-title-curve {
+  color: #ff4fb3;
+}
+
+.amm-title-uniswap {
+  color: #4bc8ff;
+}
+
+.preset-pair-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.token-preset-col {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: #0b121a;
+}
+
+.preset-zone.amm-disabled {
+  opacity: 0.56;
+  filter: grayscale(0.2);
+}
+
+.token-label {
+  color: #f2a83b;
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.token-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.token-label-row .token-label {
+  margin-bottom: 0;
+}
+
+.fields-stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.alpha-beta-import-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.alpha-beta-import-grid .field {
+  margin: 0;
+}
+
+.alpha-beta-import-grid .import-btn {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: 100%;
+  height: auto;
+  min-height: 58px;
+  margin-block: 4px;
+  align-self: center;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #2f80df;
+  background: linear-gradient(180deg, #2f80df 0%, #1669c9 58%, #145cae 100%);
+  color: #e6f2ff;
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.alpha-beta-import-grid .import-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, #3a8ef2 0%, #1f74d5 58%, #185fb2 100%);
+  border-color: #4f95eb;
+}
+
+.alpha-beta-import-grid .import-btn:disabled {
+  background: linear-gradient(180deg, #1e2f47 0%, #1a2a43 100%);
+  border-color: #34455c;
+  color: #73829a;
+  cursor: not-allowed;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Horizontal group of related fields (e.g. the fee triple) — one grid
+   row instead of three stacked rows. Collapses back to a column on
+   narrow viewports so inputs stay usable. */
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.field-row .field {
+  margin: 0;
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .field-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.field label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled {
+  background: #141922;
+  color: #7f8a98;
+  border-color: #2b323a;
+  cursor: not-allowed;
+}
+
+textarea {
+  min-height: 220px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.check input {
+  width: auto;
+}
+
+.check-compact {
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0;
+  min-height: 34px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  justify-content: flex-start;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+
+.check-compact span {
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.check-compact input {
+  margin: 0;
+}
+
+.field-check-inline {
+  justify-content: flex-end;
+  padding-top: 0;
+  display: flex;
+  align-items: flex-end;
+}
+
+.field-check-inline .check-compact {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  line-height: 1;
+}
+
+.field-check-inline .check-compact span {
+  line-height: 1;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #3f4854;
+  background: #2b3138;
+}
+
+button.primary {
+  background: #1669c9;
+  border-color: #2f80df;
+}
+
+button.danger {
+  background: #581d26;
+  border-color: #7e2b3a;
+}
+
+iframe.viewer {
+  width: 100%;
+  min-height: 620px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+#app.visualizer-mode {
+  max-width: none;
+  padding: 0;
+}
+
+#app.results-mode {
+  max-width: none;
+  padding: 10px 14px 14px;
+}
+
+.results-fullpage {
+  width: 100%;
+  height: calc(100vh - 88px);
+  min-height: calc(100vh - 88px);
+}
+
+.viewer.results-standalone {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 10px;
+}
+
+.visualizer-fullpage {
+  width: 100%;
+  height: calc(100vh - 56px);
+}
+
+iframe.viewer.standalone {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  display: block;
+}
+
+.info-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+iframe.viewer.info-embedded {
+  width: 100%;
+  min-height: calc(100vh - 190px);
+  border: 0;
+  border-radius: 10px;
+  display: block;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.status-pill.queued,
+.status-pill.running {
+  color: var(--warn);
+}
+
+.status-pill.completed {
+  color: var(--ok);
+}
+
+.status-pill.failed,
+.status-pill.canceled {
+  color: var(--bad);
+}
+
+.progress-wrap {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #0b0f14;
+  overflow: hidden;
+}
+
+.progress {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #2f7fff, #1ba8f0);
+  transition: width 0.2s ease;
+}
+
+.run-top-card {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.run-top-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.run-top-main {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  align-content: start;
+}
+
+.run-top-shard {
+  display: grid;
+  align-content: start;
+}
+
+.run-actions-inline {
+  margin-top: 2px;
+}
+
+.run-msg-inline {
+  margin-top: -2px;
+}
+
+/* `pre.log` (the base style) sets a generous `min-height: 280px`
+ * which is appropriate for the long tail-log block but way too tall
+ * for the compact 7-line shard-progress panel. We override at
+ * matching specificity (element + two classes) so the panel sizes
+ * down to its actual content (`completed N/6` + 6 per-AMM lines).
+ * 120px / 150px keeps the right column visually balanced with the
+ * slim left column (Status + Progress + button). */
+pre.log.log-shard-compact {
+  min-height: 120px;
+  max-height: 150px;
+}
+
+.shard-report-generation-notice {
+  display: block;
+  margin-top: 8px;
+  color: #2dcc70;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: pre-line;
+}
+
+pre.log.log-tail-wide {
+  height: 288px;
+  min-height: 288px;
+  max-height: 288px;
+}
+
+/* Run-detail console spoiler — header button + collapsible
+ * `<pre id="runLogs">`. The header is always visible; clicking it
+ * toggles `.is-collapsed` on the wrapper which hides the log tail. */
+.run-console {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.run-console-toggle {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: border-color 0.15s, color 0.15s;
+}
+.run-console-toggle:hover {
+  color: var(--text);
+  border-color: #3f4854;
+}
+.run-console-sym {
+  display: inline-block;
+  width: 12px;
+  text-align: center;
+  font-weight: 700;
+}
+.run-console.is-collapsed > pre.log {
+  display: none;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Prominent full-width error banner (e.g. the /api/config/limits fetch
+ * failed and run submission is disabled). */
+.banner-error {
+  border: 1px solid var(--bad);
+  border-radius: 10px;
+  /* rgba(226, 85, 85, 0.12) flattened over the page background so the
+   * declared colors are verifiably high-contrast. */
+  background: #271418;
+  color: #ff9d9d;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* Error emphasis for inline status messages (setupMsg / runMsg).
+ * The compound selector out-specifies the base `.muted` rule those
+ * elements also carry, regardless of source order. */
+.msg-error,
+.muted.msg-error {
+  color: var(--bad);
+}
+
+/* Per-field validation feedback: red border on the offending input
+ * plus a small message injected directly after it. */
+input.input-invalid,
+select.input-invalid,
+textarea.input-invalid {
+  border-color: var(--bad);
+}
+
+.field-error-msg {
+  color: var(--bad);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+pre.log {
+  margin: 0;
+  width: 100%;
+  max-width: 100%;
+  min-height: 280px;
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f141b;
+  padding: 10px;
+  font:
+    12px/1.4 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace;
+}
+
+.lp-live-chart {
+  display: block;
+  width: 100%;
+  height: 190px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f141b;
+}
+
+.grid-2.live-lp-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  margin-top: 14px;
+}
+
+.lp-live-chart-large {
+  height: 520px;
+}
+
+.price-live-block {
+  margin-top: 10px;
+}
+
+.price-live-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.price-live-chart {
+  height: 320px;
+}
+
+.price-live-legend {
+  margin-top: 6px;
+}
+
+.lp-live-legend {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.lp-live-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.lp-live-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.kv div:nth-child(odd) {
+  color: var(--muted);
+}
+
+/* The runs table has 7 columns with nowrap delta cells — scroll it
+ * inside its own container on narrow viewports instead of letting the
+ * whole page body scroll horizontally. */
+#runsTableWrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+thead th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+  padding: 8px;
+}
+
+tbody td {
+  border-bottom: 1px solid #262c33;
+  padding: 8px;
+}
+
+.run-delta-cell {
+  white-space: nowrap;
+}
+
+.run-delta-amm {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.run-delta-sep {
+  color: var(--muted);
+}
+
+.run-delta-pos {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.run-delta-neg {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.run-delta-zero {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.actions-inline {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.actions-inline a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button.inline-btn {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+@media (max-width: 1280px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .grid-2.live-lp-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .alpha-beta-import-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .alpha-beta-import-grid .import-btn {
+    grid-column: auto;
+    grid-row: auto;
+    min-height: 38px;
+  }
+
+  .setup-top-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-controls-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .field-check-inline {
+    grid-column: 1 / -1;
+    padding-top: 0;
+  }
+
+  .field-check-inline .check-compact span {
+    white-space: normal;
+  }
+
+  .period-controls {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .period-date-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .period-date-grid .field,
+  .period-date-input {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .period-preset-actions-right {
+    justify-content: flex-start;
+    margin-top: 2px;
+  }
+
+  .run-top-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  pre.log.log-shard-compact {
+    min-height: 100px;
+    max-height: 140px;
+  }
+
+  pre.log.log-tail-wide {
+    height: 240px;
+    min-height: 240px;
+    max-height: 240px;
+  }
+
+  .lp-live-chart-large {
+    height: 340px;
+  }
+
+  .price-live-chart {
+    height: 220px;
+  }
+}

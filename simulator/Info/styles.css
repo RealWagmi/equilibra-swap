@@ -1,0 +1,705 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-soft: #21262d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --border: #30363d;
+  --anchor: #d29922;
+  --depletion: #f0883e;
+  --surplus: #3fb950;
+  --mirror: #8b949e;
+  --accent: #58a6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Noto Sans", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.5;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  background: linear-gradient(180deg, #161b22, #0f141b);
+  padding: 20px 16px;
+  overflow: auto;
+}
+
+.brand-block {
+  margin: -20px -16px 2px;
+}
+
+.brand-logo-wrap {
+  overflow: hidden;
+  background: #0f141b;
+}
+
+.brand-logo {
+  width: 100%;
+  max-width: none;
+  display: block;
+  object-fit: contain;
+  margin: -5% 0;
+}
+
+.brand-sub {
+  margin-top: 6px;
+  padding: 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+nav {
+  margin-top: 20px;
+  display: grid;
+  gap: 8px;
+}
+
+nav a {
+  color: var(--text);
+  text-decoration: none;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+nav a:hover {
+  background: var(--panel-soft);
+}
+
+.side-card {
+  margin-top: 18px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  font-size: 13px;
+}
+
+.side-card h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.content {
+  padding: 26px;
+  max-width: 1260px;
+}
+
+section {
+  margin-bottom: 26px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 16px;
+  padding: 20px;
+}
+
+.hero {
+  background: radial-gradient(1200px 400px at 10% -10%, #1e293b, transparent),
+    var(--panel);
+}
+
+h1 {
+  margin: 0 0 10px;
+  font-size: 34px;
+  line-height: 1.15;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 28px;
+}
+
+h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 17px;
+}
+
+.hero-actions {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.btn {
+  display: inline-block;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #1f6feb;
+  color: #ffffff;
+  text-decoration: none;
+  font-size: 13px;
+  border: 1px solid #388bfd;
+}
+
+.btn.ghost {
+  background: #21262d;
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.kpi-grid {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.kpi-grid article {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--panel-soft);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+}
+
+th,
+td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  font-size: 14px;
+}
+
+th {
+  background: #21262d;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.equation-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+
+.equation-grid article,
+.equation-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--panel-soft);
+}
+
+.math-display {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid #1f2937;
+  background: linear-gradient(180deg, #171a22, #12151d);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  overflow-x: auto;
+}
+
+.math-display math {
+  display: block;
+  margin: 6px 0;
+  font-size: 1.14rem;
+  color: #e2e8f0;
+}
+
+.math-display math:first-child {
+  margin-top: 0;
+}
+
+.math-display math:last-child {
+  margin-bottom: 0;
+}
+
+.math-display mi {
+  font-style: italic;
+}
+
+.math-display mtext {
+  color: #cbd5e1;
+}
+
+pre {
+  margin: 8px 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #dbeafe;
+  overflow: auto;
+  font-size: 13px;
+}
+
+code {
+  font-family: "Consolas", "Menlo", monospace;
+}
+
+.callout {
+  margin-top: 12px;
+  border: 1px solid #1f6feb;
+  border-left: 4px solid var(--accent);
+  background: #0f1a2a;
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.callout.warn {
+  border-color: #7d4e17;
+  border-left-color: #d29922;
+  background: #2a1f10;
+}
+
+.note {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tech-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.control-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--panel-soft);
+}
+
+.control-group label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.control-group input:not([type="range"]) {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.slider-group .slider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+/* Wide slider tile — used for the Market price slider so the user
+ * has more travel for the auto-repeg animation. Spans two grid
+ * columns when the `.controls` track has room; falls back gracefully
+ * on narrow viewports where each tile already takes the full row. */
+.slider-group-wide {
+  grid-column: span 2;
+}
+
+.slider-group output {
+  min-width: 86px;
+  text-align: right;
+  font-family: "Consolas", "Menlo", monospace;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.control-group input[type="range"] {
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: 14px;
+  accent-color: var(--accent);
+  background: transparent;
+}
+
+.preset-buttons {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.preset-buttons button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #21262d;
+  color: var(--text);
+  padding: 7px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.preset-buttons button:hover {
+  background: #30363d;
+}
+
+.preset-buttons button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.preset-buttons button:disabled:hover {
+  background: #21262d;
+}
+
+/* Visible warning strip for API-failure / stale-data states — the
+   Info page must never fail silently (populated by app.js via the
+   `chartStatus` / `presetStatus` elements). */
+.status-note {
+  grid-column: 1 / -1;
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border: 1px solid #6e4b17;
+  border-radius: 6px;
+  background: rgba(210, 153, 34, 0.12);
+  color: var(--anchor);
+  font-size: 13px;
+}
+
+.status-note[hidden] {
+  display: none;
+}
+
+.curve-key {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.curve-key-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.swatch-cp {
+  background: #4aa8ff;
+}
+
+.swatch-eq-dep {
+  background: #f0883e;
+}
+
+.swatch-eq-sur {
+  background: #3fb950;
+}
+
+.swatch-anchor {
+  background: #d29922;
+}
+
+.swatch-mirror {
+  background: #8b949e;
+}
+
+.main-curve-key {
+  margin: 10px 0 12px;
+}
+
+.chart-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.chart-grid.two-up {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+
+.compact-main-charts .chart-card {
+  padding: 10px;
+}
+
+.compact-main-charts .chart-card h3 {
+  margin-bottom: 6px;
+  font-size: 16px;
+}
+
+.xy-toolbar {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.xy-toolbar h3 {
+  margin: 0;
+}
+
+.xy-presets {
+  grid-column: auto;
+  margin: 0;
+}
+
+.xy-layout {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(340px, 0.8fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.xy-card {
+  margin-top: 0;
+}
+
+.xy-card canvas {
+  aspect-ratio: 1 / 1;
+  max-height: 760px;
+}
+
+.chart-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--panel-soft);
+}
+
+canvas {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0f141b;
+}
+
+/* The repeg-bell canvas redraws on every slider input. We pin the
+ * aspect ratio so its CSS height is derived from the parent's width
+ * (and *only* from the parent's width) — without this, `height: auto`
+ * falls back to the canvas's attribute-driven intrinsic aspect
+ * ratio, which our DPR-aware `setupCanvas` rewrites on every frame.
+ * The sub-pixel rounding drift in those rewrites would otherwise
+ * compound into visible vertical growth on every Market-price drag.
+ */
+#envelopeChart {
+  aspect-ratio: 1040 / 420;
+  height: auto;
+}
+
+.sample-table-wrap {
+  margin-top: 12px;
+}
+
+.xy-layout .sample-table-wrap {
+  margin-top: 4px;
+}
+
+.xy-layout .sample-table-wrap h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.xy-layout #xySampleTable th,
+.xy-layout #xySampleTable td {
+  font-size: 12px;
+  padding: 6px 8px;
+  line-height: 1.25;
+}
+
+.side-controls {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.side-controls h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.side-controls .control-group {
+  margin-bottom: 8px;
+  padding: 8px;
+}
+
+.side-controls .slider-group output {
+  min-width: 70px;
+  font-size: 12px;
+}
+
+.side-controls .slider-group label {
+  font-size: 14px;
+}
+
+.faq-item {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 10px;
+}
+
+.faq-item:first-of-type {
+  border-top: none;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.pitch {
+  background: linear-gradient(135deg, #0f1d2d, #161b22);
+}
+
+@media (max-width: 980px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .content {
+    padding: 16px;
+  }
+
+  .xy-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .xy-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ========== New: SETUP table & inline formula (post-2026 rewrite) ========== */
+.setup-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0 24px;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.setup-table thead {
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.setup-table th,
+.setup-table td {
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.setup-table th {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.setup-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.setup-table tbody tr:hover {
+  background: rgba(88, 166, 255, 0.04);
+}
+
+.setup-table code {
+  background: rgba(88, 166, 255, 0.08);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.formula {
+  margin: 8px 0;
+  padding: 10px 14px;
+  background: var(--panel-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 14px;
+  color: var(--accent);
+  text-align: center;
+}
+
+.formula code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+.snapshot-card ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+.snapshot-card li {
+  margin: 4px 0;
+}
+
+.snapshot-card code {
+  background: rgba(88, 166, 255, 0.08);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.snapshot-card [data-snap] {
+  color: var(--accent);
+  font-weight: 600;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  margin: 0 4px;
+}
+

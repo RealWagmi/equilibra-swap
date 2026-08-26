@@ -1,0 +1,62 @@
+node_modules
+.env
+
+# Local dev-chain deployment documents (real networks ARE tracked)
+deployments/local-*.json
+
+# Hardhat files
+/cache
+/artifacts
+
+# hardhat-exposed generated test scaffolding (not deployed)
+/contracts-exposed
+
+# TypeChain files
+/typechain
+/typechain-types
+
+# solidity-coverage files
+/coverage
+/coverage.json
+
+
+coverage
+coverage.json
+cache
+
+# IDE
+.idea
+.vscode
+
+# Mac
+.DS_Store
+
+gasReporterOutput.json
+checkpoints/
+
+
+# dotenv
+.env
+.env.local
+.env.*.local
+backup
+.claude
+.codex
+
+# Python venv for Vyper
+.venv
+
+# Anvil (Foundry)
+.anvil.pid
+.anvil.log
+
+runs/
+results/
+# Rust build artifacts (binaries, incremental cache, deps)
+**/target/
+audit/
+# Pre-compiled third-party pool artifacts — local-only, never published
+test/fixtures/curve-artifacts/
+
+# Python bytecode cache
+__pycache__/

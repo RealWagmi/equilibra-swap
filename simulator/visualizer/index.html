@@ -1,0 +1,5107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Equilibra Curve Visualizer</title>
+    <script src="vendor/chart.umd.min.js"></script>
+    <style>
+      :root {
+        --bg-primary: #0d1117;
+        --bg-secondary: #161b22;
+        --bg-tertiary: #21262d;
+        --text-primary: #c9d1d9;
+        --text-secondary: #8b949e;
+        --text-muted: #6e7681;
+        --border-color: #30363d;
+        --accent-blue: #58a6ff;
+        --accent-green: #3fb950;
+        --accent-red: #f85149;
+        --accent-yellow: #d29922;
+        --accent-purple: #a371f7;
+        --accent-orange: #d18616;
+        --spacing-xs: 4px;
+        --spacing-sm: 8px;
+        --spacing-md: 16px;
+        --spacing-lg: 24px;
+        --spacing-xl: 32px;
+        --radius-sm: 4px;
+        --radius-md: 8px;
+        --radius-lg: 12px;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+          sans-serif;
+        background-color: var(--bg-primary);
+        color: var(--text-primary);
+        line-height: 1.6;
+        overflow-x: hidden;
+      }
+
+      .container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: var(--spacing-lg);
+      }
+
+      .workspace-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "main";
+        gap: var(--spacing-lg);
+        align-items: start;
+      }
+      .workspace-main {
+        grid-area: main;
+        min-width: 0;
+        overflow-x: hidden;
+      }
+      .workspace-sidebar {
+        display: none;
+      }
+      .workspace-sidebar .controls-section {
+        margin-bottom: 0;
+      }
+      .workspace-sidebar .overlay-row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: var(--spacing-sm);
+      }
+      .workspace-sidebar .overlay-row .slider-group {
+        width: 100%;
+        flex: 1 1 auto;
+      }
+      .workspace-sidebar .pw-sliders {
+        grid-template-columns: 1fr;
+        width: 100%;
+      }
+      .workspace-sidebar .solidity-params {
+        width: 100%;
+        min-width: 0;
+      }
+      .workspace-sidebar #pwSolidityParams {
+        display: block;
+      }
+      .workspace-sidebar #pwSolidityParams .sol-label {
+        display: block;
+        margin-bottom: var(--spacing-xs);
+      }
+      .workspace-sidebar #pwSolidityParams .solidity-line {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: var(--spacing-sm);
+        margin-bottom: 2px;
+      }
+      .workspace-sidebar #pwSolidityParams .solidity-line span {
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+      .workspace-sidebar #pwSolidityParams code {
+        white-space: nowrap;
+        overflow-wrap: normal;
+        word-break: normal;
+        max-width: none;
+      }
+      .workspace-sidebar #pwSolidityParams .solidity-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--spacing-xs);
+        margin-top: var(--spacing-xs);
+        width: 100%;
+      }
+      .workspace-sidebar #pwSolidityParams .btn-copy {
+        margin-left: 0;
+      }
+      .workspace-sidebar .pw-paste-panel-wide {
+        flex: 1 0 100%;
+        width: 100%;
+        margin-top: var(--spacing-xs);
+        margin-bottom: var(--spacing-xs);
+      }
+      .workspace-sidebar .pw-paste-panel-wide .pw-paste-row {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-xs);
+        width: 100%;
+      }
+      .workspace-sidebar .pw-paste-panel-wide #pwPasteInput {
+        flex: 1 1 auto;
+        min-width: 0;
+        width: 100%;
+      }
+      .workspace-sidebar .pw-paste-panel-wide #pwPasteStatus {
+        display: block;
+        margin-top: 4px;
+      }
+      /* Same paste layout rules when controls are relocated from sidebar to main */
+      #pwSolidityParams .solidity-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: var(--spacing-xs);
+        margin-left: auto;
+        width: auto;
+        flex: 0 0 auto;
+      }
+      #pwSolidityParams .solidity-actions .btn {
+        margin-left: 0;
+      }
+      .pw-paste-panel-wide {
+        flex: 1 0 100%;
+        width: 100%;
+        min-width: 0;
+        margin-top: var(--spacing-xs);
+        margin-bottom: var(--spacing-xs);
+      }
+      .pw-paste-panel-wide .pw-paste-row {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-xs);
+        width: 100%;
+        min-width: 0;
+      }
+      .pw-paste-panel-wide #pwPasteInput {
+        flex: 1 1 auto;
+        min-width: 0;
+        width: 100%;
+      }
+      .pw-paste-panel-wide #pwPasteStatus {
+        display: block;
+        margin-top: 4px;
+      }
+      .pw-footer-actions {
+        justify-content: flex-end;
+      }
+      .workspace-sidebar .overlay-row .overlay-row {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .btn {
+        padding: 6px 16px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        cursor: pointer;
+        font-size: 0.85rem;
+        white-space: nowrap;
+      }
+      .btn:hover {
+        border-color: var(--accent-blue);
+        color: var(--accent-blue);
+      }
+      .btn.active {
+        background: var(--accent-blue);
+        color: #fff;
+        border-color: var(--accent-blue);
+      }
+
+      /* Controls */
+      .controls-section {
+        padding: var(--spacing-md) var(--spacing-lg);
+        background: var(--bg-secondary);
+        border-radius: var(--radius-md);
+        margin-bottom: var(--spacing-lg);
+      }
+      .controls-section h2 {
+        font-size: 1rem;
+        margin-bottom: var(--spacing-md);
+        color: var(--text-secondary);
+      }
+      .controls-inline-main {
+        margin-bottom: 0;
+        min-width: 0;
+        overflow-x: hidden;
+      }
+      .controls-inline-main .overlay-row {
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--spacing-sm) var(--spacing-md);
+        min-width: 0;
+      }
+      .controls-inline-main .amm-toggle-row {
+        gap: 6px 10px;
+      }
+      .controls-inline-main .curve-row,
+      .controls-inline-main .eq-top-row {
+        gap: 6px 10px;
+        align-items: center;
+      }
+      .controls-inline-main .amm-toggle-row + .curve-row,
+      .controls-inline-main .curve-row + .eq-top-row {
+        border-top: none;
+        padding-top: 6px;
+      }
+      .controls-inline-main .overlay-row.curve-row .slider-group,
+      .controls-inline-main .overlay-row.eq-top-row .slider-group {
+        flex: 0 0 auto;
+        min-width: 0;
+        gap: 6px;
+      }
+      .controls-inline-main .overlay-row.curve-row .slider-group label,
+      .controls-inline-main .overlay-row.eq-top-row .slider-group label {
+        min-width: 0;
+        white-space: nowrap;
+      }
+      .controls-inline-main .curve-row .curve-toggle {
+        white-space: nowrap;
+        margin-right: 2px;
+      }
+      .controls-inline-main .eq-top-row .preset-field {
+        margin-left: 2px;
+      }
+      .controls-inline-main .overlay-row .slider-group {
+        flex: 1 1 300px;
+        min-width: 220px;
+      }
+      .controls-inline-main .pw-sliders {
+        grid-template-columns: 1fr;
+        gap: 6px 0;
+      }
+      .controls-inline-main .pw-sliders .slider-group {
+        display: grid;
+        grid-template-columns: minmax(54px, auto) minmax(0, 1fr) minmax(
+            58px,
+            72px
+          );
+        align-items: center;
+        gap: var(--spacing-sm);
+        min-width: 0;
+      }
+      .controls-inline-main .pw-sliders .slider-group label {
+        min-width: 0;
+      }
+      .controls-inline-main .pw-sliders .slider-group .value {
+        min-width: 56px;
+        justify-self: end;
+      }
+      .controls-inline-main .pw-sliders .slider-group.has-fine-input {
+        grid-template-columns: minmax(54px, auto) minmax(0, 1fr) minmax(
+            120px,
+            132px
+          );
+      }
+      .controls-inline-main .pw-sliders .slider-group.has-fine-input .value {
+        display: none !important;
+      }
+      .controls-inline-main
+        .pw-sliders
+        .slider-group.has-fine-input
+        input[type="number"] {
+        width: 100% !important;
+        min-width: 0;
+        margin: 0;
+        padding: 4px 6px;
+      }
+      .sliders-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: var(--spacing-md) var(--spacing-xl);
+        margin-bottom: var(--spacing-md);
+      }
+
+      .slider-group {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-sm);
+      }
+      .slider-group label {
+        font-family: monospace;
+        font-size: 0.9rem;
+        color: var(--accent-blue);
+        min-width: 28px;
+      }
+      .slider-group input[type="range"] {
+        flex: 1;
+        height: 6px;
+        -webkit-appearance: none;
+        appearance: none;
+        background: var(--bg-tertiary);
+        border-radius: 3px;
+        outline: none;
+      }
+      .slider-group input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--accent-blue);
+        cursor: pointer;
+      }
+      .slider-group input[type="range"]::-moz-range-thumb {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--accent-blue);
+        cursor: pointer;
+        border: none;
+      }
+      .slider-group .value {
+        font-family: monospace;
+        font-size: 0.85rem;
+        min-width: 42px;
+        text-align: right;
+        color: var(--text-primary);
+      }
+
+      /* Solidity params bar */
+      .solidity-params {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-sm);
+        padding: var(--spacing-sm) var(--spacing-md);
+        margin-bottom: var(--spacing-md);
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        font-family: monospace;
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        flex-wrap: wrap;
+      }
+      .solidity-params .sol-label {
+        color: var(--accent-yellow);
+        white-space: nowrap;
+        margin-right: var(--spacing-xs);
+      }
+      .solidity-params code {
+        color: var(--accent-green);
+        background: rgba(63, 185, 80, 0.08);
+        padding: 1px 4px;
+        border-radius: 2px;
+      }
+      .btn-copy {
+        padding: 2px 8px;
+        font-size: 0.75rem;
+        margin-left: auto;
+      }
+
+      .presets-row {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-sm);
+        margin-bottom: var(--spacing-md);
+        flex-wrap: wrap;
+      }
+      .presets-row span {
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        margin-right: var(--spacing-sm);
+      }
+
+      .overlay-row {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-md);
+        padding-top: var(--spacing-sm);
+        border-top: 1px solid var(--border-color);
+      }
+      .overlay-row label {
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+      .overlay-row input[type="checkbox"] {
+        cursor: pointer;
+        accent-color: var(--accent-orange);
+      }
+      .overlay-row .slider-group {
+        flex: 0 0 250px;
+      }
+      .overlay-row .slider-group label {
+        color: var(--accent-orange);
+      }
+      .pw-sliders {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px 16px;
+        width: 100%;
+      }
+      .pw-sliders .slider-group {
+        flex: unset;
+      }
+      .pw-sliders .slider-group.has-fine-input {
+        gap: 6px;
+      }
+      .pw-sliders .slider-group.has-fine-input input[type="range"] {
+        flex: 1 1 0;
+        min-width: 0;
+        margin-right: 2px;
+      }
+      .pw-sliders .slider-group.has-fine-input input[type="number"] {
+        flex: 0 0 112px;
+        min-width: 112px;
+        width: 112px;
+        margin-right: 4px;
+        padding: 3px 4px;
+        height: 24px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        color: var(--text-primary);
+        font-family: monospace;
+        font-size: 0.8rem;
+        appearance: auto;
+        -webkit-appearance: auto;
+        -moz-appearance: number-input;
+      }
+      .pw-sliders
+        .slider-group.has-fine-input
+        input[type="number"]::-webkit-inner-spin-button,
+      .pw-sliders
+        .slider-group.has-fine-input
+        input[type="number"]::-webkit-outer-spin-button {
+        -webkit-appearance: auto;
+        opacity: 1;
+        margin: 0;
+      }
+      .pw-sliders .slider-group.has-fine-input .value {
+        display: none !important;
+      }
+
+      /* Charts grid */
+      .charts-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: var(--spacing-lg);
+        margin-bottom: var(--spacing-lg);
+        min-width: 0;
+      }
+      /* Children default to spanning the full row; only the explicitly
+       * paired Slippage / Liquidity cards opt into single-column layout.
+       * Keeps the Coverage chart and the relocated Controls section
+       * full-width without extra markup. */
+      .charts-grid > * {
+        grid-column: 1 / -1;
+        min-width: 0;
+      }
+      .charts-grid > .chart-container-pair-left,
+      .charts-grid > .chart-container-pair-right {
+        grid-column: auto;
+      }
+      .chart-container {
+        background: var(--bg-secondary);
+        border-radius: var(--radius-md);
+        padding: var(--spacing-md);
+        min-width: 0;
+        overflow: hidden;
+      }
+      .chart-container h3 {
+        font-size: 0.95rem;
+        font-weight: 500;
+        margin-bottom: var(--spacing-sm);
+        color: var(--text-secondary);
+      }
+      /* Per-card collapse toggle (`+` / `−`). Used by the Price Coverage
+       * card to hide its charts + table behind a spoiler so the page
+       * fits on one screen by default. */
+      .card-toggle {
+        background: transparent;
+        border: 1px solid rgba(48, 54, 61, 0.7);
+        border-radius: 6px;
+        width: 22px;
+        height: 22px;
+        color: var(--text-muted);
+        font-weight: 700;
+        font-size: 14px;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        margin-right: 8px;
+        vertical-align: middle;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+      }
+      .card-toggle:hover {
+        color: var(--text-primary);
+        border-color: rgba(86, 212, 221, 0.7);
+      }
+      /* Hide everything inside the card except the title row when
+       * the card is collapsed. The header row keeps the toggle so
+       * the user can re-expand. */
+      .chart-container.is-collapsed > *:not(h3) {
+        display: none;
+      }
+      .chart-container.is-collapsed h3 {
+        margin-bottom: 0;
+      }
+      .metric-badges {
+        display: flex;
+        /* Compact sizing so all four RMSE / Area-Err badges fit a single
+           row inside a half-width chart card; wrap stays on as a fallback
+           for very narrow viewports. */
+        flex-wrap: wrap;
+        gap: 4px 6px;
+        margin: 0 0 var(--spacing-sm) 0;
+        padding: 6px 8px;
+        background: rgba(13, 17, 23, 0.55);
+        border: 1px solid rgba(48, 54, 61, 0.45);
+        border-radius: var(--radius-sm, 6px);
+        font-size: 0.66rem;
+        line-height: 1.2;
+      }
+      .metric-badge {
+        display: inline-flex;
+        align-items: baseline;
+        /* Grow evenly so the badge row fills the card width instead of
+           leaving a gap on the right; content stays centered per badge. */
+        flex: 1 1 auto;
+        justify-content: center;
+        gap: 4px;
+        padding: 2px 6px 2px 8px;
+        background: rgba(33, 38, 45, 0.7);
+        border: 1px solid rgba(48, 54, 61, 0.55);
+        border-left-width: 3px;
+        border-radius: 4px 999px 999px 4px;
+        white-space: nowrap;
+      }
+      .metric-badge.wide {
+        white-space: normal;
+        max-width: 100%;
+      }
+      .metric-badge .m-label {
+        color: var(--text-muted);
+      }
+      .metric-badge .m-val {
+        color: var(--text-primary, #c9d1d9);
+        font-weight: 600;
+      }
+      /* AMM colour accents (matches chart colours) */
+      .metric-badge.amm-uni {
+        border-color: rgba(86, 212, 221, 0.55);
+        border-left-color: #56d4dd;
+        background: rgba(86, 212, 221, 0.08);
+      }
+      .metric-badge.amm-uni .m-val {
+        color: #56d4dd;
+      }
+      .metric-badge.amm-curve {
+        border-color: rgba(247, 120, 186, 0.55);
+        border-left-color: #f778ba;
+        background: rgba(247, 120, 186, 0.08);
+      }
+      .metric-badge.amm-curve .m-val {
+        color: #f778ba;
+      }
+      .metric-badge.amm-equilibra {
+        border-color: rgba(63, 185, 80, 0.55);
+        border-left-color: #3fb950;
+        background: rgba(63, 185, 80, 0.08);
+      }
+      .metric-badge.amm-equilibra .m-val {
+        color: #3fb950;
+      }
+      .chart-subtitle {
+        font-size: 0.75rem;
+        font-weight: 400;
+        color: var(--text-muted);
+      }
+      .chart-container canvas {
+        width: 100% !important;
+      }
+      /* Slippage / Liquidity main chart now spans the full card width
+       * — the side-by-side zoom panel was promoted to an on-demand
+       * popover triggered by the magnifier button. The legacy
+       * `.coverage-zoom-row` (Price Coverage chart) keeps its own
+       * 2-column grid via the more specific selector below. */
+      .penalty-charts-row,
+      .chart-with-zoom-row {
+        display: block;
+      }
+      .penalty-main-wrap,
+      .chart-main-wrap {
+        position: relative;
+        min-width: 0;
+      }
+      .penalty-zoom-wrap,
+      .chart-zoom-wrap {
+        background: rgba(22, 27, 34, 0.55);
+        border: 1px solid rgba(48, 54, 61, 0.6);
+        border-radius: var(--radius-sm);
+        padding: 8px;
+        min-width: 0;
+      }
+      .penalty-zoom-title,
+      .chart-zoom-title {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        margin-bottom: 6px;
+      }
+      /* Restore the 2-column grid only for the Price Coverage chart,
+       * which is unrelated to the Slippage/Liquidity restructure. */
+      .coverage-zoom-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(280px, 34%);
+        gap: var(--spacing-md);
+        align-items: stretch;
+      }
+      /* Magnifier button overlaid on the main chart. The trigger sits
+       * at the bottom corner of the main canvas, hugging the side of
+       * the x-axis where the zoom region of interest lies:
+       *   • Slippage Curves — bottom-LEFT (the zoom region d=0..0.2
+       *     starts at the origin).
+       *   • Liquidity Distribution — bottom-RIGHT (the zoom region
+       *     d=0.70..0.90 ends near the right edge of the x-axis). */
+      .zoom-trigger {
+        position: absolute;
+        bottom: 8px;
+        z-index: 5;
+        background: rgba(22, 27, 34, 0.78);
+        border: 1px solid rgba(48, 54, 61, 0.7);
+        border-radius: 999px;
+        padding: 4px 8px;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        color: var(--text-secondary);
+        transition: border-color 0.15s, color 0.15s, background 0.15s;
+      }
+      .zoom-trigger:hover {
+        border-color: rgba(86, 212, 221, 0.7);
+        color: var(--text-primary);
+        background: rgba(33, 38, 45, 0.92);
+      }
+      .zoom-trigger-left {
+        left: 8px;
+      }
+      .zoom-trigger-right {
+        right: 8px;
+      }
+      /* Zoom popover — hidden by default, opens as an absolutely
+       * positioned overlay anchored to the SAME corner as its
+       * trigger and growing UPWARD from the trigger. The combination
+       * of `bottom`-anchoring and `max-height` keeps the popover
+       * fully inside the parent `.chart-container` (which has
+       * `overflow: hidden`) regardless of the chart canvas size. */
+      .zoom-popover {
+        display: none;
+        position: absolute;
+        bottom: 38px;
+        z-index: 4;
+        width: min(360px, calc(100% - 16px));
+        max-height: calc(100% - 56px);
+        overflow: auto;
+        background: rgba(22, 27, 34, 0.96);
+        border: 1px solid rgba(48, 54, 61, 0.7);
+        border-radius: var(--radius-sm);
+        padding: 24px 10px 10px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      }
+      .zoom-popover.is-open {
+        display: block;
+      }
+      .zoom-popover-left {
+        left: 8px;
+      }
+      .zoom-popover-right {
+        right: 8px;
+      }
+      .zoom-popover-title {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        margin-bottom: 6px;
+      }
+      .zoom-popover-close {
+        position: absolute;
+        top: 4px;
+        right: 6px;
+        background: transparent;
+        border: none;
+        color: var(--text-muted);
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        padding: 4px 6px;
+        border-radius: 4px;
+      }
+      .zoom-popover-close:hover {
+        color: var(--text-primary);
+        background: rgba(48, 54, 61, 0.55);
+      }
+      .zoom-popover canvas {
+        /* 200px keeps the popover (canvas + title + padding ≈ 256px)
+         * comfortably inside the smallest chart canvas height we
+         * support (`clamp(320px, 42vw, 520px)` → 320px floor minus
+         * 56px clearance for the trigger button = 264px budget). */
+        height: 200px !important;
+        display: block;
+        width: 100% !important;
+      }
+      /* Main canvases. The zoom canvases (`#penaltyZoomChart`,
+       * `#liquidityZoomChart`) live inside `.zoom-popover` and pick
+       * up their compact 200px height from `.zoom-popover canvas`
+       * above — they intentionally do NOT inherit the main chart's
+       * `clamp()` height. */
+      #penaltyChart,
+      #liquidityChart {
+        height: clamp(320px, 42vw, 520px) !important;
+        display: block;
+      }
+      #coverageZoomChart {
+        height: 330px !important;
+        display: block;
+      }
+      .coverage-zoom-row .coverage-chart-wrap {
+        height: 380px;
+      }
+      .coverage-zoom-row .chart-zoom-wrap {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .coverage-zoom-row .chart-zoom-wrap canvas {
+        width: 100% !important;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+      /* Status / error line above the charts. Filled by
+       * `setSourceStatus` — normal state shows the data source,
+       * error state (`.is-error`) shows input / API failures loudly
+       * instead of freezing the page silently. */
+      .status-source {
+        font-family: monospace;
+        font-size: 0.78rem;
+        color: var(--text-muted);
+        margin-bottom: var(--spacing-sm);
+        min-height: 1.2em;
+      }
+      .status-source.is-error {
+        color: var(--accent-red);
+        font-weight: 600;
+      }
+      .coverage-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--spacing-sm);
+        margin-bottom: var(--spacing-sm);
+      }
+      .coverage-input {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 170px;
+        flex: 1 1 170px;
+      }
+      .coverage-input label {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+      }
+      .coverage-input input {
+        width: 100%;
+        padding: 4px 8px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        color: var(--text-primary);
+        font-family: monospace;
+        font-size: 0.85rem;
+      }
+      .coverage-input input:focus {
+        outline: none;
+        border-color: var(--accent-blue);
+      }
+      .coverage-chart-wrap {
+        position: relative;
+        height: 380px;
+        margin-top: var(--spacing-xs);
+      }
+      .coverage-chart-wrap canvas {
+        width: 100% !important;
+        display: block;
+      }
+      .coverage-table-wrap {
+        margin-top: var(--spacing-md);
+        border: 1px solid rgba(48, 54, 61, 0.6);
+        border-radius: var(--radius-sm);
+        overflow-x: auto;
+        min-width: 0;
+        max-width: 100%;
+      }
+      .coverage-table {
+        width: 100%;
+        min-width: 760px;
+        border-collapse: collapse;
+        font-family: monospace;
+        font-size: 0.78rem;
+      }
+      .coverage-table th,
+      .coverage-table td {
+        padding: 6px 8px;
+        border-bottom: 1px solid rgba(48, 54, 61, 0.45);
+        text-align: right;
+        white-space: nowrap;
+      }
+      .coverage-table th {
+        color: var(--text-secondary);
+        background: rgba(33, 38, 45, 0.55);
+        font-weight: 600;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+      .coverage-table td:first-child,
+      .coverage-table th:first-child {
+        text-align: left;
+      }
+      .coverage-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+      .coverage-table tbody tr.iso-row-away td {
+        background: rgba(63, 185, 80, 0.07);
+        border-top: 1px solid rgba(63, 185, 80, 0.25);
+        font-weight: 600;
+      }
+      .coverage-table tbody tr.iso-row-reverse td {
+        color: var(--text-muted);
+      }
+
+      /* Footer */
+      .footer {
+        text-align: center;
+        margin-top: var(--spacing-xl);
+        padding-top: var(--spacing-md);
+        border-top: 1px solid var(--border-color);
+        color: var(--text-muted);
+        font-size: 0.8rem;
+      }
+
+      /* Responsive */
+      @media (max-width: 1100px) {
+        .charts-grid {
+          grid-template-columns: 1fr;
+        }
+        .charts-grid > .chart-container-pair-left,
+        .charts-grid > .chart-container-pair-right {
+          grid-column: 1 / -1;
+        }
+      }
+      @media (max-width: 900px) {
+        .sliders-grid {
+          grid-template-columns: 1fr;
+        }
+        .coverage-zoom-row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="workspace-layout">
+        <aside class="workspace-sidebar">
+          <!-- Controls -->
+          <div class="controls-section">
+            <div id="legacyBezierControls" style="display: none">
+              <h2>Bezier Control Points</h2>
+              <div class="sliders-grid">
+                <div class="slider-group">
+                  <label>x1</label>
+                  <input
+                    type="range"
+                    id="x1"
+                    min="0"
+                    max="100"
+                    value="42"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="x1Val">0.42</span>
+                </div>
+                <div class="slider-group">
+                  <label>y1</label>
+                  <input
+                    type="range"
+                    id="y1"
+                    min="0"
+                    max="500"
+                    value="7"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="y1Val">0.07</span>
+                </div>
+                <div class="slider-group">
+                  <label>x2</label>
+                  <input
+                    type="range"
+                    id="x2"
+                    min="0"
+                    max="100"
+                    value="100"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="x2Val">1.00</span>
+                </div>
+                <div class="slider-group">
+                  <label>y2</label>
+                  <input
+                    type="range"
+                    id="y2"
+                    min="0"
+                    max="500"
+                    value="26"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="y2Val">0.26</span>
+                </div>
+                <div class="slider-group">
+                  <label style="color: #58a6ff">amp</label>
+                  <input
+                    type="range"
+                    id="bezierAmp"
+                    min="10"
+                    max="10000"
+                    value="10"
+                    step="1"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="bezierAmpVal">1.0</span>
+                </div>
+              </div>
+
+              <!-- Solidity integer params -->
+              <div class="solidity-params" id="solidityParams">
+                <span class="sol-label">Solidity (uint256):</span>
+                <code id="solX1">420000000000000000</code>,
+                <code id="solY1">70000000000000000</code>,
+                <code id="solX2">1000000000000000000</code>,
+                <code id="solY2">260000000000000000</code>
+                <span style="color: var(--text-muted); margin: 0 4px"
+                  >amp:</span
+                >
+                <code id="solAmp">1000000000000000000</code>
+                <button
+                  class="btn btn-copy"
+                  onclick="copySolidityParams()"
+                  title="Copy to clipboard"
+                >
+                  Copy
+                </button>
+              </div>
+
+              <div class="presets-row">
+                <span>Presets:</span>
+                <button class="btn" onclick="applyPreset('linear')">
+                  Linear
+                </button>
+                <button class="btn active" onclick="applyPreset('ease-in')">
+                  Ease-in
+                </button>
+                <button class="btn" onclick="applyPreset('ease-out')">
+                  Ease-out
+                </button>
+                <button class="btn" onclick="applyPreset('ease-in-out')">
+                  Ease-in-out
+                </button>
+                <button class="btn" onclick="applyPreset('steep')">
+                  Steep edges
+                </button>
+                <button class="btn" onclick="applyPreset('concentrated')">
+                  Concentrated
+                </button>
+                <button class="btn" onclick="applyPreset('aggressive')">
+                  Aggressive
+                </button>
+                <button class="btn" onclick="applyPreset('convex')">
+                  Convex (y&gt;1)
+                </button>
+              </div>
+
+              <div class="overlay-row">
+                <label
+                  ><input
+                    type="checkbox"
+                    id="showK"
+                    onchange="onSliderChange()"
+                  />
+                  Show d^k overlay</label
+                >
+                <div class="slider-group">
+                  <label>k</label>
+                  <input
+                    type="range"
+                    id="kVal"
+                    min="10"
+                    max="250"
+                    value="20"
+                    step="1"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="kDisplay">2.0</span>
+                </div>
+                <div class="slider-group">
+                  <label style="color: #d18616">offset</label>
+                  <input
+                    type="range"
+                    id="kOffset"
+                    min="0"
+                    max="95"
+                    value="0"
+                    step="1"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="kOffsetDisplay">0.00</span>
+                </div>
+                <div class="slider-group">
+                  <label style="color: #d18616">amp</label>
+                  <input
+                    type="range"
+                    id="kAmp"
+                    min="10"
+                    max="500"
+                    value="10"
+                    step="1"
+                    oninput="onSliderChange()"
+                  />
+                  <span class="value" id="kAmpDisplay">1.0</span>
+                </div>
+              </div>
+            </div>
+            <div class="overlay-row amm-toggle-row">
+              <label
+                ><input
+                  type="checkbox"
+                  id="showUni"
+                  checked
+                  onchange="onSliderChange()"
+                />
+                Uniswap x&middot;y=k</label
+              >
+            </div>
+            <div class="overlay-row curve-row">
+              <label class="curve-toggle"
+                ><input
+                  type="checkbox"
+                  id="showCurve"
+                  checked
+                  onchange="onSliderChange()"
+                />
+                YieldBasis reference AMM</label
+              >
+              <div class="slider-group">
+                <label style="color: #f778ba">Mode</label>
+                <select
+                  id="curveMathMode"
+                  onchange="onSliderChange()"
+                  style="
+                    width: 116px;
+                    padding: 4px 8px;
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: var(--radius-sm);
+                    color: var(--text-primary);
+                    font-family: monospace;
+                    font-size: 0.85rem;
+                  "
+                >
+                  <option value="stableswap" selected>stableswap</option>
+                  <option value="crypto">crypto</option>
+                </select>
+              </div>
+              <div class="slider-group">
+                <label style="color: #f778ba">A</label>
+                <input
+                  type="number"
+                  id="curveA"
+                  value="90000"
+                  step="1000"
+                  title="YieldBasis reference packed A — valid range [4_000, 40_000_000].
+
+In stableswap mode: A controls BOTH the width AND depth of the flat plateau. Higher A → wider flat zone (Equilibra-like behaviour).
+
+In crypto (cryptoswap) mode: A controls only the DEPTH of the plateau; γ controls its width. For a wide concentrated zone, stableswap is the right baseline."
+                  onchange="onSliderChange()"
+                  style="
+                    width: 92px;
+                    padding: 4px 8px;
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: var(--radius-sm);
+                    color: var(--text-primary);
+                    font-family: monospace;
+                    font-size: 0.85rem;
+                  "
+                />
+              </div>
+              <div class="slider-group">
+                <label style="color: #f778ba">&gamma;</label>
+                <input
+                  type="number"
+                  id="curveGamma"
+                  value="1000000000000000"
+                  step="1"
+                  title="YieldBasis (cryptoswap) gamma — valid range [1e10, 1.99e17].
+
+γ controls the WIDTH of the flat plateau around the price scale. Maximum width is reached at γ ≈ 2e16 (≈ 2% of balance); above that the kernel re-shrinks it. So the cryptoswap plateau is fundamentally narrow — for a wide stableswap-like concentration (Equilibra-style), switch Mode to stableswap.
+
+Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
+                  onchange="onSliderChange()"
+                  style="
+                    width: 148px;
+                    padding: 4px 8px;
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: var(--radius-sm);
+                    color: var(--text-primary);
+                    font-family: monospace;
+                    font-size: 0.85rem;
+                  "
+                />
+              </div>
+            </div>
+            <div class="overlay-row eq-top-row" style="flex-wrap: wrap">
+              <label id="showPowerWallLabel"
+                ><input
+                  type="checkbox"
+                  id="showPowerWall"
+                  checked
+                  onchange="onSliderChange()"
+                />
+                <span id="showPowerWallText"
+                  >Equilibra (a, &lambda;)</span
+                ></label
+              >
+              <div class="slider-group preset-field">
+                <label style="color: #3fb950">Preset</label>
+                <select
+                  id="curvePreset"
+                  onchange="onCurvePresetChange()"
+                  style="
+                    width: 110px;
+                    padding: 4px 8px;
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: var(--radius-sm);
+                    color: var(--text-primary);
+                    font-family: monospace;
+                    font-size: 0.85rem;
+                  "
+                >
+                  <option value="WBTC" selected>WBTC</option>
+                  <option value="WETH">WETH</option>
+                </select>
+              </div>
+            </div>
+            <div class="overlay-row" style="display: none">
+              <label
+                ><input
+                  type="checkbox"
+                  id="showRational"
+                  onchange="onSliderChange()"
+                />
+                1/(1-d)<sup>n</sup> &minus; 1</label
+              >
+              <div class="slider-group">
+                <label style="color: #e5c07b">n</label>
+                <input
+                  type="range"
+                  id="rationalN"
+                  min="1"
+                  max="60"
+                  value="20"
+                  step="1"
+                  oninput="onSliderChange()"
+                />
+                <span class="value" id="rationalNDisplay">2.0</span>
+              </div>
+              <div class="slider-group">
+                <label style="color: #e5c07b">offset</label>
+                <input
+                  type="range"
+                  id="rationalOffset"
+                  min="0"
+                  max="95"
+                  value="0"
+                  step="1"
+                  oninput="onSliderChange()"
+                />
+                <span class="value" id="rationalOffsetDisplay">0.00</span>
+              </div>
+            </div>
+            <div class="overlay-row" style="flex-wrap: wrap">
+              <div class="pw-sliders">
+                <div class="slider-group has-fine-input">
+                  <label
+                    style="color: #3fb950"
+                    title="a — depth-at-anchor knob. A(D=0) = a; larger a deepens the centre. Curve Lab range: [0.01, 0.99] (research sandbox — the open interval (0, W); a=W is forbidden because it kills the L-quadratic). Production envelope enforced on-chain: [0.1, 0.99] (Constants.A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16) — values outside this band will be rejected by the factory at deploy time. Slider mapping is cubic with fine resolution near the upper bound (a → W is the sensitive region; numerically ill-conditioned)."
+                    >a</label
+                  >
+                  <input
+                    type="range"
+                    id="pwAlpha"
+                    min="0"
+                    max="1"
+                    value="0.5"
+                    step="0.0001"
+                    oninput="onPwAlphaSliderInput()"
+                  />
+                  <input
+                    type="number"
+                    id="pwAlphaFine"
+                    class="pw-fine-input"
+                    value="0.50000"
+                    step="any"
+                    oninput="onPwFineInputType('pwAlphaFine', 'pwAlpha')"
+                    onchange="onPwFineInputCommit('pwAlphaFine', 'pwAlpha')"
+                  />
+                  <span class="value" id="pwAlphaDisplay" style="display: none"
+                    >0.50</span
+                  >
+                </div>
+                <div class="slider-group has-fine-input">
+                  <label
+                    style="color: #f6c177"
+                    title="λ — plateau-width knob. A = a/2 at λ·D = W (half-amplification distance). Larger λ narrows the plateau (cliff closer to anchor); smaller widens it. Curve Lab range: [0.0001, 10] (research sandbox — five orders of magnitude; capped at 10 to keep lambdaWad inside the uint64 envelope the InitParams struct uses). Production envelope enforced on-chain: [0.001, 1.0] (Constants.LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18) — values outside this band will be rejected by the factory at deploy time. Slider mapping is cubic with fine resolution near the lower bound (production envelope 0.001..1.0 occupies the left ~46 % of the slider)."
+                    >&lambda;</label
+                  >
+                  <input
+                    type="range"
+                    id="pwLambda"
+                    min="0"
+                    max="1"
+                    value="0.215"
+                    step="0.0001"
+                    oninput="onPwLambdaSliderInput()"
+                  />
+                  <input
+                    type="number"
+                    id="pwLambdaFine"
+                    class="pw-fine-input"
+                    value="0.01000"
+                    step="any"
+                    oninput="onPwFineInputType('pwLambdaFine', 'pwLambda')"
+                    onchange="onPwFineInputCommit('pwLambdaFine', 'pwLambda')"
+                  />
+                  <span class="value" id="pwLambdaDisplay" style="display: none"
+                    >0.01</span
+                  >
+                </div>
+                <div class="slider-group" style="display: none" aria-hidden="true">
+                  <input
+                    type="range"
+                    id="pwGamma"
+                    min="1"
+                    max="1"
+                    value="1"
+                    step="1"
+                  />
+                </div>
+                <!-- aSeg policy is now hard-wired to `state-fp` (production
+                     default) — the iteration cap lives in the server's
+                     `EquilibraAmmCfg.asegFpIter` config and is applied
+                     process-wide at startup. UI no longer exposes a
+                     toggle: the visualizer always reflects the production
+                     swap behaviour. -->
+              </div>
+              <div class="solidity-params" id="pwSolidityParams">
+                <span class="sol-label" id="solPwModeHint">Solidity:</span>
+                <div class="solidity-line" id="solPwLineAmp">
+                  <span id="solPwAmpLabel">amp=</span
+                  ><code id="solPwAmp">0</code>
+                </div>
+                <div
+                  class="solidity-line"
+                  id="solPwLineW1"
+                  style="display: none"
+                >
+                  <span id="solPwW1Label">w<sub>1</sub>=</span
+                  ><code id="solPwW1">0</code>
+                </div>
+                <div
+                  class="solidity-line"
+                  id="solPwLineK"
+                  style="display: none"
+                >
+                  <span id="solPwKLabel">k<sub>1</sub>=</span
+                  ><code id="solPwK">0</code>
+                </div>
+                <div
+                  class="solidity-line"
+                  id="solPwLineW2"
+                  style="display: none"
+                >
+                  <span id="solPwW2Label">w<sub>2</sub>=</span
+                  ><code id="solPwW2">0</code>
+                </div>
+                <div
+                  class="solidity-line"
+                  id="solPwLineK2"
+                  style="display: none"
+                >
+                  <span id="solPwK2Label">k<sub>2</sub>=</span
+                  ><code id="solPwK2">0</code>
+                </div>
+                <div class="solidity-line" id="solPwLineWWall">
+                  <span id="solPwWWallLabel">w<sub>wall</sub>=</span
+                  ><code id="solPwWWall">0</code>
+                </div>
+                <div
+                  class="solidity-line"
+                  id="solPwLineDRef"
+                  style="display: none"
+                >
+                  <span id="solPwDRefLabel">dRef=</span
+                  ><code id="solPwDRef">0</code>
+                </div>
+                <div class="solidity-actions">
+                  <button
+                    class="btn btn-copy"
+                    id="pwCopyBtn"
+                    onclick="copyPwSolidityParams()"
+                    title="Copy to clipboard"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+              <div
+                id="pwPastePanel"
+                class="pw-paste-panel-wide"
+                style="display: none"
+              >
+                <div class="pw-paste-row">
+                  <input
+                    type="text"
+                    id="pwPasteInput"
+                    placeholder="aWad: ...n, lambdaWad: ...n"
+                    style="
+                      padding: 6px 8px;
+                      background: var(--bg-primary);
+                      border: 1px solid var(--border-color);
+                      border-radius: var(--radius-sm);
+                      color: var(--text-primary);
+                      font-family: monospace;
+                      font-size: 0.78rem;
+                    "
+                  />
+                  <button
+                    class="btn btn-copy"
+                    id="pwPasteApplyBtn"
+                    onclick="applyPwParamsFromPaste()"
+                  >
+                    Apply
+                  </button>
+                  <button class="btn btn-copy" onclick="closePwPastePanel()">
+                    Cancel
+                  </button>
+                </div>
+                <span
+                  id="pwPasteStatus"
+                  style="font-size: 0.78rem; color: var(--text-muted)"
+                ></span>
+              </div>
+              <div class="overlay-row pw-footer-actions">
+                <button
+                  class="btn"
+                  id="pwInsertToggleBtn"
+                  onclick="openPwPastePanel()"
+                  title="Insert params string"
+                >
+                  Insert
+                </button>
+                <button class="btn" onclick="resetPwDefaults()">
+                  reset to default
+                </button>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <main class="workspace-main">
+          <!-- Data-source / error status line (id consumed by
+               setSourceStatus; errors from input validation and the
+               series API render here). -->
+          <div class="status-source" id="mSource"></div>
+          <!-- Charts -->
+          <div class="charts-grid">
+            <div class="chart-container chart-container-pair-left">
+              <h3>
+                Slippage
+                <span class="chart-subtitle" id="penaltyYAxisMeta"
+                  >Y: Slippage = (1 - P(0)/P(d)) · 100%</span
+                >
+                <label
+                  style="
+                    float: right;
+                    font-size: 12px;
+                    font-weight: normal;
+                    color: var(--text-muted);
+                    cursor: pointer;
+                  "
+                  title="Switch the Y-axis to log scale to see YieldBasis crypto / Equilibra concentration in the d=0..0.4 region (where penalties are too small to read on a 0..75% linear scale)"
+                >
+                  <input
+                    type="checkbox"
+                    id="penaltyLogScale"
+                    onchange="togglePenaltyLogScale()"
+                    style="vertical-align: middle"
+                  />
+                  Log scale
+                </label>
+              </h3>
+              <div class="metric-badges" id="penaltyMetricBadges">
+                <span class="metric-badge amm-uni"
+                  ><span class="m-label">RMSE Uni</span
+                  ><span class="m-val" id="pwRmseUni">-</span></span
+                >
+                <span class="metric-badge amm-curve"
+                  ><span class="m-label">RMSE YB</span
+                  ><span class="m-val" id="pwRmseCurve">-</span></span
+                >
+                <span class="metric-badge amm-uni"
+                  ><span class="m-label">Area Err Uni</span
+                  ><span class="m-val" id="pwAreaErrUni">-</span></span
+                >
+                <span class="metric-badge amm-curve"
+                  ><span class="m-label">Area Err YB</span
+                  ><span class="m-val" id="pwAreaErrCurve">-</span></span
+                >
+              </div>
+              <div class="penalty-charts-row">
+                <div class="penalty-main-wrap">
+                  <button
+                    type="button"
+                    class="zoom-trigger zoom-trigger-left"
+                    onclick="toggleZoomPopover('slippage')"
+                    aria-label="Toggle zoom near d=0..0.2"
+                    title="Zoom: d = 0.00 .. 0.20"
+                  >
+                    🔍
+                  </button>
+                  <canvas id="penaltyChart"></canvas>
+                  <div class="zoom-popover zoom-popover-left" id="slippageZoomPopover">
+                    <button
+                      type="button"
+                      class="zoom-popover-close"
+                      onclick="toggleZoomPopover('slippage')"
+                      aria-label="Close zoom"
+                    >✕</button>
+                    <div class="zoom-popover-title">Zoom: d = 0.00 .. 0.20</div>
+                    <canvas id="penaltyZoomChart"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="chart-container chart-container-pair-right">
+              <h3>
+                Liquidity Distribution
+                <span class="chart-subtitle"
+                  >L = (1 - d) / slippage' &mdash; depth per unit price
+                  change</span
+                >
+                <label
+                  style="
+                    float: right;
+                    font-size: 12px;
+                    font-weight: normal;
+                    color: var(--text-muted);
+                    cursor: pointer;
+                  "
+                >
+                  <input
+                    type="checkbox"
+                    id="liqLogScale"
+                    onchange="toggleLiqLogScale()"
+                    style="vertical-align: middle"
+                  />
+                  Log scale
+                </label>
+              </h3>
+              <div class="metric-badges" id="liquidityMetricBadges">
+                <span class="metric-badge amm-uni"
+                  ><span class="m-label">RMSE Uni</span
+                  ><span class="m-val" id="pwLiqRmseUni">-</span></span
+                >
+                <span class="metric-badge amm-curve"
+                  ><span class="m-label">RMSE YB</span
+                  ><span class="m-val" id="pwLiqRmseCurve">-</span></span
+                >
+                <span class="metric-badge amm-uni"
+                  ><span class="m-label">Area Err Uni</span
+                  ><span class="m-val" id="pwLiqAreaErrUni">-</span></span
+                >
+                <span class="metric-badge amm-curve"
+                  ><span class="m-label">Area Err YB</span
+                  ><span class="m-val" id="pwLiqAreaErrCurve">-</span></span
+                >
+              </div>
+              <div class="chart-with-zoom-row">
+                <div class="chart-main-wrap">
+                  <button
+                    type="button"
+                    class="zoom-trigger zoom-trigger-right"
+                    onclick="toggleZoomPopover('liquidity')"
+                    aria-label="Toggle zoom near d=0.7..0.9"
+                    title="Zoom: d = 0.70 .. 0.90"
+                  >
+                    🔍
+                  </button>
+                  <canvas id="liquidityChart"></canvas>
+                  <div class="zoom-popover zoom-popover-right" id="liquidityZoomPopover">
+                    <button
+                      type="button"
+                      class="zoom-popover-close"
+                      onclick="toggleZoomPopover('liquidity')"
+                      aria-label="Close zoom"
+                    >✕</button>
+                    <div class="zoom-popover-title">
+                      Zoom: d = 0.70 .. 0.90, L max = 0.5
+                    </div>
+                    <canvas id="liquidityZoomChart"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="chart-container" id="priceCoverageCard">
+              <h3>
+                <button
+                  type="button"
+                  class="card-toggle"
+                  onclick="togglePriceCoverage()"
+                  aria-label="Toggle Price Coverage section"
+                  id="priceCoverageToggleBtn"
+                >+</button>
+                Price Coverage by Sold Liquidity
+                <span class="chart-subtitle"
+                  >Price ranges for each 10% of initial quote liquidity sold
+                  (current math model)</span
+                >
+              </h3>
+              <div class="coverage-controls">
+                <div class="coverage-input">
+                  <label for="coverageInitialPrice">Initial price</label>
+                  <!-- No hardcoded default: an empty field means the
+                       request is sent WITHOUT `initialPrice` and the
+                       backend's canonical per-preset price (echoed in
+                       the response) populates the field. A user-typed
+                       value takes precedence until the next preset
+                       switch clears it. -->
+                  <input
+                    type="text"
+                    id="coverageInitialPrice"
+                    placeholder="preset default"
+                    onchange="updateCharts()"
+                  />
+                </div>
+              </div>
+              <div class="chart-with-zoom-row coverage-zoom-row">
+                <div class="coverage-chart-wrap">
+                  <canvas id="coverageChart"></canvas>
+                </div>
+                <div class="chart-zoom-wrap">
+                  <div id="coverageZoomTitle" class="chart-zoom-title">
+                    Zoom: sold 0 .. 10%, max height = 5.00% of initial price
+                  </div>
+                  <canvas id="coverageZoomChart"></canvas>
+                </div>
+              </div>
+              <div class="coverage-table-wrap">
+                <table class="coverage-table">
+                  <thead>
+                    <tr>
+                      <th>Sold bucket</th>
+                      <th>Equilibra price range</th>
+                      <th>Uniswap price range</th>
+                      <th>YieldBasis price range</th>
+                    </tr>
+                  </thead>
+                  <tbody id="coverageTableBody"></tbody>
+                </table>
+              </div>
+              <div class="chart-container" style="margin-top: var(--spacing-lg)">
+                <h3>
+                  Isolated Swap Quotes (round-trip)
+                  <span class="chart-subtitle"
+                    >Each row swaps `pct% × reserve1` USDT into the pool
+                    (token1 → token0), captures post-fwd marginal
+                    price, then immediately reverses the received
+                    token0 back through the same post-fwd state. State
+                    is reset between rows. Same `amountIn` across all
+                    AMMs — different `out` reflects curve shape.</span
+                  >
+                </h3>
+                <div
+                  id="isolatedSwapsHeader"
+                  style="
+                    margin: 8px 0 12px 0;
+                    color: var(--text-muted);
+                    font-size: 0.8rem;
+                  "
+                ></div>
+                <div class="coverage-table-wrap">
+                  <table class="coverage-table" id="isolatedSwapsTable">
+                    <thead>
+                      <tr>
+                        <th rowspan="2">Step</th>
+                        <th rowspan="2">amountIn</th>
+                        <th colspan="3">Forward out (token0)</th>
+                        <th colspan="3">Reverse back (token1, round-trip)</th>
+                        <th colspan="3">Marginal price post-fwd</th>
+                      </tr>
+                      <tr>
+                        <th>Equilibra</th>
+                        <th>Uniswap</th>
+                        <th>YieldBasis</th>
+                        <th>Equilibra</th>
+                        <th>Uniswap</th>
+                        <th>YieldBasis</th>
+                        <th>Equilibra</th>
+                        <th>Uniswap</th>
+                        <th>YieldBasis</th>
+                      </tr>
+                    </thead>
+                    <tbody id="isolatedSwapsTableBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+
+      <footer class="footer">
+        EquilibraSwap &mdash; Curve Visualization Tool
+      </footer>
+    </div>
+
+    <script>
+      // ═══════════════════════════════════════════════════════════════
+      //  Constants & State
+      // ═══════════════════════════════════════════════════════════════
+
+      const NUM_SAMPLES = 80;
+
+      // ─── Research-band bounds — the SINGLE source in this file ────
+      // The PRODUCTION envelope for the Equilibra knobs is enforced
+      // on-chain by contracts/libraries/Constants.sol:
+      //   A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16   (display 0.1 .. 0.99)
+      //   LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18 (0.001 .. 1.0)
+      // The Curve Lab deliberately exposes this WIDER research band
+      // for calibration; out-of-envelope values are rejected by the
+      // factory at deploy time. These constants are pushed into the
+      // DOM min/max attributes at init (applyResearchBandBoundsToDom)
+      // — do not repeat the literals anywhere else in this file.
+      const PW_ALPHA_MIN = 0.01;
+      const PW_ALPHA_MAX = 0.99;
+      const PW_LAMBDA_MIN = 0.0001;
+      const PW_LAMBDA_MAX = 10;
+      // YieldBasis reference-AMM kernel bounds (mirrors
+      // simulator/src/runtime_quoter/curve.rs). Applied to the A / γ
+      // number inputs' min/max at init; out-of-range submissions are
+      // rejected loudly by the backend API — never silently coerced
+      // or substituted client-side.
+      const CURVE_MIN_GAMMA = 10_000_000_000n; // 1e10
+      const CURVE_MAX_GAMMA = 199_000_000_000_000_000n; // 1.99e17
+      const CURVE_MIN_A_PACKED = 4_000n;
+      const CURVE_MAX_A_PACKED = 40_000_000n;
+      // V1.5 bump: discard any cached V1 single-`α` slider state. The
+      // ".v2" suffix invalidates prior localStorage payloads so the UI
+      // boots from defaults the first time after upgrading. Replace if
+      // future schema-breaking changes land.
+      const VIS_ALPHA_BETA_KEY = "equinova.visualizer.alphaBeta.v2";
+      const VIS_CURVE_KEY = "equinova.visualizer.curvePreset.v1";
+      const VIS_UI_STATE_KEY = "equinova.visualizer.uiState.v2";
+      const BENCHMARK_PRESET_KEYS = ["WETH", "WBTC"];
+      let CURVE_BENCHMARK_PRESETS = null;
+      let PW_PRESET_BY_TOKEN = null;
+
+      function parseStrictBigIntString(value, fieldName) {
+        const text = String(value ?? "").trim();
+        if (!/^[0-9]+$/.test(text)) {
+          throw new Error(`Invalid ${fieldName}: expected uint decimal string`);
+        }
+        return BigInt(text);
+      }
+
+      function requireNumberField(value, fieldName) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) {
+          throw new Error(`Invalid ${fieldName}: expected finite number`);
+        }
+        return n;
+      }
+
+      async function fetchDefaultBenchmarkConfig() {
+        const res = await fetch("/api/config/default");
+        const text = await res.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch {
+          json = null;
+        }
+        if (!res.ok) {
+          throw new Error((json && json.error) || text || `HTTP ${res.status}`);
+        }
+        if (!json || typeof json !== "object" || !json.config) {
+          throw new Error("Invalid /api/config/default payload");
+        }
+        return json.config;
+      }
+
+      async function loadBenchmarkPresetsFromApi() {
+        const cfg = await fetchDefaultBenchmarkConfig();
+        const eqPresets = cfg?.amms?.equilibra?.presets;
+        const curvePresets = cfg?.amms?.curve?.presets;
+        if (!eqPresets || typeof eqPresets !== "object") {
+          throw new Error("Missing amms.equilibra.presets in default config");
+        }
+        if (!curvePresets || typeof curvePresets !== "object") {
+          throw new Error("Missing amms.curve.presets in default config");
+        }
+
+        const curveOut = {};
+        const eqOut = {};
+        for (const key of BENCHMARK_PRESET_KEYS) {
+          const c = curvePresets[key];
+          const e = eqPresets[key];
+          if (!c || typeof c !== "object") {
+            throw new Error(`Missing amms.curve.presets.${key}`);
+          }
+          if (!e || typeof e !== "object") {
+            throw new Error(`Missing amms.equilibra.presets.${key}`);
+          }
+
+          curveOut[key] = {
+            A: Math.trunc(requireNumberField(c.A, `curve.${key}.A`)),
+            gamma: String(c.gamma ?? ""),
+          };
+
+          eqOut[key] = {
+            aWad: parseStrictBigIntString(e.aWad, `equilibra.${key}.aWad`),
+            lambdaWad: parseStrictBigIntString(e.lambdaWad, `equilibra.${key}.lambdaWad`),
+            feeBps: Math.trunc(requireNumberField(e.feeBps, `equilibra.${key}.feeBps`)),
+          };
+        }
+
+        CURVE_BENCHMARK_PRESETS = curveOut;
+        PW_PRESET_BY_TOKEN = eqOut;
+      }
+
+      let penaltyChart = null;
+      let penaltyZoomChart = null;
+      let liquidityChart = null;
+      let liquidityZoomChart = null;
+      let coverageChart = null;
+      let coverageZoomChart = null;
+      let updateTimer = null;
+      // UI-local timing knob: trailing debounce for slider-driven chart
+      // refreshes. A drag emits one request per ~150 ms instead of ~60/s;
+      // the AbortController below cancels any still-queued stale fetch.
+      const UPDATE_DEBOUNCE_MS = 150;
+      let coverageAxisMinPrice = 1;
+      const VISUALIZER_API_ENDPOINT = "/api/visualizer/series";
+      let visualizerApiReqId = 0;
+      // In-flight /api/visualizer/series controller. Each updateCharts()
+      // aborts the previous fetch before issuing its own, so at most one
+      // request is outstanding; the reqId guard remains the authority for
+      // discarding stale responses that already arrived.
+      let visualizerApiAbort = null;
+      let visualizerSeriesData = null;
+      // JSON of the payload that produced visualizerSeriesData. Pure
+      // display toggles (showUni / showCurve / showPowerWall) build an
+      // identical payload — those re-render from the cached series
+      // instead of re-fetching the same server compute.
+      let visualizerSeriesPayloadJson = null;
+      const COVERAGE_X_ZOOM_SPLIT_PCT = 70;
+      const COVERAGE_X_ZOOM_FACTOR = 2;
+
+      function getCoverageXDisplaySplitPct() {
+        const split = Math.max(1, Math.min(99, COVERAGE_X_ZOOM_SPLIT_PCT));
+        const factor = Math.max(1, COVERAGE_X_ZOOM_FACTOR);
+        const weightedLeft = split * factor;
+        const weightedRight = 100 - split;
+        return (weightedLeft / (weightedLeft + weightedRight)) * 100;
+      }
+
+      function coverageToDisplayPct(actualPct) {
+        const split = Math.max(1, Math.min(99, COVERAGE_X_ZOOM_SPLIT_PCT));
+        const displaySplit = getCoverageXDisplaySplitPct();
+        const p = Math.max(0, Math.min(100, Number(actualPct) || 0));
+        if (p <= split) return (p / split) * displaySplit;
+        return (
+          displaySplit + ((p - split) / (100 - split)) * (100 - displaySplit)
+        );
+      }
+
+      function coverageFromDisplayPct(displayPct) {
+        const split = Math.max(1, Math.min(99, COVERAGE_X_ZOOM_SPLIT_PCT));
+        const displaySplit = getCoverageXDisplaySplitPct();
+        const x = Math.max(0, Math.min(100, Number(displayPct) || 0));
+        if (x <= displaySplit) return (x / displaySplit) * split;
+        return (
+          split + ((x - displaySplit) / (100 - displaySplit)) * (100 - split)
+        );
+      }
+
+      const infinityTailMarkerPlugin = {
+        id: "infinityTailMarkerPlugin",
+        afterDatasetsDraw(chart) {
+          const ctx = chart.ctx;
+          if (!ctx) return;
+          ctx.save();
+          ctx.font = "bold 12px monospace";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+
+          for (
+            let dsIndex = 0;
+            dsIndex < chart.data.datasets.length;
+            dsIndex++
+          ) {
+            const ds = chart.data.datasets[dsIndex];
+            if (!ds || !ds.tailMarker) continue;
+            const meta = chart.getDatasetMeta(dsIndex);
+            if (!meta || !meta.data) continue;
+            const color = Array.isArray(ds.borderColor)
+              ? ds.borderColor[0]
+              : ds.borderColor;
+            ctx.fillStyle = color || "#ffffff";
+            for (const point of meta.data) {
+              if (
+                !point ||
+                point.skip ||
+                !Number.isFinite(point.x) ||
+                !Number.isFinite(point.y)
+              )
+                continue;
+              ctx.fillText("∞", point.x, point.y - 6);
+            }
+          }
+
+          ctx.restore();
+        },
+      };
+
+      // Presets: { x1, y1, x2, y2 } in slider units (÷100 = actual value)
+      // x in [0, 100] → [0.00, 1.00]; y in [-50, 500] → [-0.50, 5.00]
+      const PRESETS = {
+        linear: { x1: 33, y1: 33, x2: 67, y2: 67 },
+        "ease-in": { x1: 42, y1: 0, x2: 100, y2: 100 },
+        "ease-out": { x1: 0, y1: 0, x2: 58, y2: 100 },
+        "ease-in-out": { x1: 42, y1: 0, x2: 58, y2: 100 },
+        steep: { x1: 85, y1: 0, x2: 100, y2: 1 },
+        concentrated: { x1: 99, y1: 0, x2: 100, y2: 1 },
+        aggressive: { x1: 10, y1: 350, x2: 90, y2: 200 },
+        convex: { x1: 5, y1: 500, x2: 50, y2: 400 },
+      };
+
+      function relocateControlsSection() {
+        const sidebar = document.querySelector(".workspace-sidebar");
+        const controls = sidebar
+          ? sidebar.querySelector(":scope > .controls-section")
+          : null;
+        const chartsGrid = document.querySelector(
+          ".workspace-main .charts-grid",
+        );
+        if (!controls || !chartsGrid) return;
+
+        const chartContainers = chartsGrid.querySelectorAll(
+          ":scope > .chart-container",
+        );
+        controls.classList.add("controls-inline-main");
+
+        if (chartContainers.length >= 3) {
+          chartsGrid.insertBefore(controls, chartContainers[2]);
+        } else {
+          chartsGrid.appendChild(controls);
+        }
+
+        // Drop the now-empty sidebar from DOM so layout reclaims its space
+        if (sidebar && !sidebar.querySelector(".controls-section")) {
+          sidebar.remove();
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      //  Equilibra slippage / curve preview
+      // ═══════════════════════════════════════════════════════════════
+      //
+      // The visualizer no longer recomputes the Equilibra slippage curve
+      // in float64 — see `simulator/src/app/visualizer.rs::build_series_for_amm`
+      // for the authoritative U256 implementation (with adaptive
+      // sampling). Sliders feed the single concentration parameter
+      // `alpha` into the API request payload via `getPwSolidityParams`,
+      // the backend computes the blend invariant
+      // `K = (1 − w(D))·α·L·(x + y) + w(D)·xy`, and the frontend just
+      // renders the returned series.
+      //
+      // A previous client-side port suffered catastrophic cancellation
+      // in `targetX`/`targetY` near reserve depletion, blowing up f64
+      // penalties by 20+ orders of magnitude while U256 stayed smooth.
+      // That code path is gone; chart precision now matches the pool
+      // contract bit-for-bit modulo float quantisation in Chart.js.
+
+
+      // Convert a positive decimal string (e.g. "25", "12.5", "200")
+      // straight into a WAD-scaled BigInt (`value * 1e18`).
+      function decimalStringToWad(rawValue) {
+        const raw = String(rawValue).trim();
+        const m = raw.match(/^(\d+)(?:\.(\d+))?$/);
+        if (!m) return 0n;
+
+        const whole = m[1];
+        const fracRaw = m[2] || "";
+        const fracLen = Math.min(fracRaw.length, 18);
+        const fracUsed = fracRaw.slice(0, fracLen);
+        const dropped = fracRaw.length > 18 ? fracRaw[18] : "";
+
+        const base = 1000000000000000000n; // 1e18
+        let scaled = BigInt(whole) * base;
+
+        if (fracLen > 0) {
+          const fracInt = BigInt(fracUsed);
+          scaled += fracInt * 10n ** (18n - BigInt(fracLen));
+        }
+
+        // Round half-up if there are more than 18 fractional digits.
+        if (dropped && dropped >= "5") {
+          scaled += 1n;
+        }
+
+        return scaled;
+      }
+
+      // Legacy alias: a few call sites still reference `sliderRawToScaled`
+      // (for example when feeding a slider's `value` straight back through
+      // the WAD encoder). Keep the old name pointing at the new helper.
+      const sliderRawToScaled = decimalStringToWad;
+
+      // Read live (a, λ) DISPLAY values and return them WAD-scaled.
+      // Source of truth is the fine-input number field (carries the
+      // user's full typed precision); the slider is a positioner only.
+      // `pw{Alpha,Lambda}DisplayValue()` falls back to the cubic
+      // mapping of the slider position if the fine field is empty.
+      function getPwLegacySolidityParams() {
+        const aDisplay = pwAlphaDisplayValue();
+        const lambdaDisplay = pwLambdaDisplayValue();
+        return {
+          aWad: decimalStringToWad(aDisplay.toFixed(18)),
+          lambdaWad: decimalStringToWad(lambdaDisplay.toFixed(18)),
+        };
+      }
+
+      function getPwSolidityParams() {
+        return { mode: "v15", ...getPwLegacySolidityParams() };
+      }
+
+      // ─────────────────────────────────────────────────────────────────
+      // Per-token snapshot readers + overlays.
+      //
+      // onCurvePresetChange() applies FACTORY defaults (from
+      // CURVE_BENCHMARK_PRESETS / PW_PRESET_BY_TOKEN) into the DOM and then
+      // auto-saves the DOM back into localStorage via onSliderChange().
+      //
+      // Without the overlay below, switching WETH → WBTC → WETH would wipe
+      // the user's customized α/λ/γ and Curve A/γ for WETH: factory defaults
+      // would land in the DOM, onSliderChange() would persist them, and the
+      // per-token snapshot would lose its customized payload forever.
+      //
+      // These helpers read the per-token payload straight from localStorage
+      // and layer it on top of factory defaults, so customized knobs survive
+      // preset switching. Reset (resetPwDefaults) intentionally bypasses
+      // these overlays — that is the supported way to drop customization.
+      // ─────────────────────────────────────────────────────────────────
+      function readVisualizerAlphaBetaSnapshotFor(token) {
+        try {
+          const raw = localStorage.getItem(VIS_ALPHA_BETA_KEY);
+          if (!raw) return null;
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object") return null;
+          const snap = parsed[token];
+          return snap && typeof snap === "object" ? snap : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function readVisualizerCurveSnapshotFor(token) {
+        try {
+          const raw = localStorage.getItem(VIS_CURVE_KEY);
+          if (!raw) return null;
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object") return null;
+          const snap = parsed[token];
+          return snap && typeof snap === "object" ? snap : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function applyAlphaBetaPersistedOverlayNoRefresh(presetKey) {
+        const snap = readVisualizerAlphaBetaSnapshotFor(presetKey);
+        if (!snap) return;
+        try {
+          if (typeof snap.aWad === "string" && snap.aWad.length > 0) {
+            setLegacySliderFromScaled("pwAlpha", BigInt(snap.aWad), 5);
+          }
+          if (typeof snap.lambdaWad === "string" && snap.lambdaWad.length > 0) {
+            setLegacySliderFromScaled(
+              "pwLambda",
+              BigInt(snap.lambdaWad),
+              5,
+            );
+          }
+        } catch {
+          // malformed snapshot: keep factory defaults already in the DOM
+        }
+      }
+
+      function applyCurvePersistedOverlayNoRefresh(presetKey) {
+        const snap = readVisualizerCurveSnapshotFor(presetKey);
+        if (!snap) return;
+        const aRaw = typeof snap.A === "string" ? snap.A.trim() : "";
+        const gammaRaw = typeof snap.gamma === "string" ? snap.gamma.trim() : "";
+        if (aRaw !== "") {
+          const el = document.getElementById("curveA");
+          if (el) el.value = aRaw;
+        }
+        if (gammaRaw !== "") {
+          const el = document.getElementById("curveGamma");
+          if (el) el.value = gammaRaw;
+        }
+      }
+
+      function saveVisualizerAlphaBetaSnapshot() {
+        try {
+          const token = requirePresetKey();
+          const p = getPwLegacySolidityParams();
+          const raw = localStorage.getItem(VIS_ALPHA_BETA_KEY);
+          let map = {};
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === "object") map = parsed;
+            } catch {
+              map = {};
+            }
+          }
+          map[token] = {
+            aWad: p.aWad.toString(),
+            lambdaWad: p.lambdaWad.toString(),
+            updatedAt: new Date().toISOString(),
+          };
+          localStorage.setItem(VIS_ALPHA_BETA_KEY, JSON.stringify(map));
+        } catch {
+          // no-op
+        }
+      }
+
+      function saveVisualizerCurveSnapshot() {
+        try {
+          const token = requirePresetKey();
+          const A = String(requireInputValue("curveA")).trim();
+          const gamma = String(requireInputValue("curveGamma")).trim();
+          if (!A || !gamma) return;
+          const raw = localStorage.getItem(VIS_CURVE_KEY);
+          let map = {};
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed === "object") map = parsed;
+            } catch {
+              map = {};
+            }
+          }
+          map[token] = {
+            A,
+            gamma,
+            updatedAt: new Date().toISOString(),
+          };
+          localStorage.setItem(VIS_CURVE_KEY, JSON.stringify(map));
+        } catch {
+          // no-op
+        }
+      }
+
+      function collectVisualizerUiState() {
+        const state = {};
+        const controls = document.querySelectorAll(
+          "input[id], select[id], textarea[id]",
+        );
+        controls.forEach((el) => {
+          const id = el.id;
+          if (!id) return;
+          if (el instanceof HTMLInputElement && el.type === "checkbox") {
+            state[id] = !!el.checked;
+            return;
+          }
+          state[id] = String(el.value ?? "");
+        });
+        return state;
+      }
+
+      function saveVisualizerUiState() {
+        try {
+          const state = collectVisualizerUiState();
+          localStorage.setItem(VIS_UI_STATE_KEY, JSON.stringify(state));
+        } catch {
+          // ignore storage failures
+        }
+      }
+
+      function restoreVisualizerUiState() {
+        try {
+          const raw = localStorage.getItem(VIS_UI_STATE_KEY);
+          if (!raw) return false;
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object") return false;
+
+          let applied = false;
+          Object.entries(parsed).forEach(([id, value]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el instanceof HTMLInputElement && el.type === "checkbox") {
+              el.checked = Boolean(value);
+              applied = true;
+              return;
+            }
+            el.value = String(value ?? "");
+            applied = true;
+          });
+
+          return applied;
+        } catch {
+          return false;
+        }
+      }
+
+      function getPwLegacyJsParams() {
+        // Display values come from the cubic-mapped fine inputs (or
+        // slider-position fallback) so the JS-side curve renderer
+        // mirrors what the user sees in the field.
+        return {
+          mode: "v15",
+          a: pwAlphaDisplayValue(),
+          lambda: pwLambdaDisplayValue(),
+        };
+      }
+
+      function getPwJsParams() {
+        return getPwLegacyJsParams();
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      //  Slider & Preset Handling
+      // ═══════════════════════════════════════════════════════════════
+
+      function getParams() {
+        return {
+          x1: parseInt(document.getElementById("x1").value) / 100,
+          y1: parseInt(document.getElementById("y1").value) / 100,
+          x2: parseInt(document.getElementById("x2").value) / 100,
+          y2: parseInt(document.getElementById("y2").value) / 100,
+        };
+      }
+
+      function getParamsBigInt() {
+        const p = getParams();
+        return {
+          x1: BigInt(Math.round(p.x1 * 1e18)),
+          y1: BigInt(Math.round(p.y1 * 1e18)),
+          x2: BigInt(Math.round(p.x2 * 1e18)),
+          y2: BigInt(Math.round(p.y2 * 1e18)),
+        };
+      }
+
+      function applyPreset(name) {
+        const p = PRESETS[name];
+        if (!p) return;
+        document.getElementById("x1").value = p.x1;
+        document.getElementById("y1").value = p.y1;
+        document.getElementById("x2").value = p.x2;
+        document.getElementById("y2").value = p.y2;
+        document.getElementById("bezierAmp").value = p.amp || 10; // default 1.0
+
+        // Update active button
+        document
+          .querySelectorAll(".presets-row .btn")
+          .forEach((b) => b.classList.remove("active"));
+        event.target.classList.add("active");
+
+        onSliderChange();
+      }
+
+      function curveReadIntInputStrict(id, minValue = 1) {
+        const el = document.getElementById(id);
+        if (!el) throw new Error(`Missing required input: ${id}`);
+        const parsed = Number.parseInt(String(el.value), 10);
+        if (!Number.isFinite(parsed) || parsed < minValue) {
+          throw new Error(`Invalid ${id}: expected integer >= ${minValue}`);
+        }
+        return parsed;
+      }
+
+      function curveReadBigIntInputStrict(id) {
+        const el = document.getElementById(id);
+        if (!el) throw new Error(`Missing required input: ${id}`);
+        const raw = String(el.value || "").trim();
+        if (!/^\d+$/.test(raw)) {
+          throw new Error(`Invalid ${id}: expected decimal bigint`);
+        }
+        const parsed = BigInt(raw);
+        if (parsed <= 0n) {
+          throw new Error(`Invalid ${id}: expected > 0`);
+        }
+        return parsed;
+      }
+
+      function getCurveBenchmarkParams() {
+        const presetKey = requirePresetKey();
+        const mathModeRaw = String(requireInputValue("curveMathMode")).trim();
+        if (mathModeRaw !== "crypto" && mathModeRaw !== "stableswap") {
+          throw new Error(`Invalid curveMathMode: ${mathModeRaw}`);
+        }
+        const mathMode = mathModeRaw;
+
+        const A = BigInt(curveReadIntInputStrict("curveA", 1));
+        const gamma = curveReadBigIntInputStrict("curveGamma");
+
+        // Only the fields the API payload and the chart legend consume.
+        // The old synthetic client-side pool fields (priceScale,
+        // precisions, D) died with the JS reference-math mirror — the
+        // backend owns the reference pool construction now.
+        return {
+          presetKey,
+          mathMode,
+          A,
+          gamma,
+        };
+      }
+
+      function getCurveLegendLabel(params) {
+        const aText =
+          params.A <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(params.A).toLocaleString()
+            : params.A.toString();
+        return `YieldBasis ${params.mathMode} (${params.presetKey}, A=${aText}, no-fee)`;
+      }
+
+      function requireInputValue(id) {
+        const el = document.getElementById(id);
+        if (!el || typeof el.value !== "string") {
+          throw new Error(`Missing required input: ${id}`);
+        }
+        return el.value;
+      }
+
+      function getVisualizerApiPresetKey() {
+        const raw = String(requireInputValue("curvePreset"))
+          .toUpperCase()
+          .trim();
+        if (raw !== "WETH" && raw !== "WBTC") {
+          throw new Error(`Unsupported preset: ${raw}`);
+        }
+        return raw;
+      }
+
+      function readCoverageInitialPriceForApi() {
+        const raw = requireInputValue("coverageInitialPrice")
+          .trim()
+          .replaceAll(/\s+/g, "")
+          .replaceAll(",", ".");
+        // Empty field ⇒ send the request WITHOUT `initialPrice`
+        // (undefined keys are dropped by JSON.stringify). The backend
+        // then seeds the pool from its canonical per-preset price and
+        // echoes it back as `response.initialPrice`, which repopulates
+        // the field — no frontend hardcode of any price literal.
+        if (raw === "") return undefined;
+        const parsed = Number.parseFloat(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new Error(
+            "Invalid coverageInitialPrice: expected positive number",
+          );
+        }
+        return parsed;
+      }
+
+      // Populate the initial-price field from the backend echo when the
+      // user has not typed a value. A user-typed value always wins until
+      // the next preset switch clears the field (see onCurvePresetChange).
+      function populateCoverageInitialPriceFromResponse(apiPayload) {
+        const el = document.getElementById("coverageInitialPrice");
+        if (!el) return;
+        if (String(el.value ?? "").trim() !== "") return;
+        const p = Number(apiPayload?.initialPrice);
+        if (!Number.isFinite(p) || p <= 0) return;
+        el.value = String(p);
+      }
+
+      function buildVisualizerApiPayload(curveParams) {
+        const pwSol = getPwSolidityParams();
+        const samples = Math.max(20, Math.min(400, NUM_SAMPLES));
+        // aSeg policy is fixed to `state-fp` server-side (see
+        // `EquilibraAmmCfg.asegFpIter`); UI no longer ships those fields.
+        return {
+          presetKey: getVisualizerApiPresetKey(),
+          samples,
+          maxDepletionBps: 9900,
+          initialPrice: readCoverageInitialPriceForApi(),
+          equilibra: {
+            // Two-knob (a, λ) sourced directly from the live sliders.
+            aWad: pwSol.aWad.toString(),
+            lambdaWad: pwSol.lambdaWad.toString(),
+          },
+          curve: {
+            mathMode:
+              curveParams.mathMode === "crypto" ? "crypto" : "stableswap",
+            A: Number(curveParams.A),
+            gamma: curveParams.gamma.toString(),
+          },
+        };
+      }
+
+      async function fetchVisualizerSeriesFromApi(payload, signal) {
+        const res = await fetch(VISUALIZER_API_ENDPOINT, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          signal,
+        });
+        const text = await res.text();
+        let json = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch {
+          json = null;
+        }
+        if (!res.ok) {
+          throw new Error((json && json.error) || text || `HTTP ${res.status}`);
+        }
+        return json;
+      }
+
+      function seriesPenalties(series) {
+        if (!Array.isArray(series)) {
+          throw new Error("Invalid API payload: slippage series must be array");
+        }
+        return series.map((pt) => {
+          if (!pt || pt.penalty === null || pt.penalty === undefined) {
+            return Number.POSITIVE_INFINITY;
+          }
+          const v = Number(pt.penalty);
+          if (!Number.isFinite(v)) return Number.POSITIVE_INFINITY;
+          return Math.max(0, v);
+        });
+      }
+
+      function seriesLiquidity(series) {
+        if (!Array.isArray(series)) {
+          throw new Error(
+            "Invalid API payload: liquidity series must be array",
+          );
+        }
+        return series.map((pt) => {
+          const v = Number(pt?.liquidity);
+          return Number.isFinite(v) && v >= 0 ? v : 0;
+        });
+      }
+
+      function requirePresetKey(presetKey) {
+        const keyRaw = String(
+          presetKey !== undefined
+            ? presetKey
+            : requireInputValue("curvePreset"),
+        )
+          .toUpperCase()
+          .trim();
+        if (keyRaw !== "WETH" && keyRaw !== "WBTC") {
+          throw new Error(`Unsupported preset: ${keyRaw}`);
+        }
+        return keyRaw;
+      }
+
+      function applyCurvePresetNoRefresh(presetKey) {
+        const key = requirePresetKey(presetKey);
+        if (!CURVE_BENCHMARK_PRESETS) {
+          throw new Error("YieldBasis reference presets are not initialized");
+        }
+        const preset = CURVE_BENCHMARK_PRESETS[key];
+        if (!preset) {
+          throw new Error(`Missing curve preset: ${key}`);
+        }
+        const setValue = (id, value) => {
+          const el = document.getElementById(id);
+          if (el) el.value = String(value);
+        };
+        setValue("curveA", preset.A);
+        setValue("curveGamma", preset.gamma);
+      }
+
+      function onCurvePresetChange() {
+        const presetKey = requirePresetKey();
+        // Step 1: lay down factory defaults. This is what the user sees when
+        // the selected token has never been customized before.
+        applyCurvePresetNoRefresh(presetKey);
+        const presetDefaults = getPwDefaultsForSelectedPreset();
+        applyPwLegacyDefaultsNoRefresh(presetDefaults);
+        // Step 2: if the user customized this specific token earlier and the
+        // knobs are still stored per-token in localStorage, restore them on
+        // top of the defaults. Without this, the subsequent onSliderChange()
+        // auto-save would persist defaults and erase the customization.
+        applyCurvePersistedOverlayNoRefresh(presetKey);
+        applyAlphaBetaPersistedOverlayNoRefresh(presetKey);
+        // A preset switch invalidates any user-typed initial price: the
+        // field is cleared so the next response's canonical per-preset
+        // backend price repopulates it.
+        const priceEl = document.getElementById("coverageInitialPrice");
+        if (priceEl) priceEl.value = "";
+        onSliderChange();
+      }
+
+      function getPwDefaultsForSelectedPreset() {
+        const presetKey = requirePresetKey();
+        if (!PW_PRESET_BY_TOKEN) {
+          throw new Error("Equilibra presets are not initialized");
+        }
+        return PW_PRESET_BY_TOKEN[presetKey];
+      }
+
+      function applyPwLegacyDefaultsNoRefresh(defaults) {
+        if (!defaults) {
+          throw new Error("Missing preset defaults for PW");
+        }
+        const d = defaults;
+
+        // V1.5 contract: every Equilibra preset arrives with `aWad` /
+        // `lambdaWad` as a bigint (WAD-scaled). The helper routes both
+        // the slider position (cubic-mapped) and the fine input value
+        // in lockstep, so a fresh default always lands the user on a
+        // consistent (slider, fine) pair.
+        const toBigInt = (raw, fallback) => {
+          if (typeof raw === "bigint") return raw;
+          if (typeof raw === "string" && raw.length > 0) {
+            try { return BigInt(raw); } catch { /* fall through */ }
+          }
+          if (typeof raw === "number" && Number.isFinite(raw)) {
+            // Treat a bare decimal as a fraction of WAD (legacy preset
+            // shape: `aWad: 0.5` ⇒ 5e17). Anything outside the lab
+            // band is clamped by `setLegacySliderFromScaled`.
+            return BigInt(Math.round(raw * 1e18));
+          }
+          return BigInt(Math.round(fallback * 1e18));
+        };
+
+        setLegacySliderFromScaled("pwAlpha", toBigInt(d.aWad, 0.5), 5);
+        setLegacySliderFromScaled("pwLambda", toBigInt(d.lambdaWad, 0.01), 5);
+      }
+
+      function resetPwDefaults() {
+        // Defaults are bound to currently selected preset (WBTC/WETH).
+        const presetKey = requirePresetKey();
+        applyCurvePresetNoRefresh(presetKey);
+        const presetDefaults = getPwDefaultsForSelectedPreset();
+        applyPwLegacyDefaultsNoRefresh(presetDefaults);
+        onSliderChange();
+      }
+
+      // ─────────────────────────────────────────────────────────────────
+      //  V1.5 (a, λ) slider mapping
+      //
+      //  Slider DOM value is a linear position `t ∈ [0, 1]` (step 0.0001
+      //  ⇒ 10001 stops). The displayed α/λ is the cubic-mapped value:
+      //
+      //    α = α_max − (α_max − α_min) · (1 − t)^3   // fine near the
+      //                                              //   upper bound
+      //    λ = λ_min + (λ_max − λ_min) · t^3         // fine near the
+      //                                              //   lower bound
+      //
+      //  The fine-input number field carries the AUTHORITATIVE real
+      //  value (α or λ) — `getPwLegacySolidityParams`,
+      //  `saveVisualizerAlphaBetaSnapshot`, `updatePwSolidity` all read
+      //  from it so user-typed precision is never lost to slider step
+      //  snapping. The slider position is reconstructed via the inverse
+      //  cube root mapping whenever the fine value changes externally
+      //  (preset load, snapshot restore, manual typing).
+      // ─────────────────────────────────────────────────────────────────
+      // (Band bounds PW_ALPHA_MIN/MAX + PW_LAMBDA_MIN/MAX live in the
+      //  single-source research-band block at the top of this script.)
+      const PW_NONLINEAR_K = 3; // cubic ramp
+
+      function _pwClamp(value, lo, hi) {
+        if (!Number.isFinite(value)) return lo;
+        if (value < lo) return lo;
+        if (value > hi) return hi;
+        return value;
+      }
+
+      function pwAlphaTToValue(t) {
+        const tt = _pwClamp(t, 0, 1);
+        const oneMinus = 1 - tt;
+        return PW_ALPHA_MAX -
+          (PW_ALPHA_MAX - PW_ALPHA_MIN) * Math.pow(oneMinus, PW_NONLINEAR_K);
+      }
+      function pwAlphaValueToT(value) {
+        const v = _pwClamp(value, PW_ALPHA_MIN, PW_ALPHA_MAX);
+        const frac = (PW_ALPHA_MAX - v) / (PW_ALPHA_MAX - PW_ALPHA_MIN);
+        return 1 - Math.pow(frac, 1 / PW_NONLINEAR_K);
+      }
+      function pwLambdaTToValue(t) {
+        const tt = _pwClamp(t, 0, 1);
+        return PW_LAMBDA_MIN +
+          (PW_LAMBDA_MAX - PW_LAMBDA_MIN) * Math.pow(tt, PW_NONLINEAR_K);
+      }
+      function pwLambdaValueToT(value) {
+        const v = _pwClamp(value, PW_LAMBDA_MIN, PW_LAMBDA_MAX);
+        const frac = (v - PW_LAMBDA_MIN) / (PW_LAMBDA_MAX - PW_LAMBDA_MIN);
+        return Math.pow(frac, 1 / PW_NONLINEAR_K);
+      }
+
+      // Read the authoritative (a, λ) DISPLAY values from the fine
+      // inputs. Falls back to the cubic mapping of the slider position
+      // if the fine input is empty / malformed (e.g. just after a
+      // preset import that updates the slider directly).
+      function pwAlphaDisplayValue() {
+        const fineEl = document.getElementById("pwAlphaFine");
+        const fine = Number.parseFloat(String(fineEl?.value ?? ""));
+        if (Number.isFinite(fine))
+          return _pwClamp(fine, PW_ALPHA_MIN, PW_ALPHA_MAX);
+        const t = Number.parseFloat(
+          String(document.getElementById("pwAlpha")?.value ?? "0"),
+        );
+        return pwAlphaTToValue(t);
+      }
+      function pwLambdaDisplayValue() {
+        const fineEl = document.getElementById("pwLambdaFine");
+        const fine = Number.parseFloat(String(fineEl?.value ?? ""));
+        if (Number.isFinite(fine))
+          return _pwClamp(fine, PW_LAMBDA_MIN, PW_LAMBDA_MAX);
+        const t = Number.parseFloat(
+          String(document.getElementById("pwLambda")?.value ?? "0"),
+        );
+        return pwLambdaTToValue(t);
+      }
+
+      // Slider → fine: drag updates the fine input and re-renders.
+      function onPwAlphaSliderInput() {
+        const slider = document.getElementById("pwAlpha");
+        const fine = document.getElementById("pwAlphaFine");
+        if (!slider || !fine) return;
+        const t = Number.parseFloat(String(slider.value));
+        const v = pwAlphaTToValue(t);
+        // Only overwrite fine input if the user isn't actively typing
+        // there — saves any in-progress keystrokes.
+        if (document.activeElement !== fine) fine.value = v.toFixed(5);
+        onSliderChange();
+      }
+      function onPwLambdaSliderInput() {
+        const slider = document.getElementById("pwLambda");
+        const fine = document.getElementById("pwLambdaFine");
+        if (!slider || !fine) return;
+        const t = Number.parseFloat(String(slider.value));
+        const v = pwLambdaTToValue(t);
+        if (document.activeElement !== fine) fine.value = v.toFixed(5);
+        onSliderChange();
+      }
+
+      // Fine → slider: keystroke (`oninput`) live-positions the slider
+      // and re-renders without snapping the user's typed precision.
+      // `oninput` does NOT format the field back at the user — they
+      // keep editing freely; on `change` (blur / Enter) we commit and
+      // format.
+      function onPwFineInputType(inputId, sliderId) {
+        const input = document.getElementById(inputId);
+        const slider = document.getElementById(sliderId);
+        if (!input || !slider) return;
+        const raw = Number.parseFloat(String(input.value));
+        if (!Number.isFinite(raw)) return; // ignore mid-typing junk
+        let t;
+        if (sliderId === "pwAlpha") {
+          t = pwAlphaValueToT(raw);
+        } else {
+          t = pwLambdaValueToT(raw);
+        }
+        slider.value = String(t);
+        // Do NOT rewrite the fine input here — let the user finish.
+        onSliderChange();
+      }
+      function onPwFineInputCommit(inputId, sliderId) {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        const raw = Number.parseFloat(String(input.value));
+        const lo = sliderId === "pwAlpha" ? PW_ALPHA_MIN : PW_LAMBDA_MIN;
+        const hi = sliderId === "pwAlpha" ? PW_ALPHA_MAX : PW_LAMBDA_MAX;
+        const clamped = _pwClamp(raw, lo, hi);
+        input.value = clamped.toFixed(5);
+        onPwFineInputType(inputId, sliderId);
+      }
+
+      function setLegacySliderFromScaled(id, scaledValue, rawDecimals) {
+        const el = document.getElementById(id);
+        if (!el) return;
+
+        // V1.5 (a, λ) sliders: position `t ∈ [0, 1]` (cubic-mapped to
+        // the real value). The fine input holds the authoritative
+        // decimal — write to it first, then back-solve the slider t.
+        if (id === "pwAlpha" || id === "pwLambda") {
+          const wad = 1000000000000000000n; // 1e18
+          const units = 10n ** BigInt(rawDecimals);
+          const rawUnits = (scaledValue * units) / wad;
+          const factor = Number(units);
+          // `scaledValue` may originate in the visualizer's wider
+          // research band; clamp to the on-chain envelope ONLY for the
+          // displayed decimal so the slider can still position it.
+          const numeric = Number(rawUnits) / factor;
+          const lo = id === "pwAlpha" ? PW_ALPHA_MIN : PW_LAMBDA_MIN;
+          const hi = id === "pwAlpha" ? PW_ALPHA_MAX : PW_LAMBDA_MAX;
+          const clamped = _pwClamp(numeric, lo, hi);
+          const fineId = id + "Fine";
+          const fineEl = document.getElementById(fineId);
+          if (fineEl) fineEl.value = clamped.toFixed(rawDecimals);
+          const t = id === "pwAlpha"
+            ? pwAlphaValueToT(clamped)
+            : pwLambdaValueToT(clamped);
+          el.value = String(t);
+          return;
+        }
+
+        // Legacy fall-through for any other slider that may still
+        // carry `value = display·1` semantics (e.g. Curve V2 lab
+        // controls). Convert the on-chain WAD-scaled bigint back into a
+        // fixed-point decimal with `rawDecimals` fractional digits so
+        // the slider keeps a precise representation.
+        const wad = 1000000000000000000n; // 1e18
+        const units = 10n ** BigInt(rawDecimals);
+        let rawUnits = (scaledValue * units) / wad;
+
+        const factor = Number(units);
+        const minUnits = BigInt(
+          Math.round(Number.parseFloat(el.min || "0") * factor),
+        );
+        const maxUnits = BigInt(
+          Math.round(Number.parseFloat(el.max || "0") * factor),
+        );
+        if (rawUnits < minUnits) rawUnits = minUnits;
+        if (rawUnits > maxUnits) rawUnits = maxUnits;
+
+        const whole = rawUnits / units;
+        const frac = rawUnits % units;
+        if (rawDecimals === 0) {
+          el.value = whole.toString();
+        } else {
+          el.value = `${whole.toString()}.${frac.toString().padStart(rawDecimals, "0")}`;
+        }
+      }
+
+      function updatePwModeUI() {
+        const showLabel = document.getElementById("showPowerWallText");
+        if (showLabel) {
+          showLabel.innerHTML = "Equilibra (a, &lambda;)";
+        }
+        updatePwFormulaModeUI();
+      }
+
+      function updatePwFormulaModeUI() {
+        // single formula mode
+      }
+
+      function toSolidityUint(floatVal) {
+        // Negative values: show as int256 (not valid for current uint256 contract)
+        const scaled = BigInt(Math.round(floatVal * 1e18));
+        return scaled.toString();
+      }
+
+      function copySolidityParams() {
+        const bp = getParamsBigInt();
+        const ampVal =
+          parseInt(document.getElementById("bezierAmp").value) / 10;
+        const ampScaled = BigInt(Math.round(ampVal * 1e18));
+        const text = `${bp.x1}, ${bp.y1}, ${bp.x2}, ${bp.y2}, ${ampScaled}`;
+        navigator.clipboard.writeText(text).then(() => {
+          const btn = document.querySelector(".btn-copy");
+          btn.textContent = "Copied!";
+          setTimeout(() => {
+            btn.textContent = "Copy";
+          }, 1500);
+        });
+      }
+
+      function updatePwSolidity() {
+        const p = getPwLegacySolidityParams();
+        const modeHint = document.getElementById("solPwModeHint");
+        if (modeHint) {
+          modeHint.textContent = "Solidity:";
+        }
+
+        document.getElementById("solPwAmpLabel").innerHTML = "aWad=";
+        document.getElementById("solPwW1Label").innerHTML = "&lambda;Wad=";
+        document.getElementById("solPwKLabel").innerHTML = "";
+        document.getElementById("solPwW2Label").innerHTML = "";
+        document.getElementById("solPwK2Label").innerHTML = "";
+
+        document.getElementById("solPwLineW1").style.display = "";
+        document.getElementById("solPwLineK").style.display = "none";
+        document.getElementById("solPwLineW2").style.display = "none";
+        document.getElementById("solPwLineK2").style.display = "none";
+        document.getElementById("solPwLineDRef").style.display = "none";
+        document.getElementById("solPwLineWWall").style.display = "none";
+        document.getElementById("solPwLineAmp").style.display = "";
+
+        document.getElementById("solPwAmp").textContent = p.aWad.toString();
+        const lambdaEl = document.getElementById("solPwW1");
+        if (lambdaEl) lambdaEl.textContent = p.lambdaWad.toString();
+      }
+
+      function copyPwSolidityParams() {
+        const p = getPwLegacySolidityParams();
+        const text = `aWad: ${p.aWad}n, lambdaWad: ${p.lambdaWad}n`;
+        navigator.clipboard.writeText(text).then(() => {
+          const btn = document.getElementById("pwCopyBtn");
+          btn.textContent = "Copied!";
+          setTimeout(() => {
+            btn.textContent = "Copy";
+          }, 1500);
+        });
+      }
+
+      function openPwPastePanel() {
+        const panel = document.getElementById("pwPastePanel");
+        const status = document.getElementById("pwPasteStatus");
+        const input = document.getElementById("pwPasteInput");
+        if (!panel) return;
+        panel.style.display = "";
+        if (status) {
+          status.textContent = "";
+          status.style.color = "var(--text-muted)";
+        }
+        if (input) {
+          input.value = "";
+          input.focus();
+        }
+      }
+
+      function closePwPastePanel() {
+        const panel = document.getElementById("pwPastePanel");
+        const status = document.getElementById("pwPasteStatus");
+        const input = document.getElementById("pwPasteInput");
+        if (panel) panel.style.display = "none";
+        if (status) {
+          status.textContent = "";
+          status.style.color = "var(--text-muted)";
+        }
+        if (input) input.value = "";
+      }
+
+      function parsePwParamsString(rawText) {
+        const text = String(rawText || "").trim();
+        if (!text) {
+          return { ok: false, error: "Empty input" };
+        }
+
+        const parsed = {};
+        const pairRe = /([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([-+]?\d+(?:\.\d+)?n?)/g;
+        let match;
+        while ((match = pairRe.exec(text)) !== null) {
+          parsed[match[1].toLowerCase()] = match[2];
+        }
+
+        if (Object.keys(parsed).length === 0) {
+          return { ok: false, error: "No key:value pairs found" };
+        }
+
+        const parseBigIntField = (...keys) => {
+          for (const key of keys) {
+            // `parsed` keys are lowercased at capture time (single
+            // normalization point: the pair regex loop above). Resolve
+            // the canonical camelCase name here so call sites keep the
+            // displayed field names.
+            const k = key.toLowerCase();
+            if (!(k in parsed)) continue;
+            const raw = String(parsed[k]).trim().replace(/n$/i, "");
+            if (!/^-?\d+$/.test(raw)) return null;
+            try {
+              return BigInt(raw);
+            } catch {
+              return null;
+            }
+          }
+          return undefined;
+        };
+
+        const aWad = parseBigIntField("aWad");
+        const lambdaWad = parseBigIntField("lambdaWad");
+        if (aWad === null || lambdaWad === null) {
+          return { ok: false, error: "Invalid numeric value in string" };
+        }
+        if (aWad === undefined || lambdaWad === undefined) {
+          return {
+            ok: false,
+            error: "Missing required field (aWad and/or lambdaWad)",
+          };
+        }
+
+        return {
+          ok: true,
+          aWad,
+          lambdaWad,
+        };
+      }
+
+      function applyPwParamsFromPaste() {
+        const status = document.getElementById("pwPasteStatus");
+        const input = document.getElementById("pwPasteInput");
+        if (!status || !input) return;
+
+        const parsed = parsePwParamsString(input.value);
+        if (!parsed.ok) {
+          status.textContent = parsed.error || "Parse error";
+          status.style.color = "var(--accent-red)";
+          return;
+        }
+
+        if (parsed.aWad !== undefined) {
+          const aScaled = parsed.aWad < 0n ? 0n : parsed.aWad;
+          setLegacySliderFromScaled("pwAlpha", aScaled, 5);
+        }
+        if (parsed.lambdaWad !== undefined) {
+          const lScaled = parsed.lambdaWad < 0n ? 0n : parsed.lambdaWad;
+          setLegacySliderFromScaled("pwLambda", lScaled, 5);
+        }
+
+        status.textContent = "Applied";
+        status.style.color = "var(--accent-green)";
+        onSliderChange();
+        closePwPastePanel();
+      }
+
+      function onSliderChange() {
+        // Update displayed values
+        const p = getParams();
+        document.getElementById("x1Val").textContent = p.x1.toFixed(2);
+        document.getElementById("y1Val").textContent = p.y1.toFixed(2);
+        document.getElementById("x2Val").textContent = p.x2.toFixed(2);
+        document.getElementById("y2Val").textContent = p.y2.toFixed(2);
+
+        // Update Solidity uint256 values
+        document.getElementById("solX1").textContent = toSolidityUint(p.x1);
+        document.getElementById("solY1").textContent = toSolidityUint(p.y1);
+        document.getElementById("solX2").textContent = toSolidityUint(p.x2);
+        document.getElementById("solY2").textContent = toSolidityUint(p.y2);
+        const bAmp2 = parseInt(document.getElementById("bezierAmp").value) / 10;
+        document.getElementById("solAmp").textContent = toSolidityUint(bAmp2);
+
+        const k = parseInt(document.getElementById("kVal").value) / 10;
+        document.getElementById("kDisplay").textContent = k.toFixed(1);
+
+        const rN = parseInt(document.getElementById("rationalN").value) / 10;
+        document.getElementById("rationalNDisplay").textContent = rN.toFixed(1);
+
+        const kOff = parseInt(document.getElementById("kOffset").value) / 100;
+        document.getElementById("kOffsetDisplay").textContent = kOff.toFixed(2);
+
+        const kAmp = parseInt(document.getElementById("kAmp").value) / 10;
+        document.getElementById("kAmpDisplay").textContent = kAmp.toFixed(1);
+
+        const bAmp = parseInt(document.getElementById("bezierAmp").value) / 10;
+        document.getElementById("bezierAmpVal").textContent = bAmp.toFixed(1);
+
+        const rOff =
+          parseInt(document.getElementById("rationalOffset").value) / 100;
+        document.getElementById("rationalOffsetDisplay").textContent =
+          rOff.toFixed(2);
+
+        // The DISPLAY value is read via the helper so we never re-do
+        // the cubic mapping inline. Re-projecting through the helper
+        // also lets a programmatic slider update (preset import,
+        // snapshot restore) refresh the fine field in lockstep without
+        // overwriting an in-progress edit.
+        const pwAlpha = pwAlphaDisplayValue();
+        document.getElementById("pwAlphaDisplay").textContent =
+          pwAlpha.toFixed(5);
+        const pwAlphaFineEl = document.getElementById("pwAlphaFine");
+        if (pwAlphaFineEl && document.activeElement !== pwAlphaFineEl) {
+          pwAlphaFineEl.value = pwAlpha.toFixed(5);
+        }
+
+        const pwLambda = pwLambdaDisplayValue();
+        const pwLambdaDisplayEl = document.getElementById("pwLambdaDisplay");
+        if (pwLambdaDisplayEl) pwLambdaDisplayEl.textContent = pwLambda.toFixed(5);
+        const pwLambdaFineEl = document.getElementById("pwLambdaFine");
+        if (pwLambdaFineEl && document.activeElement !== pwLambdaFineEl) {
+          pwLambdaFineEl.value = pwLambda.toFixed(5);
+        }
+
+        updatePwSolidity();
+        saveVisualizerAlphaBetaSnapshot();
+        saveVisualizerCurveSnapshot();
+        saveVisualizerUiState();
+
+        if (updateTimer) clearTimeout(updateTimer);
+        updateTimer = setTimeout(() => {
+          updateCharts();
+        }, UPDATE_DEBOUNCE_MS);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      //  Chart Updates
+      // ═══════════════════════════════════════════════════════════════
+
+      function renderChartsFromSeriesData(
+        apiPayload,
+        curveParams,
+        pw,
+        showUni,
+        showCurve,
+        showPowerWall,
+      ) {
+        const slippage = apiPayload?.slippage;
+        if (!slippage) throw new Error("Invalid API payload: missing slippage");
+
+        const eqSeries = slippage.equilibra;
+        const uniSeries = slippage.uniswapV2;
+        const curveSeries = slippage.curve;
+
+        const dVals = eqSeries.map((pt) => Number(pt?.d));
+        if (dVals.length === 0) {
+          throw new Error("Invalid API payload: equilibra series is empty");
+        }
+        if (dVals.some((d) => !Number.isFinite(d) || d < 0)) {
+          throw new Error("Invalid API payload: equilibra d-values");
+        }
+        const eqVals = seriesPenalties(eqSeries);
+        const uniRefVals = seriesPenalties(uniSeries);
+        const curveRefVals = seriesPenalties(curveSeries);
+
+        const eqLiq = seriesLiquidity(eqSeries);
+        const uniLiqRaw = seriesLiquidity(uniSeries);
+        const curveLiqRaw = seriesLiquidity(curveSeries);
+
+        const uniVals = showUni ? uniRefVals : null;
+        const curveVals = showCurve ? curveRefVals : null;
+        const powerWallVals = showPowerWall ? eqVals : null;
+        const penaltyVals = powerWallVals ?? dVals.map(() => 0);
+
+        const liqPrimary = eqLiq;
+        const liqUni = showUni ? uniLiqRaw : null;
+        const liqCurve = showCurve ? curveLiqRaw : null;
+        const liqPowerWall = showPowerWall ? eqLiq : null;
+
+        updatePenaltyChart(
+          dVals,
+          penaltyVals,
+          null,
+          false,
+          0,
+          uniVals,
+          showUni,
+          curveVals,
+          showCurve,
+          curveParams,
+          null,
+          false,
+          0,
+          powerWallVals,
+          showPowerWall,
+          pw,
+        );
+
+        updateLiquidityChart(
+          dVals,
+          liqPrimary,
+          null,
+          false,
+          0,
+          liqUni,
+          showUni,
+          liqCurve,
+          showCurve,
+          curveParams,
+          null,
+          false,
+          0,
+          liqPowerWall,
+          showPowerWall,
+          pw,
+        );
+
+        updateMetrics();
+        updatePwFitMetrics(
+          dVals,
+          powerWallVals,
+          liqPowerWall,
+          uniRefVals,
+          curveRefVals,
+          uniLiqRaw,
+          curveLiqRaw,
+        );
+        updateCoverageComparisonFromApi(apiPayload, curveParams);
+        updateIsolatedSwapsFromApi(apiPayload);
+      }
+
+      // Backend (`build_visualizer_series` in `simulator/src/app/visualizer.rs`)
+      // is the single source of truth for Equilibra/Curve/Uniswap series — it
+      // runs the same U256 math kernel as the on-chain pool, with adaptive
+      // sampling around high-slope (and unreachable-tail) segments. The
+      // frontend must never recompute the curve in float64: that path
+      // produced visible staircase artefacts at low-λ / fractional-γ
+      // presets where catastrophic cancellation in `targetX`/`targetY`
+      // (subtraction of two near-equal large terms) blew up f64 penalties
+      // by 20+ orders of magnitude while U256 stayed smooth.
+      function renderApiPayload(
+        apiPayload,
+        curveParams,
+        pw,
+        showUni,
+        showCurve,
+        showPowerWall,
+      ) {
+        renderChartsFromSeriesData(
+          apiPayload,
+          curveParams,
+          pw,
+          showUni,
+          showCurve,
+          showPowerWall,
+        );
+      }
+
+      async function updateCharts() {
+        // ── Parameter collection ─────────────────────────────────────
+        // The strict input readers (getCurveBenchmarkParams,
+        // readCoverageInitialPriceForApi via buildVisualizerApiPayload)
+        // THROW on malformed user input. Catch that here, in a block of
+        // its own BEFORE the fetch try below (whose catch references
+        // reqId — not yet declared at this point), so a bad field
+        // surfaces as a visible banner instead of an unhandled
+        // rejection that silently freezes the charts (updateCharts is
+        // invoked from a debounce timer — nothing upstream catches).
+        // No fallback values are substituted: the user must fix the
+        // field.
+        let showUni;
+        let showCurve;
+        let showPowerWall;
+        let curveParams;
+        let pw;
+        let reqId;
+        let payload;
+        try {
+          showUni = document.getElementById("showUni").checked;
+          showCurve = document.getElementById("showCurve").checked;
+          curveParams = getCurveBenchmarkParams();
+          showPowerWall = document.getElementById("showPowerWall").checked;
+          pw = getPwJsParams();
+          reqId = ++visualizerApiReqId;
+          payload = buildVisualizerApiPayload(curveParams);
+        } catch (e) {
+          const src = document.getElementById("mSource");
+          if (src)
+            src.textContent = `Input error: ${(e?.message || e || "").toString().slice(0, 80)}`;
+          clearCurveAndEquilibraOnApiError();
+          return;
+        }
+
+        // Pure display toggles (showUni / showCurve / showPowerWall)
+        // do not change the request payload — re-render from the cached
+        // series instead of re-fetching identical server compute.
+        const payloadJson = JSON.stringify(payload);
+        if (visualizerSeriesData && payloadJson === visualizerSeriesPayloadJson) {
+          renderApiPayload(
+            visualizerSeriesData,
+            curveParams,
+            pw,
+            showUni,
+            showCurve,
+            showPowerWall,
+          );
+          return;
+        }
+
+        // While the new request is in flight, repaint with the most recent
+        // server payload so the UI is responsive. This briefly shows the
+        // previous slider's curve (~30-60 ms typical API latency) instead of
+        // a frozen chart — acceptable trade-off for guaranteed U256 fidelity.
+        if (visualizerSeriesData) {
+          try {
+            renderApiPayload(
+              visualizerSeriesData,
+              curveParams,
+              pw,
+              showUni,
+              showCurve,
+              showPowerWall,
+            );
+          } catch (e) {
+            console.warn(
+              "[Visualizer] stale-payload repaint failed:",
+              e?.message || e,
+            );
+          }
+        }
+
+        // Cancel any still-in-flight series request — only the newest
+        // slider state matters. Server compute that already started
+        // cannot be cancelled, but aborting stops browser-queued
+        // requests from being sent and frees the connection pool. The
+        // reqId guard below remains the authority for discarding stale
+        // responses that raced past the abort.
+        if (visualizerApiAbort) visualizerApiAbort.abort();
+        const abortCtl = new AbortController();
+        visualizerApiAbort = abortCtl;
+
+        try {
+          const apiPayload = await fetchVisualizerSeriesFromApi(
+            payload,
+            abortCtl.signal,
+          );
+          if (reqId !== visualizerApiReqId) return;
+          visualizerSeriesData = apiPayload;
+          visualizerSeriesPayloadJson = payloadJson;
+          populateCoverageInitialPriceFromResponse(apiPayload);
+          renderApiPayload(
+            apiPayload,
+            curveParams,
+            pw,
+            showUni,
+            showCurve,
+            showPowerWall,
+          );
+        } catch (e) {
+          // An abort means a newer request superseded this one — an
+          // expected control-flow event, never a user-facing error.
+          if (e?.name === "AbortError") return;
+          if (reqId !== visualizerApiReqId) return;
+          visualizerSeriesData = null;
+          visualizerSeriesPayloadJson = null;
+          console.warn(
+            "[Visualizer API] series fetch failed:",
+            e?.message || e,
+          );
+          const src = document.getElementById("mSource");
+          if (src)
+            src.textContent = `API error: ${(e?.message || e || "").toString().slice(0, 80)}`;
+          // Without this, Chart.js keeps the LAST successful kadr on
+          // screen → user thinks the curve "didn't react" to their
+          // input change. We strip the Curve / Equilibra series from
+          // both charts so the freeze is visually unambiguous and
+          // they know their A / γ value was rejected by the kernel.
+          clearCurveAndEquilibraOnApiError();
+        }
+      }
+
+      /// Clears the Curve and Equilibra datasets on both the
+      /// Slippage and Liquidity charts. The Uniswap series stays
+      /// because it does not depend on the curve params and is still
+      /// a useful baseline. Leaves the chart visible so the user can
+      /// see *which* curves disappeared (vs whole chart blanking,
+      /// which would obscure that they're seeing an error state).
+      function clearCurveAndEquilibraOnApiError() {
+        const stripDatasets = (chart) => {
+          if (!chart || !chart.data || !Array.isArray(chart.data.datasets))
+            return;
+          // Keep only Uniswap (deterministic constant-product, does
+          // not depend on the rejected A / γ params). Curve and
+          // Equilibra series are dropped so the user sees their
+          // input was rejected — instead of staring at the prior
+          // successful kadr that Chart.js would otherwise leave on
+          // screen.
+          chart.data.datasets = chart.data.datasets.filter((ds) =>
+            /uniswap/i.test(ds.label || ""),
+          );
+          try {
+            chart.update("none");
+          } catch (_) {
+            /* canvas may still be detaching during HMR; ignore */
+          }
+        };
+        stripDatasets(penaltyChart);
+        stripDatasets(penaltyZoomChart);
+        stripDatasets(liquidityChart);
+        stripDatasets(liquidityZoomChart);
+      }
+
+      function computeRmse(dVals, aVals, bVals, dMin, dMax) {
+        let sum = 0;
+        let cnt = 0;
+        for (let i = 0; i < dVals.length; i++) {
+          const d = dVals[i];
+          if (d < dMin || d > dMax) continue;
+          const a = aVals[i];
+          const b = bVals[i];
+          if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+          const diff = a - b;
+          sum += diff * diff;
+          cnt++;
+        }
+        if (cnt === 0) return Number.NaN;
+        return Math.sqrt(sum / cnt);
+      }
+
+      function computeAreaTrapz(dVals, vals, dMin, dMax, useAbs = false) {
+        let area = 0;
+        for (let i = 1; i < dVals.length; i++) {
+          const x0 = dVals[i - 1];
+          const x1 = dVals[i];
+          if (x1 <= dMin || x0 >= dMax) continue;
+
+          const y0 = vals[i - 1];
+          const y1 = vals[i];
+          if (!Number.isFinite(y0) || !Number.isFinite(y1)) continue;
+
+          const left = Math.max(x0, dMin);
+          const right = Math.min(x1, dMax);
+          if (right <= left) continue;
+
+          const span = x1 - x0;
+          if (span <= 0) continue;
+
+          const tLeft = (left - x0) / span;
+          const tRight = (right - x0) / span;
+          let yLeft = y0 + (y1 - y0) * tLeft;
+          let yRight = y0 + (y1 - y0) * tRight;
+          if (useAbs) {
+            yLeft = Math.abs(yLeft);
+            yRight = Math.abs(yRight);
+          }
+
+          area += 0.5 * (yLeft + yRight) * (right - left);
+        }
+        return area;
+      }
+
+      function computeRelativeAreaAbsErrorPct(dVals, aVals, bVals, dMin, dMax) {
+        const diffVals = aVals.map((a, i) => Math.abs(a - bVals[i]));
+        const absErrArea = computeAreaTrapz(dVals, diffVals, dMin, dMax, false);
+        const refArea = computeAreaTrapz(dVals, bVals, dMin, dMax, true);
+        if (
+          !Number.isFinite(absErrArea) ||
+          !Number.isFinite(refArea) ||
+          refArea <= 1e-12
+        ) {
+          return Number.NaN;
+        }
+        return (absErrArea / refArea) * 100;
+      }
+
+      function formatCoverageNumber(value, maxFrac = 2) {
+        if (value === Number.POSITIVE_INFINITY) return "∞";
+        if (value === Number.NEGATIVE_INFINITY) return "-∞";
+        if (!Number.isFinite(value)) return "-";
+        return value.toLocaleString("en-US", {
+          minimumFractionDigits: 0,
+          maximumFractionDigits: maxFrac,
+        });
+      }
+
+      function formatCoverageRange(fromPrice, toPrice) {
+        const fromInf =
+          fromPrice === Number.POSITIVE_INFINITY ||
+          fromPrice === Number.NEGATIVE_INFINITY;
+        const toInf =
+          toPrice === Number.POSITIVE_INFINITY ||
+          toPrice === Number.NEGATIVE_INFINITY;
+        if (
+          (!Number.isFinite(fromPrice) && !fromInf) ||
+          (!Number.isFinite(toPrice) && !toInf)
+        )
+          return "-";
+        const low = Math.min(fromPrice, toPrice);
+        const high = Math.max(fromPrice, toPrice);
+        return `${formatCoverageNumber(low, 2)} -> ${formatCoverageNumber(high, 2)}`;
+      }
+
+      // Convert Wp to effective slippage percent for UI.
+      // outputFactor = 1/(1+Wp) => slippage% = (1 - outputFactor) * 100
+      function wpToLossPct(wp) {
+        if (!Number.isFinite(wp) || wp < 0) return Number.NaN;
+        const denom = 1 + wp;
+        if (denom <= 1e-12) return Number.POSITIVE_INFINITY;
+        return (wp / denom) * 100;
+      }
+
+      function lossPctToWp(lossPct) {
+        const p = Number(lossPct);
+        if (!Number.isFinite(p) || p <= 0) return 0;
+        if (p >= 100) return Number.POSITIVE_INFINITY;
+        const ratio = p / 100;
+        return ratio / (1 - ratio);
+      }
+
+      function formatWpAxisTick(value) {
+        const wp = Number(value);
+        if (!Number.isFinite(wp)) return "";
+        const lossPct = wpToLossPct(wp);
+        return Number.isFinite(lossPct) ? `${lossPct.toFixed(1)}%` : "∞";
+      }
+
+      function niceLinearStep(rawStep) {
+        if (!Number.isFinite(rawStep) || rawStep <= 0) return 0.001;
+        const exponent = Math.floor(Math.log10(rawStep));
+        const scale = 10 ** exponent;
+        const norm = rawStep / scale;
+        let base = 10;
+        if (norm <= 1) base = 1;
+        else if (norm <= 2) base = 2;
+        else if (norm <= 2.5) base = 2.5;
+        else if (norm <= 5) base = 5;
+        return base * scale;
+      }
+
+      function computePenaltyZoomAxis(dVals, seriesList) {
+        const ZOOM_X_MAX = 0.2 + 1e-12;
+        const ZOOM_MAX_LOSS_PCT = 10;
+        const ZOOM_MAX_WP = lossPctToWp(ZOOM_MAX_LOSS_PCT);
+        const yVals = [];
+        for (let i = 0; i < dVals.length; i++) {
+          const d = dVals[i];
+          if (!Number.isFinite(d) || d < 0 || d > ZOOM_X_MAX) continue;
+          for (const s of seriesList) {
+            if (!s) continue;
+            const y = s[i];
+            if (Number.isFinite(y) && y >= 0) yVals.push(y);
+          }
+        }
+
+        if (yVals.length === 0) {
+          return {
+            min: 0,
+            max: ZOOM_MAX_WP,
+            step: niceLinearStep(ZOOM_MAX_WP / 10),
+          };
+        }
+
+        let yMin = Math.min(...yVals);
+        let yMax = Math.max(...yVals);
+        if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) {
+          return {
+            min: 0,
+            max: ZOOM_MAX_WP,
+            step: niceLinearStep(ZOOM_MAX_WP / 10),
+          };
+        }
+
+        if (yMax - yMin < 1e-9) {
+          const center = Math.max(0, yMax);
+          yMin = Math.max(0, center - 0.005);
+          yMax = center + 0.005;
+        }
+
+        const range = yMax - yMin;
+        const pad = Math.max(range * 0.12, 0.0002);
+        let min = Math.max(0, yMin - pad);
+        const max = ZOOM_MAX_WP;
+        if (min >= max) min = 0;
+        const span = Math.max(max - min, ZOOM_MAX_WP / 8);
+        const step = niceLinearStep(span / 10);
+        return { min, max, step };
+      }
+
+      function percentile(sortedVals, q) {
+        if (!sortedVals || sortedVals.length === 0) return Number.NaN;
+        const clampedQ = Math.max(0, Math.min(1, q));
+        const idx = clampedQ * (sortedVals.length - 1);
+        const lo = Math.floor(idx);
+        const hi = Math.min(sortedVals.length - 1, lo + 1);
+        const t = idx - lo;
+        return sortedVals[lo] + (sortedVals[hi] - sortedVals[lo]) * t;
+      }
+
+      function updateCoverageZoomChartFromSeries(
+        soldPct,
+        equilibraPrices,
+        uniswapPrices,
+        curvePrices,
+        initialPrice,
+        curveParams,
+      ) {
+        if (!coverageZoomChart) return;
+        if (!Number.isFinite(initialPrice) || initialPrice <= 0) return;
+        const ZOOM_X_MIN_ACTUAL = 0;
+        const ZOOM_X_MAX_ACTUAL = 10;
+        const ZOOM_Y_MIN = initialPrice;
+        const ZOOM_Y_MAX = initialPrice * (1 + 0.05); // +5.00% from initial price
+        const ZOOM_CLIP_EPS = 1e-6;
+        const DENSE_STEP_PCT = 0.01;
+
+        const normalizeSource = (values) => {
+          if (!Array.isArray(values)) return [];
+          const n = Math.min(soldPct.length, values.length);
+          const points = [];
+          for (let i = 0; i < n; i++) {
+            const x = Number(soldPct[i]);
+            const y = Number(values[i]);
+            if (!Number.isFinite(x)) continue;
+            points.push({
+              x,
+              y: Number.isFinite(y) && y > 0 ? y : null,
+            });
+          }
+          points.sort((a, b) => a.x - b.x);
+          return points;
+        };
+
+        const interpolateY = (points, xActual) => {
+          if (!points.length || !Number.isFinite(xActual)) return null;
+          if (xActual <= points[0].x) return points[0].y;
+          for (let i = 1; i < points.length; i++) {
+            const left = points[i - 1];
+            const right = points[i];
+            if (xActual > right.x) continue;
+            if (
+              !Number.isFinite(left.y) ||
+              left.y <= 0 ||
+              !Number.isFinite(right.y) ||
+              right.y <= 0
+            ) {
+              return null;
+            }
+            const dx = right.x - left.x;
+            if (Math.abs(dx) <= 1e-12) return left.y;
+            const t = (xActual - left.x) / dx;
+            return left.y + (right.y - left.y) * t;
+          }
+          return points[points.length - 1].y;
+        };
+
+        const eqSource = normalizeSource(equilibraPrices);
+        const uniSource = normalizeSource(uniswapPrices);
+        const curveSource = normalizeSource(curvePrices);
+
+        const zoomTitleEl = document.getElementById("coverageZoomTitle");
+        if (zoomTitleEl) {
+          zoomTitleEl.textContent =
+            "Zoom: sold 0 .. 10%, max height = 5.00% of initial price";
+        }
+
+        const buildZoomSeries = (source) => {
+          const data = [];
+          let cut = false;
+          let prev = null;
+          let marker = null;
+          const steps = Math.round(
+            (ZOOM_X_MAX_ACTUAL - ZOOM_X_MIN_ACTUAL) / DENSE_STEP_PCT,
+          );
+          for (let i = 0; i <= steps; i++) {
+            const xActual = ZOOM_X_MIN_ACTUAL + i * DENSE_STEP_PCT;
+            if (cut) {
+              data.push({ x: xActual, y: null });
+              continue;
+            }
+            const yRaw = interpolateY(source, xActual);
+            if (!Number.isFinite(yRaw) || yRaw <= 0) {
+              data.push({ x: xActual, y: null });
+              continue;
+            }
+
+            if (yRaw < ZOOM_Y_MAX * (1 - ZOOM_CLIP_EPS)) {
+              const point = {
+                x: xActual,
+                y: Math.max(ZOOM_Y_MIN, yRaw),
+              };
+              data.push(point);
+              prev = point;
+              continue;
+            }
+
+            let xClip = xActual;
+            if (prev && Number.isFinite(prev.y) && prev.y > 0) {
+              const denom = yRaw - prev.y;
+              if (Math.abs(denom) > 1e-12) {
+                const t = (ZOOM_Y_MAX - prev.y) / denom;
+                const tClamped = Number.isFinite(t)
+                  ? Math.max(0, Math.min(1, t))
+                  : 1;
+                xClip = prev.x + (xActual - prev.x) * tClamped;
+              }
+            }
+            marker = { x: xClip, y: ZOOM_Y_MAX };
+            data.push(marker);
+            cut = true;
+          }
+
+          return { data, marker };
+        };
+
+        const eqFeeTag = "no-fee";
+        coverageZoomChart.options.scales.x.min = ZOOM_X_MIN_ACTUAL;
+        coverageZoomChart.options.scales.x.max = ZOOM_X_MAX_ACTUAL;
+        coverageZoomChart.options.scales.x.ticks.callback = (value) =>
+          Number(value).toFixed(1);
+        coverageZoomChart.options.plugins.tooltip.callbacks.label = (ctx) => {
+          return `${ctx.dataset.label}: sold=${Number(ctx.parsed.x).toFixed(3)}%, price=${formatCoverageNumber(ctx.parsed.y, 2)}`;
+        };
+        coverageZoomChart.options.scales.y.min = ZOOM_Y_MIN;
+        coverageZoomChart.options.scales.y.max = ZOOM_Y_MAX;
+        coverageZoomChart.options.scales.y.ticks.stepSize =
+          (ZOOM_Y_MAX - ZOOM_Y_MIN) / 10;
+        const eqSeries = buildZoomSeries(eqSource);
+        const uniSeries = buildZoomSeries(uniSource);
+        const curveSeries = buildZoomSeries(curveSource);
+
+        coverageZoomChart.data.datasets = [
+          {
+            label: `Equilibra [analytical] (${eqFeeTag})`,
+            data: eqSeries.data,
+            borderColor: "#3fb950",
+            pointRadius: 0,
+            borderWidth: 2.5,
+            showLine: true,
+            spanGaps: false,
+            order: 2,
+          },
+          {
+            label: "Uniswap",
+            data: uniSeries.data,
+            borderColor: "rgba(86, 212, 221, 0.55)",
+            borderDash: [5, 3],
+            pointRadius: 0,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            order: 3,
+          },
+          {
+            label: getCurveLegendLabel(curveParams),
+            data: curveSeries.data,
+            borderColor: "#ff4fb0",
+            borderDash: [10, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            order: 1,
+          },
+        ];
+        const zoomMarkers = [
+          { key: "eq", color: "#3fb950", point: eqSeries.marker },
+          { key: "uni", color: "#56d4dd", point: uniSeries.marker },
+          { key: "curve", color: "#f778ba", point: curveSeries.marker },
+        ];
+        const markerOffset = { eq: -0.04, uni: 0.04, curve: 0.12 };
+        const markerStyle = { eq: "circle", uni: "rectRot", curve: "triangle" };
+        for (const marker of zoomMarkers) {
+          if (!marker.point) continue;
+          const shiftedX = Math.max(
+            ZOOM_X_MIN_ACTUAL,
+            Math.min(
+              ZOOM_X_MAX_ACTUAL,
+              marker.point.x + (markerOffset[marker.key] ?? 0),
+            ),
+          );
+          coverageZoomChart.data.datasets.push({
+            label: `_tailClipCoverageZoom_${marker.key}`,
+            data: [{ x: shiftedX, y: marker.point.y }],
+            borderColor: marker.color,
+            backgroundColor: marker.color,
+            pointRadius: 5,
+            pointHoverRadius: 6,
+            pointStyle: markerStyle[marker.key] ?? "circle",
+            pointBorderWidth: 1.5,
+            pointBorderColor: "#0d1117",
+            showLine: false,
+            tailMarker: true,
+          });
+        }
+        coverageZoomChart.update("none");
+      }
+
+      function updateCoverageComparisonFromApi(
+        apiPayload,
+        curveParams,
+      ) {
+        const tableBody = document.getElementById("coverageTableBody");
+        if (!tableBody) return;
+        const coverage = apiPayload?.coverage;
+        if (!coverage) throw new Error("Invalid API payload: missing coverage");
+
+        if (!Array.isArray(coverage.table)) {
+          throw new Error("Invalid API payload: coverage.table must be array");
+        }
+        const rows = coverage.table;
+        tableBody.innerHTML = rows
+          .map((row) => {
+            const bucket = String(row?.bucket || "-");
+            const eqRange = formatCoverageRange(
+              row?.equilibraFrom,
+              row?.equilibraTo,
+            );
+            const uniRange = formatCoverageRange(
+              row?.uniswapFrom,
+              row?.uniswapTo,
+            );
+            const curveRange = formatCoverageRange(
+              row?.curveFrom,
+              row?.curveTo,
+            );
+            return `
+        <tr>
+          <td>${bucket}</td>
+          <td>${eqRange}</td>
+          <td>${uniRange}</td>
+          <td>${curveRange}</td>
+        </tr>
+      `;
+          })
+          .join("");
+
+        if (!coverageChart) return;
+
+        if (!Array.isArray(coverage.soldPct)) {
+          throw new Error(
+            "Invalid API payload: coverage.soldPct must be array",
+          );
+        }
+        const soldPct = coverage.soldPct;
+        const toSeries = (vals) => {
+          if (!Array.isArray(vals)) {
+            throw new Error(
+              "Invalid API payload: coverage series must be array",
+            );
+          }
+          const out = [];
+          const n = Math.min(soldPct.length, vals.length);
+          for (let i = 0; i < n; i++) {
+            const x = coverageToDisplayPct(Number(soldPct[i]));
+            const y = Number(vals[i]);
+            out.push({
+              x,
+              y: Number.isFinite(y) && y > 0 ? y : null,
+            });
+          }
+          return out;
+        };
+
+        const eqData = toSeries(coverage.equilibra);
+        const uniData = toSeries(coverage.uniswapV2);
+        const curveData = toSeries(coverage.curve);
+
+        const yVals = [];
+        for (const ds of [eqData, uniData, curveData]) {
+          for (const p of ds) {
+            if (Number.isFinite(p.y) && p.y > 0) yVals.push(p.y);
+          }
+        }
+        const sorted =
+          yVals.length > 0 ? [...yVals].sort((a, b) => a - b) : [1];
+        const yMin = Math.max(1e-9, sorted[0] ?? 1);
+        const q = percentile(sorted, 0.93);
+        let yMax = Number.isFinite(q)
+          ? Math.max(yMin * 1.1, q * 1.1)
+          : yMin * 1.1;
+        yMax = Math.max(yMin * 1.05, Math.min(yMax, 1e8));
+
+        coverageAxisMinPrice = yMin;
+        coverageChart.options.scales.y.min = yMin;
+        coverageChart.options.scales.y.max = yMax;
+        coverageChart.options.scales.y.title.text = "Price";
+
+        const eqFeeTag = "no-fee";
+        coverageChart.data.datasets = [
+          {
+            label: `Equilibra [analytical] (${eqFeeTag})`,
+            data: eqData,
+            borderColor: "#3fb950",
+            pointRadius: 0,
+            borderWidth: 2.5,
+            showLine: true,
+            spanGaps: false,
+            order: 2,
+          },
+          {
+            label: "Uniswap",
+            data: uniData,
+            borderColor: "rgba(86, 212, 221, 0.55)",
+            borderDash: [5, 3],
+            pointRadius: 1,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            order: 3,
+          },
+          {
+            label: getCurveLegendLabel(curveParams),
+            data: curveData,
+            borderColor: "#ff4fb0",
+            borderDash: [10, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            order: 1,
+          },
+        ];
+        coverageChart.update("none");
+        updateCoverageZoomChartFromSeries(
+          soldPct.map((x) => Number(x)),
+          coverage.equilibra,
+          coverage.uniswapV2,
+          coverage.curve,
+          Number(apiPayload.initialPrice),
+          curveParams,
+        );
+      }
+
+      function formatIsolatedAmount(value, decimals = 6) {
+        if (value === null || value === undefined) return "-";
+        const num = Number(value);
+        if (!Number.isFinite(num)) return "-";
+        if (num === 0) return "0";
+        const abs = Math.abs(num);
+        const fracDigits = abs >= 1000 ? 2 : abs >= 1 ? 4 : decimals;
+        return num.toLocaleString("en-US", {
+          minimumFractionDigits: 0,
+          maximumFractionDigits: fracDigits,
+        });
+      }
+
+      function formatIsolatedPrice(value) {
+        if (value === null || value === undefined) return "-";
+        const num = Number(value);
+        if (!Number.isFinite(num) || num <= 0) return "-";
+        const abs = Math.abs(num);
+        const fracDigits = abs >= 1000 ? 2 : abs >= 1 ? 4 : 8;
+        return num.toLocaleString("en-US", {
+          minimumFractionDigits: 0,
+          maximumFractionDigits: fracDigits,
+        });
+      }
+
+      function updateIsolatedSwapsFromApi(apiPayload) {
+        const tableBody = document.getElementById("isolatedSwapsTableBody");
+        const headerEl = document.getElementById("isolatedSwapsHeader");
+        if (!tableBody) return;
+        const iso = apiPayload?.isolatedSwaps;
+        if (!iso || !Array.isArray(iso.rows)) {
+          tableBody.innerHTML = "";
+          if (headerEl) headerEl.textContent = "";
+          return;
+        }
+        const t0 = String(iso.token0Symbol || "T0");
+        const t1 = String(iso.token1Symbol || "T1");
+        const t0Decimals = Number(iso.token0Decimals) || 6;
+        const r0 = formatIsolatedAmount(iso.initialReserve0, t0Decimals);
+        const r1 = formatIsolatedAmount(iso.initialReserve1, 2);
+        const initialPrice = formatIsolatedPrice(iso.initialPrice);
+        if (headerEl) {
+          headerEl.textContent =
+            `Base reserves: ${r0} ${t0} / ${r1} ${t1}  |  initial price ≈ ${initialPrice} ${t1}/${t0}` +
+            `  |  forward = ${t1} → ${t0}, reverse = ${t0} → ${t1}`;
+        }
+
+        tableBody.innerHTML = iso.rows
+          .map((row) => {
+            const amountIn = formatIsolatedAmount(row.amountIn, 2);
+            const eqFwd = formatIsolatedAmount(row.eqFwdOut, t0Decimals);
+            const uniFwd = formatIsolatedAmount(row.uniFwdOut, t0Decimals);
+            const curveFwd = formatIsolatedAmount(row.curveFwdOut, t0Decimals);
+            const eqBack = formatIsolatedAmount(row.eqRevBack, 2);
+            const uniBack = formatIsolatedAmount(row.uniRevBack, 2);
+            const curveBack = formatIsolatedAmount(row.curveRevBack, 2);
+            const eqPx = formatIsolatedPrice(row.eqPmargPostFwd);
+            const uniPx = formatIsolatedPrice(row.uniPmargPostFwd);
+            const curvePx = formatIsolatedPrice(row.curvePmargPostFwd);
+            const label = String(row.label || `${Number(row.pct)}%`);
+            return `
+        <tr>
+          <td>${label}</td>
+          <td>${amountIn} ${t1}</td>
+          <td>${eqFwd} ${t0}</td>
+          <td>${uniFwd} ${t0}</td>
+          <td>${curveFwd} ${t0}</td>
+          <td>${eqBack} ${t1}</td>
+          <td>${uniBack} ${t1}</td>
+          <td>${curveBack} ${t1}</td>
+          <td>${eqPx}</td>
+          <td>${uniPx}</td>
+          <td>${curvePx}</td>
+        </tr>
+      `;
+          })
+          .join("");
+      }
+
+      // RMSE / Area-Err fit badges, computed DIRECTLY from the backend
+      // response series. All three slippage series (Equilibra, the
+      // constant-product baseline and the YieldBasis reference AMM) share
+      // one index-aligned `d` axis by backend construction
+      // (`resample_secondary_at_grid`), so the reference penalty and
+      // liquidity arrays can be compared element-wise — no client-side
+      // reference-AMM math and no liquidity derivation are needed.
+      function updatePwFitMetrics(
+        dVals,
+        powerWallVals,
+        liqPowerWall,
+        uniRefVals,
+        curveRefVals,
+        uniLiqRaw,
+        curveLiqRaw,
+      ) {
+        const setTxt = (id, text) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = text;
+        };
+
+        if (!powerWallVals || !liqPowerWall) {
+          [
+            "pwRmseUni",
+            "pwRmseCurve",
+            "pwLiqRmseUni",
+            "pwLiqRmseCurve",
+            "pwAreaErrUni",
+            "pwAreaErrCurve",
+            "pwLiqAreaErrUni",
+            "pwLiqAreaErrCurve",
+            "pwDecision",
+          ].forEach((id) => setTxt(id, "-"));
+          return;
+        }
+
+        const rmseUni = computeRmse(dVals, powerWallVals, uniRefVals, 0, 0.95);
+        const rmseCurve = computeRmse(
+          dVals,
+          powerWallVals,
+          curveRefVals,
+          0,
+          0.95,
+        );
+        const liqRmseUni = computeRmse(dVals, liqPowerWall, uniLiqRaw, 0, 0.95);
+        const liqRmseCurve = computeRmse(
+          dVals,
+          liqPowerWall,
+          curveLiqRaw,
+          0,
+          0.95,
+        );
+        const areaErrUni = computeRelativeAreaAbsErrorPct(
+          dVals,
+          powerWallVals,
+          uniRefVals,
+          0,
+          0.95,
+        );
+        const areaErrCurve = computeRelativeAreaAbsErrorPct(
+          dVals,
+          powerWallVals,
+          curveRefVals,
+          0,
+          0.95,
+        );
+        const liqAreaErrUni = computeRelativeAreaAbsErrorPct(
+          dVals,
+          liqPowerWall,
+          uniLiqRaw,
+          0,
+          0.95,
+        );
+        const liqAreaErrCurve = computeRelativeAreaAbsErrorPct(
+          dVals,
+          liqPowerWall,
+          curveLiqRaw,
+          0,
+          0.95,
+        );
+
+        const decision = "single-power mode";
+
+        setTxt(
+          "pwRmseUni",
+          Number.isFinite(rmseUni) ? rmseUni.toFixed(4) : "-",
+        );
+        setTxt(
+          "pwRmseCurve",
+          Number.isFinite(rmseCurve) ? rmseCurve.toFixed(4) : "-",
+        );
+        setTxt(
+          "pwLiqRmseUni",
+          Number.isFinite(liqRmseUni) ? liqRmseUni.toFixed(4) : "-",
+        );
+        setTxt(
+          "pwLiqRmseCurve",
+          Number.isFinite(liqRmseCurve) ? liqRmseCurve.toFixed(4) : "-",
+        );
+        setTxt(
+          "pwAreaErrUni",
+          Number.isFinite(areaErrUni) ? `${areaErrUni.toFixed(2)}%` : "-",
+        );
+        setTxt(
+          "pwAreaErrCurve",
+          Number.isFinite(areaErrCurve) ? `${areaErrCurve.toFixed(2)}%` : "-",
+        );
+        setTxt(
+          "pwLiqAreaErrUni",
+          Number.isFinite(liqAreaErrUni) ? `${liqAreaErrUni.toFixed(2)}%` : "-",
+        );
+        setTxt(
+          "pwLiqAreaErrCurve",
+          Number.isFinite(liqAreaErrCurve)
+            ? `${liqAreaErrCurve.toFixed(2)}%`
+            : "-",
+        );
+        setTxt("pwDecision", decision);
+      }
+
+      function updatePenaltyChart(
+        dVals,
+        penaltyVals,
+        kVals,
+        showK,
+        k,
+        uniVals,
+        showUni,
+        curveVals,
+        showCurve,
+        curveParams,
+        rationalVals,
+        showRational,
+        rationalN,
+        powerWallVals,
+        showPowerWall,
+        pw,
+      ) {
+        const datasets = [];
+        const clipFlags = { uni: false, curve: false, pw: false };
+        const clipMarkers = [];
+        const SCALE_D_MAX = 0.985;
+        const SCALE_Q = 0.985;
+        const SCALE_MIN = 1.05;
+        const SCALE_MAX = 3;
+        const SCALE_CLIP_EPS = 1e-6;
+        const collectScaleVals = (vals) => {
+          if (!vals) return [];
+          const collected = [];
+          for (let i = 0; i < dVals.length; i++) {
+            const d = dVals[i];
+            const y = vals[i];
+            if (d >= 1 || d > SCALE_D_MAX) continue;
+            if (!Number.isFinite(y) || y < 0) continue;
+            collected.push(y);
+          }
+          return collected;
+        };
+        const scaleCandidates = [];
+        if (showUni && uniVals)
+          scaleCandidates.push(...collectScaleVals(uniVals));
+        if (showCurve && curveVals)
+          scaleCandidates.push(...collectScaleVals(curveVals));
+        if (showPowerWall && powerWallVals)
+          scaleCandidates.push(...collectScaleVals(powerWallVals));
+        if (scaleCandidates.length === 0 && penaltyVals) {
+          scaleCandidates.push(...collectScaleVals(penaltyVals));
+        }
+        const sortedScale =
+          scaleCandidates.length > 0
+            ? [...scaleCandidates].sort((a, b) => a - b)
+            : [1];
+        const qScale = percentile(sortedScale, SCALE_Q);
+        let yClipMax = Number.isFinite(qScale)
+          ? Math.max(SCALE_MIN, qScale * 1.2)
+          : SCALE_MIN;
+        yClipMax = Math.max(SCALE_MIN, Math.min(SCALE_MAX, yClipMax));
+        const yClipTrigger = yClipMax * (1 - SCALE_CLIP_EPS);
+
+        const toPenaltyPlotSeries = (vals, clipKey) => {
+          const data = [];
+          let tailCut = false;
+          let prev = null;
+          let marker = null;
+
+          for (let i = 0; i < dVals.length; i++) {
+            const d = dVals[i];
+            if (tailCut) {
+              data.push({ x: d, y: null });
+              continue;
+            }
+
+            const y = vals[i];
+            const shouldClip =
+              d >= 1 || !Number.isFinite(y) || y >= yClipTrigger;
+            if (!shouldClip) {
+              const point = { x: d, y };
+              data.push(point);
+              prev = point;
+              continue;
+            }
+
+            if (clipKey) clipFlags[clipKey] = true;
+            let xClip = d;
+            if (prev && Number.isFinite(prev.y)) {
+              if (Number.isFinite(y) && Math.abs(y - prev.y) > 1e-12) {
+                const t = (yClipMax - prev.y) / (y - prev.y);
+                const tClamped = Number.isFinite(t)
+                  ? Math.max(0, Math.min(1, t))
+                  : 1;
+                xClip = prev.x + (d - prev.x) * tClamped;
+              } else if (d >= 1) {
+                xClip = Math.min(0.9999, prev.x + (1 - prev.x) * 0.9);
+              }
+            } else if (d >= 1) {
+              xClip = 0.9999;
+            }
+
+            marker = { x: xClip, y: yClipMax };
+            data.push(marker);
+            tailCut = true;
+            data.push({ x: d, y: null });
+          }
+
+          return { data, marker };
+        };
+
+        if (showUni && uniVals) {
+          const uniSeries = toPenaltyPlotSeries(uniVals, "uni");
+          const uniData = uniSeries.data;
+          datasets.push({
+            label: `Uniswap x·y=k${clipFlags.uni ? " ∞" : ""}`,
+            data: uniData,
+            borderColor: "#56d4dd",
+            borderDash: [6, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: false,
+          });
+          if (uniSeries.marker)
+            clipMarkers.push({
+              key: "uni",
+              color: "#56d4dd",
+              point: uniSeries.marker,
+            });
+        }
+
+        if (showCurve && curveVals) {
+          const curveSeries = toPenaltyPlotSeries(curveVals, "curve");
+          const curveData = curveSeries.data;
+          datasets.push({
+            label: `${getCurveLegendLabel(curveParams)}${clipFlags.curve ? " ∞" : ""}`,
+            data: curveData,
+            borderColor: "#f778ba",
+            borderDash: [8, 3],
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: false,
+          });
+          if (curveSeries.marker)
+            clipMarkers.push({
+              key: "curve",
+              color: "#f778ba",
+              point: curveSeries.marker,
+            });
+        }
+
+        if (showPowerWall && powerWallVals) {
+          const modeTag = `a=${Number(pw.a).toFixed(3)}, λ=${Number(pw.lambda).toFixed(3)}`;
+          const eqFeeTag = "no-fee";
+          const sourceTag = " [API]";
+          const pwSeries = toPenaltyPlotSeries(powerWallVals, "pw");
+          const pwData = pwSeries.data;
+          datasets.push({
+            label: `Equilibra ${modeTag} [analytical] (${eqFeeTag})${sourceTag}${clipFlags.pw ? " ∞" : ""}`,
+            data: pwData,
+            borderColor: "#3fb950",
+            pointRadius: 0,
+            borderWidth: 2.5,
+            spanGaps: false,
+          });
+          if (pwSeries.marker)
+            clipMarkers.push({
+              key: "pw",
+              color: "#3fb950",
+              point: pwSeries.marker,
+            });
+        }
+
+        for (const marker of clipMarkers) {
+          datasets.push({
+            label: `_tailClipPenalty_${marker.key}`,
+            data: [marker.point],
+            borderColor: marker.color,
+            backgroundColor: marker.color,
+            pointRadius: 4,
+            pointHoverRadius: 4,
+            pointStyle: "circle",
+            pointBorderWidth: 1.5,
+            pointBorderColor: "#0d1117",
+            showLine: false,
+            tailMarker: true,
+          });
+        }
+
+        const clippedAny = clipFlags.uni || clipFlags.curve || clipFlags.pw;
+        penaltyChart.options.scales.y.max = yClipMax;
+        penaltyChart.options.scales.y.title.text = "Slippage (%)";
+        const penaltyMeta = document.getElementById("penaltyYAxisMeta");
+        if (penaltyMeta) {
+          penaltyMeta.textContent = clippedAny
+            ? "Y: Slippage = (1 - P(0)/P(d)) · 100%. ∞ marks clipped tail points."
+            : "Y: Slippage = (1 - P(0)/P(d)) · 100%.";
+        }
+
+        penaltyChart.data.datasets = datasets;
+        penaltyChart.update("none");
+        updatePenaltyZoomChart(
+          dVals,
+          uniVals,
+          showUni,
+          curveVals,
+          showCurve,
+          powerWallVals,
+          showPowerWall,
+          curveParams,
+          pw,
+        );
+      }
+
+      function updatePenaltyZoomChart(
+        dVals,
+        uniVals,
+        showUni,
+        curveVals,
+        showCurve,
+        powerWallVals,
+        showPowerWall,
+        curveParams,
+        pw,
+      ) {
+        if (!penaltyZoomChart) return;
+        const ZOOM_X_MAX = 0.2;
+        const datasets = [];
+
+        const sanitizePenaltyWpVals = (vals) => {
+          if (!Array.isArray(vals)) return null;
+          return vals.map((v) => {
+            const w = Number(v);
+            if (!Number.isFinite(w) || w < 0) return null;
+            return w;
+          });
+        };
+
+        const toZoomSeries = (vals) => {
+          const out = [];
+          for (let i = 0; i < dVals.length; i++) {
+            const d = dVals[i];
+            if (!Number.isFinite(d) || d < 0 || d > ZOOM_X_MAX) continue;
+            const y = vals?.[i];
+            out.push({
+              x: d,
+              y: Number.isFinite(y) && y >= 0 ? y : null,
+            });
+          }
+          return out;
+        };
+
+        const uniZoomVals = showUni ? sanitizePenaltyWpVals(uniVals) : null;
+        const curveZoomVals = showCurve
+          ? sanitizePenaltyWpVals(curveVals)
+          : null;
+        const pwZoomVals = showPowerWall
+          ? sanitizePenaltyWpVals(powerWallVals)
+          : null;
+
+        if (showUni && uniZoomVals) {
+          datasets.push({
+            label: "Uniswap x·y=k",
+            data: toZoomSeries(uniZoomVals),
+            borderColor: "#56d4dd",
+            borderDash: [6, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: false,
+          });
+        }
+
+        if (showCurve && curveZoomVals) {
+          datasets.push({
+            label: getCurveLegendLabel(curveParams),
+            data: toZoomSeries(curveZoomVals),
+            borderColor: "#f778ba",
+            borderDash: [8, 3],
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: false,
+          });
+        }
+
+        if (showPowerWall && pwZoomVals) {
+          const modeTag = `a=${Number(pw.a).toFixed(3)}, λ=${Number(pw.lambda).toFixed(3)}`;
+          const eqFeeTag = "no-fee";
+          const sourceTag = " [API]";
+          datasets.push({
+            label: `Equilibra ${modeTag} [analytical] (${eqFeeTag})${sourceTag}`,
+            data: toZoomSeries(pwZoomVals),
+            borderColor: "#3fb950",
+            pointRadius: 0,
+            borderWidth: 2.5,
+            spanGaps: false,
+          });
+        }
+
+        const axis = computePenaltyZoomAxis(dVals, [
+          uniZoomVals,
+          curveZoomVals,
+          pwZoomVals,
+        ]);
+
+        penaltyZoomChart.options.scales.x.min = 0;
+        penaltyZoomChart.options.scales.x.max = ZOOM_X_MAX;
+        penaltyZoomChart.options.scales.y.min = axis.min;
+        penaltyZoomChart.options.scales.y.max = axis.max;
+        penaltyZoomChart.options.scales.y.ticks.stepSize = axis.step;
+        penaltyZoomChart.data.datasets = datasets;
+        penaltyZoomChart.update("none");
+      }
+
+      function updateLiquidityChart(
+        dVals,
+        liqBezier,
+        liqK,
+        showK,
+        k,
+        liqUni,
+        showUni,
+        liqCurve,
+        showCurve,
+        curveParams,
+        liqRational,
+        showRational,
+        rationalN,
+        liqPowerWall,
+        showPowerWall,
+        pw,
+      ) {
+        // Mirror symmetrically: d ∈ [-1, 0] (token1 excess) and [0, 1] (token0 excess)
+        const uniData = [];
+        const curveData = [];
+        const powerWallData = [];
+
+        // Left half (reversed): d from 1 to 0
+        for (let i = dVals.length - 1; i >= 0; i--) {
+          if (showUni && liqUni) uniData.push({ x: -dVals[i], y: liqUni[i] });
+          if (showCurve && liqCurve)
+            curveData.push({ x: -dVals[i], y: liqCurve[i] });
+          if (showPowerWall && liqPowerWall)
+            powerWallData.push({ x: -dVals[i], y: liqPowerWall[i] });
+        }
+        // Right half: d from 0 to 1 (skip duplicate 0)
+        for (let i = 1; i < dVals.length; i++) {
+          if (showUni && liqUni) uniData.push({ x: dVals[i], y: liqUni[i] });
+          if (showCurve && liqCurve)
+            curveData.push({ x: dVals[i], y: liqCurve[i] });
+          if (showPowerWall && liqPowerWall)
+            powerWallData.push({ x: dVals[i], y: liqPowerWall[i] });
+        }
+
+        const datasets = [];
+
+        if (showUni && liqUni) {
+          datasets.push({
+            label: "Uniswap liquidity",
+            data: uniData,
+            borderColor: "#56d4dd",
+            borderDash: [6, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            fill: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        if (showCurve && liqCurve) {
+          datasets.push({
+            label: `${getCurveLegendLabel(curveParams)} liquidity`,
+            data: curveData,
+            borderColor: "#f778ba",
+            borderDash: [8, 3],
+            pointRadius: 0,
+            borderWidth: 2,
+            fill: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        if (showPowerWall && liqPowerWall) {
+          const eqFeeTag = "no-fee";
+          const eqLiqLabel = "Equilibra liquidity";
+          datasets.push({
+            label: `${eqLiqLabel} [analytical] (${eqFeeTag})`,
+            data: powerWallData,
+            borderColor: "#3fb950",
+            backgroundColor: createLiquidityGradient(),
+            pointRadius: 0,
+            borderWidth: 2.5,
+            fill: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        // Find max Y across all visible datasets for center line height
+        let maxY = 1;
+        for (const ds of datasets) {
+          for (const pt of ds.data) {
+            if (Number.isFinite(pt.y) && pt.y > maxY) maxY = pt.y;
+          }
+        }
+
+        // Center line
+        const isLog = document.getElementById("liqLogScale").checked;
+        datasets.push({
+          label: "Balanced price",
+          data: [
+            { x: 0, y: isLog ? 0.01 : 0 },
+            { x: 0, y: maxY * 1.1 },
+          ],
+          borderColor: "rgba(210, 153, 34, 0.6)",
+          borderDash: [4, 4],
+          pointRadius: 0,
+          borderWidth: 1,
+        });
+
+        liquidityChart.data.datasets = datasets;
+        liquidityChart.update("none");
+        updateLiquidityZoomChart(
+          dVals,
+          liqUni,
+          showUni,
+          liqCurve,
+          showCurve,
+          liqPowerWall,
+          showPowerWall,
+          curveParams,
+          pw,
+        );
+      }
+
+      function updateLiquidityZoomChart(
+        dVals,
+        liqUni,
+        showUni,
+        liqCurve,
+        showCurve,
+        liqPowerWall,
+        showPowerWall,
+        curveParams,
+        pw,
+      ) {
+        if (!liquidityZoomChart) return;
+        const ZOOM_X_MIN = 0.7;
+        const ZOOM_X_MAX = 0.9;
+        const ZOOM_Y_MAX = 0.5;
+        const datasets = [];
+
+        const toZoomSeries = (vals) => {
+          const out = [];
+          for (let i = 0; i < dVals.length; i++) {
+            const d = dVals[i];
+            if (!Number.isFinite(d) || d < ZOOM_X_MIN || d > ZOOM_X_MAX)
+              continue;
+            const y = vals?.[i];
+            out.push({
+              x: d,
+              y: Number.isFinite(y) && y >= 0 ? y : null,
+            });
+          }
+          return out;
+        };
+
+        if (showUni && liqUni) {
+          datasets.push({
+            label: "Uniswap liquidity",
+            data: toZoomSeries(liqUni),
+            borderColor: "#56d4dd",
+            borderDash: [6, 2],
+            pointRadius: 0,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        if (showCurve && liqCurve) {
+          datasets.push({
+            label: `${getCurveLegendLabel(curveParams)} liquidity`,
+            data: toZoomSeries(liqCurve),
+            borderColor: "#f778ba",
+            borderDash: [8, 3],
+            pointRadius: 0,
+            borderWidth: 2,
+            showLine: true,
+            spanGaps: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        if (showPowerWall && liqPowerWall) {
+          const modeTag = `a=${Number(pw.a).toFixed(3)}, λ=${Number(pw.lambda).toFixed(3)}`;
+          const eqFeeTag = "no-fee";
+          datasets.push({
+            label: `Equilibra ${modeTag} liquidity [analytical] (${eqFeeTag})`,
+            data: toZoomSeries(liqPowerWall),
+            borderColor: "#3fb950",
+            pointRadius: 0,
+            borderWidth: 2.5,
+            showLine: true,
+            spanGaps: false,
+            tension: 0,
+            cubicInterpolationMode: "monotone",
+          });
+        }
+
+        liquidityZoomChart.options.scales.x.min = ZOOM_X_MIN;
+        liquidityZoomChart.options.scales.x.max = ZOOM_X_MAX;
+        liquidityZoomChart.options.scales.y.min = 0;
+        liquidityZoomChart.options.scales.y.max = ZOOM_Y_MAX;
+        liquidityZoomChart.options.scales.y.ticks.stepSize = 0.05;
+        liquidityZoomChart.data.datasets = datasets;
+        liquidityZoomChart.update("none");
+      }
+
+      // Price Coverage card collapse / expand state, persisted across
+      // reloads. Defaults to COLLAPSED so the visualizer fits on one
+      // screen — the user opts in to the heavy charts + table by
+      // clicking the `+` button.
+      const PRICE_COVERAGE_COLLAPSED_KEY =
+        "equinova.visualizer.priceCoverage.collapsed.v2";
+      let priceCoverageCollapsed = (() => {
+        try {
+          const raw = localStorage.getItem(PRICE_COVERAGE_COLLAPSED_KEY);
+          return raw === null ? true : raw === "true";
+        } catch (_) {
+          return true;
+        }
+      })();
+
+      function applyPriceCoverageCollapsed() {
+        const card = document.getElementById("priceCoverageCard");
+        const btn = document.getElementById("priceCoverageToggleBtn");
+        if (!card || !btn) return;
+        card.classList.toggle("is-collapsed", priceCoverageCollapsed);
+        btn.textContent = priceCoverageCollapsed ? "+" : "−";
+        if (priceCoverageCollapsed) return;
+        // Card just expanded — Chart.js needs a kick because its
+        // canvases were sized against an offsetParent of zero height
+        // while the card was hidden.
+        requestAnimationFrame(() => {
+          for (const c of [coverageChart, coverageZoomChart]) {
+            if (!c) continue;
+            try {
+              c.resize();
+              c.update("none");
+            } catch (_) {
+              /* canvas may still be initialising; ignore */
+            }
+          }
+        });
+      }
+
+      function togglePriceCoverage() {
+        priceCoverageCollapsed = !priceCoverageCollapsed;
+        try {
+          localStorage.setItem(
+            PRICE_COVERAGE_COLLAPSED_KEY,
+            String(priceCoverageCollapsed),
+          );
+        } catch (_) {
+          /* swallow — purely UI persistence */
+        }
+        applyPriceCoverageCollapsed();
+      }
+
+      // Show / hide the on-demand zoom popover for the Slippage and
+      // Liquidity charts. The Chart.js instance keeps receiving data
+      // updates while the popover is hidden (display:none renders to
+      // a 0×0 canvas with no measurable cost), so we just need to
+      // call `resize()` after the popover becomes visible to make the
+      // chart pick up its new container dimensions.
+      function toggleZoomPopover(name) {
+        const popoverId =
+          name === "slippage" ? "slippageZoomPopover" : "liquidityZoomPopover";
+        const el = document.getElementById(popoverId);
+        if (!el) return;
+        const willOpen = !el.classList.contains("is-open");
+        el.classList.toggle("is-open", willOpen);
+        if (!willOpen) return;
+        const chartObj =
+          name === "slippage" ? penaltyZoomChart : liquidityZoomChart;
+        if (!chartObj) return;
+        // `resize()` reads canvas client size which is only correct
+        // after the browser has flushed the layout change above.
+        requestAnimationFrame(() => {
+          try {
+            chartObj.resize();
+            chartObj.update("none");
+          } catch (_) {
+            /* canvas may still be detaching during HMR; ignore */
+          }
+        });
+      }
+
+      // Log-aware tick formatter for the Slippage chart. Y-axis values
+      // are in `wp` units (the chart stores penalty as `wp = ratio − 1`,
+      // not as slippage %). For display we convert through
+      // `wpToLossPct` and pick precision adaptively so log decades
+      // remain readable (0.001%, 0.01%, 0.1%, ... 50%, 75%).
+      function formatWpAxisTickLog(value) {
+        const wp = Number(value);
+        if (!Number.isFinite(wp)) return "";
+        const lossPct = wpToLossPct(wp);
+        if (!Number.isFinite(lossPct)) return "∞";
+        if (lossPct >= 10) return `${lossPct.toFixed(0)}%`;
+        if (lossPct >= 1) return `${lossPct.toFixed(1)}%`;
+        if (lossPct >= 0.1) return `${lossPct.toFixed(2)}%`;
+        if (lossPct >= 0.01) return `${lossPct.toFixed(3)}%`;
+        return `${lossPct.toFixed(4)}%`;
+      }
+
+      // Y-axis log toggle for the Slippage chart. Mirrors the
+      // Liquidity Distribution log toggle. The Slippage chart stores
+      // values in `wp` space (not slippage %), so the log min must
+      // be set in `wp` units; `lossPctToWp(0.001)` corresponds to
+      // 0.001% slippage which lets the small-penalty region (where
+      // Curve crypto / Equilibra concentration shows) span several
+      // decades on the chart.
+      //
+      // Critical detail: in Chart.js v3+ swapping `scales.y.type` in
+      // place is sometimes ignored on `update("none")` because the
+      // scale instance is cached. We REPLACE the whole `scales.y`
+      // object (new reference) and call `update()` (full update, no
+      // "none") so Chart.js destroys the old scale and rebuilds it.
+      function togglePenaltyLogScale() {
+        const isLog = document.getElementById("penaltyLogScale")?.checked;
+        if (!penaltyChart) return;
+        const yPrev = penaltyChart.options.scales.y;
+        const baseTicks = {
+          color: "#6e7681",
+          font: { size: 11 },
+        };
+        if (isLog) {
+          penaltyChart.options.scales.y = {
+            ...yPrev,
+            type: "logarithmic",
+            min: lossPctToWp(0.001),
+            ticks: {
+              ...baseTicks,
+              callback: (value) => formatWpAxisTickLog(value),
+            },
+          };
+        } else {
+          penaltyChart.options.scales.y = {
+            ...yPrev,
+            type: "linear",
+            min: 0,
+            ticks: {
+              ...baseTicks,
+              callback: (value) => formatWpAxisTick(value),
+            },
+          };
+        }
+        try {
+          penaltyChart.update();
+        } catch (_) {
+          /* ignore HMR / detach race */
+        }
+        // Re-run the full update path so `y.max` is recomputed via
+        // `collectScaleVals` against the live data.
+        onSliderChange();
+      }
+
+      function toggleLiqLogScale() {
+        const isLog = document.getElementById("liqLogScale").checked;
+        if (isLog) {
+          liquidityChart.options.scales.y.type = "logarithmic";
+          liquidityChart.options.scales.y.min = 0.01;
+          // Custom tick formatting for log scale
+          liquidityChart.options.scales.y.ticks = {
+            ...liquidityChart.options.scales.y.ticks,
+            callback: function (value) {
+              if (value >= 1000) return value.toLocaleString();
+              if (value >= 1) return value.toFixed(1);
+              if (value >= 0.1) return value.toFixed(1);
+              return value.toFixed(2);
+            },
+          };
+        } else {
+          liquidityChart.options.scales.y.type = "linear";
+          liquidityChart.options.scales.y.min = 0;
+          liquidityChart.options.scales.y.ticks = {
+            color: "#6e7681",
+            font: { size: 11 },
+          };
+        }
+        // Re-run chart update to recalculate center line
+        onSliderChange();
+      }
+
+      function createLiquidityGradient() {
+        const canvas = document.getElementById("liquidityChart");
+        const ctx = canvas.getContext("2d");
+        const grad = ctx.createLinearGradient(0, 0, canvas.width, 0);
+        // Higher fee at edges (red/orange), low fee at center (green/blue)
+        grad.addColorStop(0, "rgba(248, 81, 73, 0.15)"); // edge: high fee
+        grad.addColorStop(0.2, "rgba(210, 153, 34, 0.15)"); // medium fee
+        grad.addColorStop(0.4, "rgba(63, 185, 80, 0.2)"); // low fee
+        grad.addColorStop(0.5, "rgba(88, 166, 255, 0.25)"); // center: minimal fee
+        grad.addColorStop(0.6, "rgba(63, 185, 80, 0.2)");
+        grad.addColorStop(0.8, "rgba(210, 153, 34, 0.15)");
+        grad.addColorStop(1, "rgba(248, 81, 73, 0.15)");
+        return grad;
+      }
+
+      function updateMetrics() {
+        const el = document.getElementById("mSource");
+        if (!el) return;
+        el.textContent = "API (benchmark offchain quoters)";
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      //  Chart Initialization
+      // ═══════════════════════════════════════════════════════════════
+
+      function initCharts() {
+        const commonOptions = {
+          responsive: true,
+          animation: false,
+          plugins: {
+            legend: {
+              display: true,
+              labels: {
+                color: "#8b949e",
+                font: { size: 11 },
+                filter: (item) =>
+                  !item.text.startsWith("_") &&
+                  item.text !== "Balanced price",
+                usePointStyle: true,
+                pointStyle: "line",
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: "linear",
+              grid: { color: "rgba(48, 54, 61, 0.5)" },
+              ticks: { color: "#6e7681", font: { size: 11 } },
+            },
+            y: {
+              grid: { color: "rgba(48, 54, 61, 0.5)" },
+              ticks: { color: "#6e7681", font: { size: 11 } },
+            },
+          },
+        };
+
+        // Penalty chart
+        penaltyChart = new Chart(document.getElementById("penaltyChart"), {
+          type: "scatter",
+          data: { datasets: [] },
+          plugins: [infinityTailMarkerPlugin],
+          options: {
+            ...commonOptions,
+            maintainAspectRatio: false,
+            plugins: {
+              ...commonOptions.plugins,
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    if (ctx.dataset && ctx.dataset.tailMarker) {
+                      const slip = wpToLossPct(Number(ctx.parsed.y));
+                      return Number.isFinite(slip)
+                        ? `∞ tail clip marker: d=${ctx.parsed.x.toFixed(3)}, slip≈${slip.toFixed(2)}%`
+                        : `∞ tail clip marker: d=${ctx.parsed.x.toFixed(3)}, slip=∞`;
+                    }
+                    const wp = Number.isFinite(ctx.parsed.y)
+                      ? ctx.parsed.y
+                      : Number.NaN;
+                    const slipPct = wpToLossPct(wp);
+                    if (!Number.isFinite(slipPct))
+                      return `d=${ctx.parsed.x.toFixed(3)}, slippage=∞`;
+                    return `d=${ctx.parsed.x.toFixed(3)}, slippage=${slipPct.toFixed(2)}%`;
+                  },
+                },
+              },
+            },
+            scales: {
+              ...commonOptions.scales,
+              x: {
+                ...commonOptions.scales.x,
+                title: {
+                  display: true,
+                  text: "d (distance from center)",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: 0,
+                max: 1,
+              },
+              y: {
+                ...commonOptions.scales.y,
+                ticks: {
+                  ...commonOptions.scales.y.ticks,
+                  callback: (value) => formatWpAxisTick(value),
+                },
+                title: {
+                  display: true,
+                  text: "Slippage (%)",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: 0,
+              },
+            },
+            showLine: true,
+            spanGaps: false,
+          },
+        });
+
+        // Penalty zoom chart (d in [0, 0.2])
+        penaltyZoomChart = new Chart(
+          document.getElementById("penaltyZoomChart"),
+          {
+            type: "scatter",
+            data: { datasets: [] },
+            options: {
+              ...commonOptions,
+              maintainAspectRatio: false,
+              plugins: {
+                ...commonOptions.plugins,
+                legend: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: (ctx) => {
+                      const wp = Number.isFinite(ctx.parsed.y)
+                        ? ctx.parsed.y
+                        : Number.NaN;
+                      const slipPct = wpToLossPct(wp);
+                      if (!Number.isFinite(slipPct))
+                        return `d=${ctx.parsed.x.toFixed(3)}, slippage=∞`;
+                      return `d=${ctx.parsed.x.toFixed(3)}, slippage=${slipPct.toFixed(3)}%`;
+                    },
+                  },
+                },
+              },
+              scales: {
+                ...commonOptions.scales,
+                x: {
+                  ...commonOptions.scales.x,
+                  title: {
+                    display: true,
+                    text: "d (zoom 0..0.2)",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 0,
+                  max: 0.2,
+                },
+                y: {
+                  ...commonOptions.scales.y,
+                  ticks: {
+                    ...commonOptions.scales.y.ticks,
+                    autoSkip: false,
+                    callback: (value) => formatWpAxisTick(value),
+                  },
+                  title: {
+                    display: true,
+                    text: "Slippage (%)",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 0,
+                },
+              },
+              showLine: true,
+              spanGaps: false,
+            },
+          },
+        );
+
+        // Liquidity chart
+        liquidityChart = new Chart(document.getElementById("liquidityChart"), {
+          type: "scatter",
+          data: { datasets: [] },
+          options: {
+            ...commonOptions,
+            maintainAspectRatio: false,
+            plugins: {
+              ...commonOptions.plugins,
+              tooltip: {
+                callbacks: {
+                  label: (ctx) =>
+                    `offset=${ctx.parsed.x.toFixed(3)}, L=${ctx.parsed.y.toFixed(2)}`,
+                },
+              },
+            },
+            scales: {
+              ...commonOptions.scales,
+              x: {
+                ...commonOptions.scales.x,
+                title: {
+                  display: true,
+                  text: "Distance from balanced price",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: -1,
+                max: 1,
+              },
+              y: {
+                ...commonOptions.scales.y,
+                title: {
+                  display: true,
+                  text: "Liquidity depth (tokens / price unit)",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: 0,
+              },
+            },
+            showLine: true,
+            spanGaps: false,
+          },
+        });
+
+        liquidityZoomChart = new Chart(
+          document.getElementById("liquidityZoomChart"),
+          {
+            type: "scatter",
+            data: { datasets: [] },
+            options: {
+              ...commonOptions,
+              maintainAspectRatio: false,
+              plugins: {
+                ...commonOptions.plugins,
+                legend: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: (ctx) =>
+                      `d=${ctx.parsed.x.toFixed(3)}, L=${Number(ctx.parsed.y).toFixed(4)}`,
+                  },
+                },
+              },
+              scales: {
+                ...commonOptions.scales,
+                x: {
+                  ...commonOptions.scales.x,
+                  title: {
+                    display: true,
+                    text: "d (zoom 0.7..0.9)",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 0.7,
+                  max: 0.9,
+                },
+                y: {
+                  ...commonOptions.scales.y,
+                  title: {
+                    display: true,
+                    text: "Liquidity",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 0,
+                  max: 0.5,
+                },
+              },
+              showLine: true,
+              spanGaps: false,
+            },
+          },
+        );
+
+        // Price coverage chart (log scale highlights range differences near center and tail)
+        coverageChart = new Chart(document.getElementById("coverageChart"), {
+          type: "scatter",
+          data: { datasets: [] },
+          plugins: [infinityTailMarkerPlugin],
+          options: {
+            ...commonOptions,
+            maintainAspectRatio: false,
+            plugins: {
+              ...commonOptions.plugins,
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    const soldPct = coverageFromDisplayPct(ctx.parsed.x);
+                    if (ctx.dataset && ctx.dataset.tailMarker) {
+                      return `∞ tail clip marker: sold=${soldPct.toFixed(1)}%, price≈${formatCoverageNumber(ctx.parsed.y, 2)}`;
+                    }
+                    return `${ctx.dataset.label}: sold=${soldPct.toFixed(1)}%, price=${formatCoverageNumber(ctx.parsed.y, 2)}`;
+                  },
+                },
+              },
+            },
+            scales: {
+              ...commonOptions.scales,
+              x: {
+                ...commonOptions.scales.x,
+                title: {
+                  display: true,
+                  text: "Cumulative sold quote liquidity (%)",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: 0,
+                max: 100,
+                ticks: {
+                  ...commonOptions.scales.x.ticks,
+                  callback: (value) => {
+                    const soldPct = coverageFromDisplayPct(value);
+                    return soldPct.toFixed(0);
+                  },
+                },
+              },
+              y: {
+                ...commonOptions.scales.y,
+                type: "logarithmic",
+                afterBuildTicks: (axis) => {
+                  const min = Math.max(1e-9, coverageAxisMinPrice || 1);
+                  let ticks = (axis.ticks || []).filter(
+                    (t) => Number.isFinite(t.value) && t.value >= min,
+                  );
+                  const isMinTick = (t) =>
+                    Math.abs(t.value - min) / Math.max(1, Math.abs(min)) <
+                    1e-10;
+                  const minExisting = ticks.find((t) => isMinTick(t));
+                  const minTick = minExisting || { value: min, major: true };
+                  const rest = ticks.filter((t) => !isMinTick(t));
+                  // Keep dense/native log ticks; only ensure initial-price tick exists.
+                  axis.ticks = [minTick, ...rest];
+                },
+                ticks: {
+                  ...commonOptions.scales.y.ticks,
+                  callback: (value) => {
+                    const v = Number(value);
+                    if (!Number.isFinite(v) || v <= 0) return "";
+                    const min = Math.max(1e-9, coverageAxisMinPrice || 1);
+                    const isMinTick =
+                      Math.abs(v - min) / Math.max(1, Math.abs(min)) < 1e-10;
+                    return isMinTick
+                      ? formatCoverageNumber(min, 2)
+                      : formatCoverageNumber(v, 0);
+                  },
+                },
+                title: {
+                  display: true,
+                  text: "Price",
+                  color: "#8b949e",
+                  font: { size: 12 },
+                },
+                min: 1,
+              },
+            },
+            showLine: true,
+            spanGaps: false,
+          },
+        });
+
+        coverageZoomChart = new Chart(
+          document.getElementById("coverageZoomChart"),
+          {
+            type: "scatter",
+            data: { datasets: [] },
+            options: {
+              ...commonOptions,
+              maintainAspectRatio: false,
+              plugins: {
+                ...commonOptions.plugins,
+                legend: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: (ctx) =>
+                      `${ctx.dataset.label}: sold=${Number(ctx.parsed.x).toFixed(2)}%, price=${formatCoverageNumber(ctx.parsed.y, 2)}`,
+                  },
+                },
+              },
+              scales: {
+                ...commonOptions.scales,
+                x: {
+                  ...commonOptions.scales.x,
+                  title: {
+                    display: true,
+                    text: "Sold quote liquidity (%)",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 0,
+                  max: 10,
+                  ticks: {
+                    ...commonOptions.scales.x.ticks,
+                    callback: (value) => Number(value).toFixed(1),
+                  },
+                },
+                y: {
+                  ...commonOptions.scales.y,
+                  title: {
+                    display: true,
+                    text: "Price (zoom around initial)",
+                    color: "#8b949e",
+                    font: { size: 12 },
+                  },
+                  min: 1,
+                  max: 1.05,
+                  ticks: {
+                    ...commonOptions.scales.y.ticks,
+                    callback: (value) => formatCoverageNumber(Number(value), 2),
+                  },
+                },
+              },
+              showLine: true,
+              spanGaps: false,
+            },
+          },
+        );
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      //  Init
+      // ═══════════════════════════════════════════════════════════════
+
+      // Push the single-source research-band / kernel bounds (declared
+      // once at the top of this script) into the DOM min/max attributes.
+      // The HTML carries no bound literals of its own, so the constants
+      // cannot drift apart from what the inputs enforce.
+      function applyResearchBandBoundsToDom() {
+        const setBounds = (id, min, max) => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.min = String(min);
+          el.max = String(max);
+        };
+        // Equilibra fine inputs carry the AUTHORITATIVE display values;
+        // the paired range sliders stay in normalized t-space [0, 1]
+        // (cubic mapping) and keep their own attributes.
+        setBounds("pwAlphaFine", PW_ALPHA_MIN, PW_ALPHA_MAX);
+        setBounds("pwLambdaFine", PW_LAMBDA_MIN, PW_LAMBDA_MAX);
+        // YieldBasis reference-AMM kernel bounds (A is packed, γ is raw).
+        setBounds("curveA", CURVE_MIN_A_PACKED, CURVE_MAX_A_PACKED);
+        setBounds("curveGamma", CURVE_MIN_GAMMA, CURVE_MAX_GAMMA);
+      }
+
+      document.addEventListener("DOMContentLoaded", async () => {
+        try {
+          await loadBenchmarkPresetsFromApi();
+        } catch (e) {
+          console.error("[Curve Lab] failed to load default presets:", e);
+          const src = document.getElementById("mSource");
+          if (src) {
+            src.textContent = `Init error: ${(e?.message || e || "").toString().slice(0, 80)}`;
+          }
+          return;
+        }
+
+        applyResearchBandBoundsToDom();
+        initCharts();
+        relocateControlsSection();
+        applyPriceCoverageCollapsed();
+        updatePwModeUI();
+        const restored = restoreVisualizerUiState();
+        if (!restored) {
+          onCurvePresetChange();
+          saveVisualizerUiState();
+          return;
+        }
+        onSliderChange();
+      });
+    </script>
+  </body>
+</html>

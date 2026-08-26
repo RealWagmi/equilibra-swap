@@ -1,0 +1,18 @@
+{
+  "schema": "equilibra-deployments/v2",
+  "network": "robinhood",
+  "chainId": "4663",
+  "commit": "Engage!",
+  "deployedAt": "2026-08-26T10:48:45.547Z",
+  "deployer": "0x972405d0009DdD8906a36109B069E4D7d02E5801",
+  "feeCollector": "0x9c4180d67E7121D6A150eFc6b9502965Bf7BB207",
+  "protocolFeePercent": 5,
+  "weth9": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+  "contracts": {
+    "poolImplementation": "0xE1609682d9fA627301125C402078A8074151886d",
+    "factory": "0x7228b8110d9A85BD6740bE03677Eb6deDe0546a8",
+    "paramTimelock": "0x022D5fCD282E03F42A0FD8632C863928681Ab35E",
+    "router": "0x07AdCfee4CfBCC6c949fDf366F423D67084c5d8a"
+  },
+  "pools": []
+}

@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EquilibraSwap — Adaptive State-Dependent CFMM</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-logo-wrap">
+            <img class="brand-logo" src="./brand.png" alt="EquilibraSwap" />
+          </div>
+          <div class="brand-sub">Adaptive State-Dependent CFMM</div>
+        </div>
+
+        <nav>
+          <a href="#positioning">Positioning</a>
+          <a href="#idea">Model Idea</a>
+          <a href="#price">How Price Forms</a>
+          <a href="#charts">Interactive: a &amp; λ</a>
+          <a href="#repeg">Auto-Repeg &amp; EMA</a>
+          <a href="#fees">Dynamic Fee</a>
+          <a href="#setup">Pool Setup (parameters)</a>
+          <a href="#disclaimer">Simulator Disclaimer</a>
+          <a href="#faq">FAQ</a>
+        </nav>
+
+        <div class="side-card">
+          <h4>At a Glance</h4>
+          <p>
+            Equilibra is a hybrid AMM with an <em>adaptive</em> price curve and
+            an <em>anchor</em> that drifts toward the live market via
+            auto-repeg, financed by a capped share of fee-funded
+            LP-unit-value growth.
+          </p>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section id="positioning">
+          <h2>Positioning</h2>
+          <p class="note">
+            Equilibra is a single-pool design that <em>shifts</em>
+            between a stable-pair regime and a volatile-pair regime
+            depending on its own state, without governance, migrations,
+            or new liquidity ranges.
+          </p>
+          <div class="equation-grid">
+            <article>
+              <h3>Stable near the anchor, robust at the edges</h3>
+              <p>
+                When the pool is balanced and trades are routine, the
+                effective curve is <em>flat</em> and slippage is
+                near-zero. As the pool drifts away from balance, the
+                curve smoothly transitions toward a constant-product
+                tail — slippage rises automatically, protecting the
+                remaining inventory and keeping every swap feasible
+                with no liquidity wall.
+              </p>
+            </article>
+            <article>
+              <h3>An anchor that learns the market</h3>
+              <p>
+                The "fair price" the pool quotes isn't pinned at
+                deploy. A protected EMA oracle observes every swap,
+                and an auto-repeg routine inches the anchor toward
+                the EMA in tiny capped steps, financed entirely out
+                of accumulated LP-unit-value growth (fee-funded —
+                there is no separate fee bucket). LPs keep at least
+                <code>(BPS − repegShareBps − protocolFeePercent · 100)
+                / (BPS − protocolFeePercent · 100)</code> of that
+                growth by construction; with the bundled presets
+                (<code>protocolFeePercent = 0</code>) this reduces to
+                <code>(BPS − repegShareBps) / BPS</code>.
+              </p>
+            </article>
+            <article>
+              <h3>Two immutable knobs, one live signal</h3>
+              <p>
+                The shape of the curve is set at deploy by two
+                independent parameters: <code>a</code> (depth at the
+                anchor) and <code>λ</code> (plateau width), and
+                reshaped on every swap by a single live number — the
+                pool's own off-balance distance <code>D</code>. The
+                whole design fits in the formulas on the next page.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section id="idea" class="hero">
+          <h1>One Curve, One Anchor, Two Tunable Concentration Knobs</h1>
+          <p class="lead">
+            Imagine the pool as a <strong>spring</strong> anchored to
+            the market price. Trades near the anchor flex the spring
+            at almost no cost — the pool quotes a near-anchor price
+            with tight slippage. The further the pool gets pulled
+            from balance, the <em>softer</em> that spring becomes,
+            so additional depletion costs the trader more and more
+            until the curve approaches a constant-product asymptote
+            and every remaining swap stays feasible.
+          </p>
+          <p class="note">
+            Mechanically there are just four moving parts:
+            <strong>reserves</strong> <code>(x, y)</code> in the
+            anchor's units, an <strong>anchor price</strong>
+            (<code>priceScale</code>) that drifts slowly toward the
+            market via auto-repeg, and two
+            <strong>concentration knobs</strong> —
+            <code>a</code> sets how deep the central plateau is,
+            <code>λ</code> sets how wide it is before the
+            constant-product tail takes over. Everything else —
+            quote, slope, fee, repeg gate — falls out of those
+            numbers.
+          </p>
+
+          <div class="kpi-grid">
+            <article>
+              <h3>Anchor — "where I think fair is"</h3>
+              <p>
+                The pool always quotes <em>this exact price</em> when
+                it's perfectly balanced. As the pool drifts off
+                balance, the quote drifts away from the anchor in a
+                controlled way.
+              </p>
+            </article>
+            <article>
+              <h3>a &amp; λ — "depth and width, decoupled"</h3>
+              <p>
+                <code>a</code> alone sets the depth of the plateau
+                at the anchor: <code>A(D = 0) = a</code>. Larger
+                <code>a</code> deepens the centre.
+                <code>λ</code> alone sets how wide the plateau is
+                before the curve tilts toward constant-product:
+                <code>A = a / 2</code> at <code>λ · D = W</code>.
+                Larger <code>λ</code> narrows the plateau;
+                smaller <code>λ</code> widens it. The two effects
+                are independent — V1 coupled them through a single
+                <code>α</code>; V1.5 splits them.
+              </p>
+            </article>
+            <article>
+              <h3>Fees pay for the anchor's drift</h3>
+              <p>
+                When the market moves, the anchor doesn't jump — it
+                <em>creeps</em> toward the market price, paid for out
+                of the pool's accumulated LP-unit-value growth (which
+                swap fees feed). By construction LPs keep at least
+                <code>(BPS − repegShareBps − protocolFeePercent · 100)
+                / (BPS − protocolFeePercent · 100)</code> of that
+                growth — 50 % at the canonical
+                <code>repegShareBps = 5 000</code> with
+                <code>protocolFeePercent = 0</code>.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section id="price">
+          <h2>How a Price Is Formed</h2>
+          <p class="note">
+            Two formulas tell the whole story: the invariant the pool
+            never breaks, and the slope of that invariant which
+            becomes the quoted price.
+          </p>
+
+          <h3>1. The invariant — Equilibra's law of conservation</h3>
+          <div class="equation-card">
+            <p class="formula">
+              <code>K(x, y; L) = A · L · (x + y) / 2 + (W − A) · x · y</code>
+            </p>
+            <p class="formula">
+              <code>A = a · W / (W + λ · D)</code>
+              &nbsp;&nbsp;&middot;&nbsp;&nbsp;
+              <code>D = (y − x)² / (x · y)</code>
+              &nbsp;&nbsp;&middot;&nbsp;&nbsp;
+              <code>W = WAD = 10¹⁸</code>
+            </p>
+          </div>
+          <div class="equation-grid">
+            <article>
+              <h3>Two regimes, one smooth curve</h3>
+              <p>
+                At balance (<code>D = 0</code>): <code>A = a</code>,
+                so the linear head dominates and the curve is its
+                deepest plateau. At deep imbalance
+                (<code>D → ∞</code>): <code>A → 0</code>, so the head
+                vanishes and <code>K → W · x · y</code> — the
+                constant-product asymptote. The transition is smooth
+                (a rational function of <code>D</code>), so there are
+                no segments, no governance levers, and no router
+                cliffs.
+              </p>
+            </article>
+            <article>
+              <h3>The depth scale L is recovered, not stored</h3>
+              <p>
+                <code>L</code> is the balance-equivalent depth of the
+                level set passing through <code>(x, y)</code>. The
+                pool recovers it analytically from the pre-state via
+                a closed-form quadratic and freezes it for the whole
+                swap leg, so the trader and the solver agree on a
+                single <code>K = const</code> level set. The forward
+                and reverse legs of the same swap therefore identify
+                the same <code>L</code>, which is what makes the
+                kernel path-additive.
+              </p>
+            </article>
+          </div>
+
+          <div class="equation-grid">
+            <article>
+              <h3>a — depth at the anchor</h3>
+              <p>
+                <code>a</code> is the value of <code>A</code> at the
+                anchor: <code>A(D = 0) = a</code>. The linear head
+                <code>A · L · (x + y) / 2</code> scales with
+                <code>a</code>, so larger <code>a</code> deepens the
+                central plateau without changing how quickly the
+                curve transitions to the CP tail. Production envelope
+                <code>[0.1 · W, 0.99 · W]</code>; <code>a = W</code>
+                is forbidden (forces the L-quadratic
+                ill-conditioned).
+              </p>
+            </article>
+            <article>
+              <h3>λ — width of the plateau</h3>
+              <p>
+                <code>λ</code> sets the half-amplification distance:
+                <code>A = a / 2</code> exactly at
+                <code>λ · D = W</code>. Larger <code>λ</code> ⇒
+                the amplification halves at a smaller <code>D</code>
+                ⇒ the plateau narrows and the CP tail kicks in
+                sooner. Smaller <code>λ</code> widens the plateau,
+                pushing the cliff further out. Decoupled from
+                <code>a</code> — the V1 single-<code>α</code> kernel
+                coupled both effects; V1.5 separates them.
+              </p>
+            </article>
+          </div>
+
+          <div class="equation-grid">
+            <article>
+              <h3>D — the imbalance signal</h3>
+              <p>
+                <code>D = (y − x)² / (x · y)</code> is a symmetric
+                state distance between the two reserves: zero at
+                balance, growing as one side outweighs the other.
+                It is purely a function of state (no oracle reads,
+                no priors), which lets the same invariant be
+                evaluated forward and backward without drift.
+              </p>
+            </article>
+            <article>
+              <h3>Math-space coords — V1-style asymmetric lift</h3>
+              <p>
+                Before the kernel sees the reserves, the pool lifts
+                them via a one-sided coordinate change:
+                <code>xMath = xWad</code> (base axis, identity) and
+                <code>yMath = yWad · W / priceScale</code> (quote
+                axis, normalised to base units). A repeg shifts
+                <code>yMath</code> only, which is what gives the
+                auto-repeg's solvency gate a real impermanent-loss
+                signal — the symmetric V1.5 lift used briefly during
+                development collapsed that signal and is gone.
+              </p>
+            </article>
+          </div>
+
+          <div class="callout">
+            <h4>Why this matters in practice</h4>
+            <p>
+              On a balanced pool <code>D = 0</code> ⇒ <code>A = a</code>
+              and the invariant evaluates on its deepest plateau —
+              a swap pays near-zero slippage. The instant a trade
+              starts pushing the pool off balance, <code>D</code>
+              climbs, <code>A</code> falls toward zero, and the
+              invariant smoothly slides toward <code>K = W · x · y</code>.
+              The curve softens, the slope steepens, and slippage on
+              the next wei rises automatically. No governance, no
+              router logic — one closed-form expression evaluated
+              per swap.
+            </p>
+          </div>
+
+          <h3>2. The slope — that's your price</h3>
+          <div class="equation-card">
+            <p class="formula">
+              <code>marginalPrice = ∂K/∂xMath ÷ ∂K/∂yMath</code>
+            </p>
+          </div>
+          <p>
+            The price an infinitesimal swap would pay is the slope of
+            the level set at the current point in math-space.
+            Multiplying by <code>priceScale</code> converts it back
+            into real units (e.g. USDT per WETH). At balance
+            (<code>xMath = yMath</code>) this slope is exactly
+            <code>1</code>, so the live spot equals the anchor. As
+            <code>yMath</code> grows relative to <code>xMath</code>
+            the slope rises; as <code>xMath</code> grows relative to
+            <code>yMath</code> it falls. That single ratio drives
+            <em>every</em> downstream gate: EMA update, dynamic-fee
+            distance, repeg activation.
+          </p>
+
+          <div class="callout">
+            <h4>What the kernel actually does on a swap</h4>
+            <ol>
+              <li>
+                Lift <code>(x, y)</code> into math-space, compute
+                <code>D</code>, evaluate
+                <code>A = a · W / (W + λ · D)</code>, and recover the
+                depth scale <code>L</code> from the closed-form
+                quadratic
+                <code>W·L² − A·L·S − (W − A)·N = 0</code> with
+                <code>S = (x + y) / 2</code>,
+                <code>N = x · y</code>.
+              </li>
+              <li>
+                Lock
+                <code>K = A · L · (x + y) / 2 + (W − A) · x · y</code>
+                for this swap.
+              </li>
+              <li>
+                Solve for the post-swap <code>(x', y')</code> via a
+                short secant iteration that converges in a handful
+                of steps from a constant-product seed. Bounded gas.
+              </li>
+              <li>
+                Charge the smoothstep dynamic fee based on how far
+                the post-swap state lands from the anchor.
+              </li>
+              <li>
+                Update the geometric EMA from the <em>pre-swap</em>
+                marginal price (the swap's own resulting price is
+                sampled by the next swap, once time advances) and,
+                if the gate allows, advance the anchor by one damped
+                log-domain step (retrying at halved magnitudes when
+                the solvency gate refuses the full move).
+              </li>
+            </ol>
+          </div>
+        </section>
+
+        <section id="charts">
+          <h2>Interactive: see <code>a</code> and <code>λ</code> reshape the curve</h2>
+          <p class="note">
+            Move the sliders to feel how the two concentration knobs
+            independently reshape liquidity around the anchor.
+            <code>a</code> controls how deep the central plateau is;
+            <code>λ</code> controls how wide it is. The chart plots
+            <em>liquidity density</em> — depth per unit price change —
+            computed server-side by the visualizer backend
+            (<code>build_visualizer_series</code> in
+            <code>simulator/src/app/visualizer.rs</code>), bit-exact
+            with the production math kernel; no invariant math runs
+            in the browser. Drag <strong>Market price</strong> to
+            watch a stylised illustration of the auto-repeg mechanic
+            crawl the anchor toward the EMA.
+          </p>
+
+          <div class="controls">
+            <div class="control-group slider-group">
+              <div class="slider-head">
+                <label for="aRange">a</label>
+                <output id="aValue" for="aRange">0.90</output>
+              </div>
+              <input
+                id="aRange"
+                type="range"
+                min="0.10"
+                max="0.99"
+                step="0.01"
+                value="0.90"
+              />
+            </div>
+
+            <div class="control-group slider-group">
+              <div class="slider-head">
+                <label for="lambdaRange">λ</label>
+                <output id="lambdaValue" for="lambdaRange">0.300</output>
+              </div>
+              <input
+                id="lambdaRange"
+                type="range"
+                min="0.001"
+                max="1.000"
+                step="0.001"
+                value="0.300"
+              />
+            </div>
+
+            <div class="control-group slider-group slider-group-wide">
+              <div class="slider-head">
+                <label for="marketRange">Market price (× anchor)</label>
+                <output id="marketValue" for="marketRange">1.10×</output>
+              </div>
+              <input
+                id="marketRange"
+                type="range"
+                min="0.4"
+                max="2.5"
+                step="0.001"
+                value="1.10"
+              />
+            </div>
+
+            <div class="preset-buttons">
+              <button
+                data-preset="weth"
+                type="button"
+                title="Production preset, loaded live from /api/config/default"
+              >WETH preset</button>
+              <button
+                data-preset="wbtc"
+                type="button"
+                title="Production preset, loaded live from /api/config/default"
+              >WBTC preset</button>
+              <button
+                data-preset="stable"
+                type="button"
+                title="Illustrative demo values — not a production preset"
+              >Stable-like</button>
+              <button
+                data-preset="volatile"
+                type="button"
+                title="Illustrative demo values — not a production preset"
+              >Volatile-like</button>
+            </div>
+            <p id="presetStatus" class="status-note" hidden></p>
+          </div>
+
+          <article class="chart-card">
+            <h3>Liquidity density around the anchor (illustrative repeg animation)</h3>
+            <canvas id="envelopeChart" width="1040" height="420"></canvas>
+            <p id="chartStatus" class="status-note" hidden></p>
+            <p class="note">
+              X-axis: market price relative to the pool's
+              <em>original</em> anchor (log scale:
+              <code>0.25×</code> through <code>4×</code>). Y-axis:
+              <em>local liquidity density</em> = depth per unit price
+              change. The one-sided bell is fetched from
+              <code>POST /api/visualizer/series</code> — the same
+              bit-exact U256 Rust kernel
+              (<code>build_visualizer_series</code> →
+              <code>LocalQuoter</code>) a benchmark run uses. For each
+              depletion fraction <code>d</code> the backend swaps the
+              pool along its own constant-<code>K</code> trajectory to
+              that state and probes the marginal execution rate there;
+              liquidity is derived as
+              <code>(1 − d) / (dPenalty/dd)</code> with the slope
+              taken as a central finite difference over neighbouring
+              samples. No invariant math runs in the browser: the page
+              mirrors the series across <code>d = 0</code> and spreads
+              it along the log-price axis with a stylised,
+              (<code>a</code>, <code>λ</code>)-independent map — bell
+              <em>heights</em> are kernel-derived, the x-placement is
+              an illustrative approximation. As you drag the
+              <strong>Market price</strong> slider, the
+              <strong>EMA</strong> and <strong>anchor</strong> markers
+              move with fixed demo lags to illustrate the repeg
+              direction only; the real on-chain gate adds direction-split
+              dead-bands, a once-per-block cap (at most one move per second), damped log-domain
+              <code>anchor · exp(±min(repegStepWad, deviation / 5))</code>
+              steps with a halving ladder and two LP-unit-value
+              solvency checks. The whole bell shifts
+              horizontally with the anchor, because Equilibra always
+              quotes its fair price at the anchor's current position.
+              Larger <code>a</code> deepens the centre (taller bell);
+              smaller <code>λ</code> widens the plateau (broader
+              bell); together they let you tune depth and width
+              independently, which the V1 single-<code>α</code>
+              kernel could not do.
+            </p>
+            <div class="curve-key">
+              <span class="curve-key-item">
+                <span
+                  class="swatch"
+                  style="background: var(--accent)"
+                ></span>
+                Equilibra concentration profile
+              </span>
+              <span class="curve-key-item">
+                <span
+                  class="swatch"
+                  style="background: var(--anchor)"
+                ></span>
+                Anchor (creeps toward EMA)
+              </span>
+              <span class="curve-key-item">
+                <span
+                  class="swatch"
+                  style="background: var(--depletion)"
+                ></span>
+                EMA / oracle (lags market)
+              </span>
+              <span class="curve-key-item">
+                <span
+                  class="swatch"
+                  style="background: var(--surplus)"
+                ></span>
+                Market price (slider)
+              </span>
+            </div>
+          </article>
+
+          <div id="snapshotCard" class="callout snapshot-card">
+            <h4>Live snapshot of the repeg state</h4>
+            <ul>
+              <li>
+                <code>a</code> = depth at anchor =
+                <span data-snap="aWad">—</span>
+              </li>
+              <li>
+                <code>λ</code> = plateau width =
+                <span data-snap="lambdaWad">—</span>
+              </li>
+              <li>
+                Peak liquidity density (at anchor) =
+                <span data-snap="peakDensity">—</span>
+                <span class="note tech-note">
+                  (depends on <code>a</code> alone; the Y-axis
+                  auto-scales to this value so the bell stays
+                  visible across the slider band)
+                </span>
+              </li>
+              <li>
+                Anchor position vs original =
+                <span data-snap="anchorRatio">—</span>
+                <span class="note tech-note">
+                  (where the curve's centre has crept to; lags the
+                  EMA)
+                </span>
+              </li>
+              <li>
+                EMA position vs original anchor =
+                <span data-snap="emaRatio">—</span>
+                <span class="note tech-note">
+                  (smoothed market reading that drives the repeg
+                  gate)
+                </span>
+              </li>
+              <li>
+                Concentration retained at market vs anchor =
+                <span data-snap="ratioAtMarket">—</span>
+                <span class="note tech-note">
+                  (how flat the curve still is at the live market
+                  price; lower = more slippage)
+                </span>
+              </li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="repeg">
+          <h2>Auto-Repeg & EMA</h2>
+          <p class="note">
+            The anchor isn't fixed forever — Equilibra has a built-in
+            mechanism that nudges it toward the real market price, but
+            slowly and only when the pool can afford to.
+          </p>
+
+          <div class="equation-grid">
+            <article>
+              <h3>Step 1 — Geometric EMA tracks the market</h3>
+              <p>
+                On every swap the pool feeds the <em>pre-swap</em>
+                marginal price into a <em>geometric</em> (log-domain)
+                exponential moving average: <code>ema′ = ema · exp(ln(spot / ema) · (1 −
+                α))</code>. Averaging in the log domain makes the oracle
+                exactly reciprocal-invariant — reading the same market
+                through either token order produces mirror EMAs, where an
+                arithmetic average would drift apart by ≈&nbsp;σ²/2 of the
+                price variance (Jensen's inequality) and subsidise one
+                repeg direction. The EMA's half-life is configurable via
+                <code>emaPeriod</code>; a large value smooths short-term
+                volatility, a small value reacts faster to rapid moves.
+              </p>
+            </article>
+            <article>
+              <h3>Step 2 — Anchor follows EMA in tiny steps</h3>
+              <p>
+                If the <em>geometric</em> deviation between EMA and
+                anchor —
+                <code>|max(EMA, anchor) / min(EMA, anchor) − 1|</code>
+                — reaches the active direction's dead-band
+                (<code>repegThresholdToken1UpWad</code> while the EMA
+                sits above the anchor, else
+                <code>repegThresholdToken1DownWad</code>), the pool
+                moves the anchor by the log-domain step
+                <code>anchor · exp(±min(repegStepWad, deviation /
+                5))</code>, clamped to the target. When the LP-value
+                gate below refuses the move, a halving ladder retries
+                the same step at ÷2, ÷4 and ÷8 within the same block
+                and commits the first affordable rung. One repeg per
+                block maximum, a single call never overshoots the
+                target, and the damped step converges without ringing.
+                The geometric metric makes a ±2× move read
+                <code>1.0</code> WAD in both directions, and splitting
+                the dead-band per side turns direction bias into an
+                explicit calibration knob (the bundled presets chase
+                base-asset rallies with the tighter band).
+              </p>
+            </article>
+          </div>
+
+          <div class="equation-grid">
+            <article>
+              <h3>Step 3 — Pay from fees, not from LP capital</h3>
+              <p>
+                A repeg has a real cost: the pool's reserves end up
+                slightly off-balance versus the new anchor. Equilibra
+                never pays for that cost out of LP principal. Instead,
+                every swap accumulates an
+                <code>lpValueGrowthWad</code> counter; the repeg gate
+                may consume at most
+                <code>repegShareBps / (BPS − protocolFeePercent · 100)</code>
+                of that counter (the share is stored pre-scaled at
+                <code>initialize</code>, so the protocol slice is
+                funded from the LPs' residual and repeg cadence is
+                independent of <code>protocolFeePercent</code>), with
+                the remainder permanently committed to LPs.
+              </p>
+            </article>
+            <article>
+              <h3>Step 4 — Manipulation defences</h3>
+              <p>
+                Two layers stop a single trade from pumping the
+                anchor: a symmetric spot cap into the EMA
+                (<code>[anchor / 2, anchor × 2]</code>) bounds how
+                far one trade can drag the oracle, and the
+                block-and-second cadence guard prevents multi-step manipulation
+                in the same block.
+              </p>
+            </article>
+          </div>
+
+          <div class="callout">
+            <h4>50 / 50 rule, in one sentence</h4>
+            <p>
+              At the canonical <code>repegShareBps = 5&nbsp;000</code>
+              (with <code>protocolFeePercent = 0</code>, as in the
+              bundled presets), no more than half of accumulated
+              LP-value growth may
+              ever be spent on re-centering the anchor — the other
+              half is locked to LPs by the gate's own threshold
+              formula.
+            </p>
+          </div>
+        </section>
+
+        <section id="fees">
+          <h2>Dynamic Fee</h2>
+          <p class="note">
+            Equilibra charges a swap fee that depends on where in the
+            curve the trade lands. Routine trades near the anchor pay the
+            floor; aggressive trades that drag the pool further from
+            balance pay the full base fee.
+          </p>
+
+          <div class="equation-grid">
+            <article>
+              <h3>Floor near the centre</h3>
+              <p>
+                When the post-swap state stays near the anchor, the
+                fee is <code>feeFloorBps</code>. LPs absorb easy flow
+                at a friendly rate.
+              </p>
+            </article>
+            <article>
+              <h3>Smooth ramp to the base fee</h3>
+              <p>
+                As the trade pushes the pool further out, the fee
+                climbs via a smoothstep <code>m(r) = 2r − r²</code>
+                over a state distance of
+                <code>feeRampBps / 10&nbsp;000</code> WAD until it
+                reaches <code>baseFee</code>. The rate is resolved and
+                charged at WAD precision (<code>1 bps = 1e14</code>),
+                so a bigger trade never buys a smaller output beyond
+                fixed-point dust.
+              </p>
+            </article>
+          </div>
+
+          <div class="callout">
+            <h4>Disabling the ramp</h4>
+            <p>
+              Set <code>feeRampBps = 0</code> and the pool charges a
+              flat <code>baseFee</code> for every swap. A live ramp
+              cannot be arbitrarily narrow: deploys must satisfy
+              <code>feeRampBps · (10&nbsp;000 − baseFee)² ≥ 12 ·
+              10&nbsp;000 · (baseFee − feeFloorBps)²</code>
+              (<code>FeeRampTooNarrow</code> otherwise) — on a steeper
+              ramp the fee on the whole notional would grow faster
+              than the input itself.
+            </p>
+          </div>
+        </section>
+
+        <section id="setup">
+          <h2>Pool Setup — Every Parameter, Limit, and Effect</h2>
+          <p class="note">
+            All knobs exposed by the simulator and the on-chain factory.
+            Hard limits are enforced by <code>EquilibraFactory</code> +
+            <code>Constants.sol</code>; the simulator mirrors these so it
+            cannot ship a config the chain would reject.
+          </p>
+
+          <h3>Curve shape (immutable, set at deploy)</h3>
+          <table class="setup-table">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Range</th>
+                <th>Effect</th>
+                <th>Tuning intuition</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>aWad</code> (WAD)</td>
+                <td>
+                  <code>[1e17, 99e16]</code><br />
+                  i.e. <code>0.10 … 0.99</code>
+                </td>
+                <td>
+                  Depth-at-anchor knob. Sets
+                  <code>A(D = 0) = a</code>, the value of the
+                  amplification at balance. Larger <code>a</code>
+                  deepens the central plateau without changing the
+                  cliff position. <code>a = W</code> is forbidden
+                  (forces the L-quadratic ill-conditioned).
+                </td>
+                <td>
+                  <code>0.1–0.4</code> volatile pairs (shallow
+                  centre), <code>0.4–0.8</code> moderately
+                  concentrated, <code>0.8–0.99</code> ultra-flat
+                  pegs.
+                </td>
+              </tr>
+              <tr>
+                <td><code>lambdaWad</code> (WAD)</td>
+                <td>
+                  <code>[1e15, 1e18]</code><br />
+                  i.e. <code>0.001 … 1.0</code>
+                </td>
+                <td>
+                  Plateau-width knob. Sets the half-amplification
+                  distance:
+                  <code>A = a / 2</code> at <code>λ · D = W</code>.
+                  Larger <code>λ</code> narrows the plateau (cliff
+                  closer to the anchor); smaller <code>λ</code>
+                  widens it. Decoupled from <code>aWad</code> — V1
+                  coupled both effects through a single knob; V1.5
+                  separates them.
+                </td>
+                <td>
+                  <code>0.001–0.01</code> wide plateau, soft cliff
+                  (volatile pairs); <code>0.01–0.1</code> moderately
+                  concentrated — the default band, where the
+                  calibrated WETH / WBTC benchmark presets sit
+                  (both <code>0.01678</code>, with
+                  <code>a = 0.90961</code>; canonical source:
+                  <code>simulator/src/app/config.rs</code>);
+                  <code>0.1–1.0</code> narrow plateau, harder
+                  transition (peg-ish pools).
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Fee model</h3>
+          <table class="setup-table">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Range</th>
+                <th>Effect</th>
+                <th>Tuning intuition</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>baseFee</code> (BPS)</td>
+                <td><code>[5, 2&nbsp;000]</code> — max <strong>20&nbsp;%</strong></td>
+                <td>
+                  Upper bound of the per-swap fee. Reached when
+                  <code>feeRampBps = 0</code> (flat fee) or when a swap
+                  travels far enough from the anchor.
+                </td>
+                <td>
+                  Typical: <code>30 bps</code> stable, <code>60–90 bps</code>
+                  volatile, <code>100+ bps</code> long-tail.
+                </td>
+              </tr>
+              <tr>
+                <td><code>feeFloorBps</code> (BPS)</td>
+                <td>
+                  <code>[0, baseFee]</code> — general-purpose default
+                  <code>20</code>; the bundled WETH / WBTC benchmark
+                  presets ship <code>136</code> / <code>146</code>
+                </td>
+                <td>
+                  Floor fee paid by trades that land near the anchor.
+                </td>
+                <td>
+                  Lower floor = more LP-friendly to small balanced flow.
+                  The only ramp opt-out is <code>feeRampBps = 0</code>
+                  (flat <code>baseFee</code>); pairing
+                  <code>feeRampBps ≠ 0</code> with
+                  <code>feeFloorBps = baseFee</code> is rejected at
+                  deploy with <code>FeeRampNoHeadroom</code> — the
+                  smoothstep would have no headroom to interpolate
+                  into.
+                </td>
+              </tr>
+              <tr>
+                <td><code>feeRampBps</code> (BPS of WAD)</td>
+                <td>
+                  <code>[0, 10&nbsp;000]</code> — <code>0</code> disables
+                  the ramp
+                </td>
+                <td>
+                  State distance over which the fee climbs from floor
+                  to base via smoothstep <code>m(r) = 2r − r²</code>.
+                </td>
+                <td>
+                  Larger = gentler climb (more room before full base
+                  fee kicks in); smaller = sharper climb, bounded by
+                  the monotonicity guard
+                  <code>feeRampBps · (10&nbsp;000 − baseFee)² ≥ 12 ·
+                  10&nbsp;000 · (baseFee − feeFloorBps)²</code>
+                  (<code>FeeRampTooNarrow</code>). Ramp-enabled
+                  pools typically sit in <code>500–2&nbsp;000</code>;
+                  pools that prefer a flat <code>baseFee</code> opt out
+                  with <code>0</code>; the bundled WETH / WBTC benchmark
+                  presets run live ramps (<code>5&nbsp;000</code> /
+                  <code>4&nbsp;000</code>).
+                </td>
+              </tr>
+              <tr>
+                <td><code>protocolFeePercent</code> (%)</td>
+                <td>
+                  <code>[0, 25]</code> — max 25&nbsp;% of each swap fee
+                  (<code>Constants.MAX_PROTOCOL_FEE</code>)
+                </td>
+                <td>
+                  Fraction of every swap fee routed to the protocol; the
+                  rest stays with LPs.
+                </td>
+                <td>
+                  Default <code>0</code>; bench presets use <code>0</code> so
+                  100&nbsp;% of fees recycle to LPs / repeg gate. Bounded
+                  jointly with the repeg budget:
+                  <code>repegShareBps + protocolFeePercent × 100 ≤
+                  10&nbsp;000</code> — the factory reverts with
+                  <code>RepegShareExceedsBudget</code> otherwise
+                  (mirrored by <code>validate_run_config</code>).
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Auto-repeg & EMA oracle</h3>
+          <table class="setup-table">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Range</th>
+                <th>Effect</th>
+                <th>Tuning intuition</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>emaPeriod</code> (s)</td>
+                <td>
+                  <code>[60, ~4.86 days]</code> — half-life in seconds
+                </td>
+                <td>
+                  Smoothing window of the price oracle. Affects how fast
+                  the EMA reacts to volatility and therefore how fast the
+                  anchor follows.
+                </td>
+                <td>
+                  Stable presets use <code>~600</code> (10 min). Long-tail
+                  pairs benefit from <code>1&nbsp;800–3&nbsp;600</code>.
+                </td>
+              </tr>
+              <tr>
+                <td><code>repegStepWad</code> (WAD)</td>
+                <td>
+                  <code>[1, 1e18]</code> — <code>≈0&nbsp;%</code> to
+                  <code>100&nbsp;%</code> relative move per commit
+                </td>
+                <td>
+                  Per-block cap on the log-domain anchor step. Applied
+                  move per commit: <code>anchor ·
+                  exp(±min(repegStepWad, deviation / 5))</code>,
+                  clamped to the target — a single call never
+                  overshoots. When the LP-value gate refuses, the
+                  halving ladder retries the same step at ÷2, ÷4, ÷8
+                  and commits the first affordable rung. No fee-scale
+                  guard applies to the cap — a large cap only widens
+                  the per-commit ceiling while the <code>deviation /
+                  5</code> damping keeps individual moves
+                  proportional.
+                </td>
+                <td>
+                  Bundled presets: <code>5e15</code> (0.5&nbsp;%) for
+                  both WETH and WBTC — canonical values live in
+                  <code>simulator/src/app/config.rs</code>.
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <code>repegThresholdToken1UpWad</code> /
+                  <code>repegThresholdToken1DownWad</code> (WAD)
+                </td>
+                <td>
+                  <code>[1, 1e18]</code> each — plus the per-side stall
+                  guard below
+                </td>
+                <td>
+                  Direction-split activation dead-bands: the gate stays
+                  shut until the <em>geometric</em> deviation
+                  <code>|max(EMA, anchor) / min(EMA, anchor) − 1|</code>
+                  reaches the active side's band (<code>Up</code> while
+                  the EMA sits above the anchor, <code>Down</code>
+                  otherwise). A ±2× move reads <code>1.0</code> WAD in
+                  both directions under the
+                  <code>[anchor / 2, anchor × 2]</code> EMA clamp, so
+                  the full range is usable on either side. With the
+                  base token in slot&nbsp;0, a rising base market is an
+                  internal token1-DOWN move — the <code>Down</code>
+                  band is the bull-market catch-up knob.
+                </td>
+                <td>
+                  Bundled presets: <code>Up 2.5e15 / Down 1.5e15</code>
+                  (0.25&nbsp;% / 0.15&nbsp;%) for both bases.
+                  Calibration rule: keep each band
+                  <code>≤ feeFloorBps · 1e14</code>
+                  (<code>baseFee · 1e14</code> when the ramp is
+                  disabled). Setting a band far above the fee scale is
+                  <em>not</em> faster catch-up — the first permitted
+                  move on that side already costs more LP unit value
+                  than the fee-funded growth budget, so the post-repeg
+                  gate skips and the anchor stalls until unrelated
+                  volume replenishes the budget.
+                </td>
+              </tr>
+              <tr>
+                <td><code>repegShareBps</code> (BPS)</td>
+                <td>
+                  <code>[0, 10&nbsp;000 − protocolFeePercent ×
+                  100]</code> — default <code>5&nbsp;000</code>
+                  (50&nbsp;% / 50&nbsp;%). Above that the factory
+                  reverts with <code>RepegShareExceedsBudget</code>:
+                  the protocol slice and the repeg share must fit in
+                  one BPS budget.
+                </td>
+                <td>
+                  Maximum fraction of accumulated LP-value growth the gate
+                  may spend on anchor moves. Threshold:
+                  <br />
+                  <code>
+                    threshold = vp_genesis + growth · (BPS − shareStored) /
+                    BPS
+                  </code>
+                  <br />
+                  where <code>shareStored</code> is grossed up at
+                  <code>initialize</code> —
+                  <code>⌊repegShareBps · BPS / (BPS −
+                  protocolFeePercent · 100)⌋</code> — so repeg cadence
+                  is identical across <code>protocolFeePercent</code>
+                  settings: the protocol slice is funded from the
+                  LPs' residual, not the repeg budget.
+                </td>
+                <td>
+                  <code>0</code> ⇒ auto-repeg disabled (gate stays shut).
+                  <code>5&nbsp;000</code> ⇒ canonical 50/50 split; the
+                  bundled WETH / WBTC benchmark presets ship
+                  <code>5&nbsp;500</code> / <code>7&nbsp;000</code>.
+                  <code>10&nbsp;000</code> ⇒ gate may spend every accrued
+                  unit on repegs (aggressive tracking, weaker LP
+                  guarantee; only reachable when
+                  <code>protocolFeePercent = 0</code>).
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+        </section>
+
+        <section id="disclaimer">
+          <h2>Simulator Disclaimer</h2>
+          <div class="callout">
+            <h4>What the simulator can and cannot tell you</h4>
+            <p>
+              The simulator runs <strong>Equilibra</strong> alongside
+              two reference AMMs (constant-product and a concentrated
+              YieldBasis AMM) on the same trade schedule, oracle path
+              and arbitrageur model so that the <em>relative
+              behaviour</em> of the AMMs can be compared under
+              identical conditions.
+            </p>
+            <p>
+              <strong>Results for every AMM — Equilibra included — may
+              diverge from what the same code would do in production.</strong>
+              The benchmark replays <strong>historical price data</strong>
+              against deterministic actors (single arbitrageur model,
+              fixed gas estimates, no MEV competition, no real-world
+              latency, no validator ordering games, no oracle outages).
+              Real markets are richer and noisier than any replay can
+              capture.
+            </p>
+            <p>
+              On top of that, gas accounting, fee precision, slippage
+              policy and edge-case behaviour of every AMM modelled here
+              are simplifications of their on-chain counterparts. Numbers
+              you see are good enough to surface <em>trends</em> — fee
+              capture, IL profile, repeg cadence, drawdowns under the same
+              price path — but they are <strong>not</strong> a literal
+              forecast of any specific production deployment.
+            </p>
+            <p class="note">
+              Treat the dashboard as a lab bench: useful for comparing
+              designs, sizing parameter ranges, and pressure-testing
+              ideas. Treat any single dollar number as a directional
+              estimate, not a guarantee.
+            </p>
+          </div>
+        </section>
+
+        <section id="faq">
+          <h2>FAQ</h2>
+          <article class="faq-item">
+            <h3>What's the difference between the anchor and the EMA?</h3>
+            <p>
+              The <strong>anchor</strong> is the curve's centre — the price
+              the pool quotes when both sides are perfectly balanced. The
+              <strong>EMA</strong> is a smoothed reading of where the
+              pool's swaps have actually been pricing things lately. Repegs
+              slowly move the anchor toward the EMA, never the other way
+              around.
+            </p>
+          </article>
+          <article class="faq-item">
+            <h3>Why doesn't <code>x · y = k</code> hold here?</h3>
+            <p>
+              Equilibra's invariant is
+              <code>K = A · L · (x + y) / 2 + (W − A) · x · y</code>
+              with <code>A = a · W / (W + λ · D)</code>. At the
+              anchor (<code>D = 0</code>) <code>A = a</code> and the
+              linear head dominates — a deep plateau scaled by
+              <code>a</code>. At deep imbalance
+              (<code>D → ∞</code>) <code>A → 0</code> and the
+              invariant collapses to <code>K = W · x · y</code>, so
+              every swap remains feasible without a liquidity wall.
+            </p>
+          </article>
+          <article class="faq-item">
+            <h3>What do <code>a</code> and <code>λ</code> actually do?</h3>
+            <p>
+              The two knobs are decoupled:
+              <strong>(1) <code>a</code> sets plateau depth</strong>
+              — <code>A(D = 0) = a</code>, so larger <code>a</code>
+              deepens the centre without moving the cliff; and
+              <strong>(2) <code>λ</code> sets plateau width</strong>
+              — <code>A = a / 2</code> exactly at
+              <code>λ · D = W</code>, so larger <code>λ</code>
+              narrows the plateau (cliff closer to the anchor) and
+              smaller <code>λ</code> widens it. The V1 single-<code>α</code>
+              kernel coupled these two effects; V1.5 splits them so
+              presets can dial depth and width independently.
+            </p>
+          </article>
+          <article class="faq-item">
+            <h3>Can I disable the dynamic fee or the auto-repeg?</h3>
+            <p>
+              Yes. Set <code>feeRampBps = 0</code> for a flat
+              <code>baseFee</code> and <code>repegShareBps = 0</code> to
+              shut the auto-repeg gate permanently. The fee triple
+              (<code>baseFee</code>, <code>feeRampBps</code>,
+              <code>feeFloorBps</code>) stays adjustable later through
+              the pool creator's parameter timelock (every change waits
+              a full queue window and is re-validated against the
+              deploy-time invariants). <code>repegShareBps = 0</code> is
+              different: it is immutable in both directions — a pool
+              deployed with the gate shut can never re-open it, and a
+              live gate can never be set to zero.
+            </p>
+            <p>
+              The full runtime-adjustable set (pool-creator admin, via
+              the parameter timelock): the fee triple
+              (<code>baseFee</code>, <code>feeRampBps</code>,
+              <code>feeFloorBps</code>), <code>repegStepWad</code>
+              (at most 2× per queued change), both repeg dead-bands,
+              <code>repegShareBps</code> (user-facing floor
+              <code>5&nbsp;000</code>; the stored, protocol-fee
+              grossed-up share is capped at <code>9&nbsp;500</code>, so
+              the user-facing ceiling shrinks with
+              <code>protocolFeePercent</code> — e.g. <code>7&nbsp;125</code>
+              at 25&nbsp;%), and
+              <code>parachuteBandMult</code>. Every change waits a
+              queue delay (24&nbsp;h public / 10&nbsp;min private
+              pools), stays executable for a 7-day grace window, and
+              is re-validated against the deploy-time invariants at
+              execution. Immutable forever: <code>a</code>,
+              <code>λ</code>, <code>emaPeriod</code>,
+              <code>protocolFeePercent</code>. LPs who disagree with a
+              queued change have the whole delay window to exit —
+              <code>removeLiquidity</code> is never gated.
+            </p>
+          </article>
+          <article class="faq-item">
+            <h3>Does an LP ever lose money to a repeg?</h3>
+            <p>
+              By construction the gate may consume at most
+              <code>repegShareBps / (10&nbsp;000 − protocolFeePercent ·
+              100)</code> of the pool's accumulated LP-unit-value
+              growth (the share is stored pre-scaled at
+              <code>initialize</code>). The remainder of the growth is
+              locked to LPs as part of the threshold formula and cannot
+              be reclaimed by the gate. With the canonical
+              50&nbsp;%/50&nbsp;% setting and
+              <code>protocolFeePercent = 0</code>, LPs are guaranteed
+              to retain at least half of the accumulated LP-unit-value
+              growth that swap fees feed — there is no separate fee
+              bucket.
+            </p>
+          </article>
+          <article class="faq-item">
+            <h3>Where do I see the live oracle state?</h3>
+            <p>
+              Two getters, both on the pool:
+              <code>getOracleState()</code> returns the storage
+              snapshot (last value written by a swap), and
+              <code>getLiveEmaPrice()</code> returns the EMA decayed
+              up to <code>block.timestamp</code> on the fly.
+            </p>
+          </article>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
