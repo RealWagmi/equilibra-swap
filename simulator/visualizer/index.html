@@ -1233,7 +1233,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                 <div class="slider-group has-fine-input">
                   <label
                     style="color: #3fb950"
-                    title="a — depth-at-anchor knob. A(D=0) = a; larger a deepens the centre. Curve Lab range: [0.01, 0.99] (research sandbox — the open interval (0, W); a=W is forbidden because it kills the L-quadratic). Production envelope enforced on-chain: [0.1, 0.99] (Constants.A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16) — values outside this band will be rejected by the factory at deploy time. Slider mapping is cubic with fine resolution near the upper bound (a → W is the sensitive region; numerically ill-conditioned)."
+                    title="a — depth-at-anchor knob. A(D=0) = a; larger a deepens the centre. Curve Lab uses the production range [0.1, 0.99] (Constants.A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16). Slider mapping is cubic with fine resolution near the upper bound."
                     >a</label
                   >
                   <input
@@ -1261,7 +1261,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                 <div class="slider-group has-fine-input">
                   <label
                     style="color: #f6c177"
-                    title="λ — plateau-width knob. A = a/2 at λ·D = W (half-amplification distance). Larger λ narrows the plateau (cliff closer to anchor); smaller widens it. Curve Lab range: [0.0001, 10] (research sandbox — five orders of magnitude; capped at 10 to keep lambdaWad inside the uint64 envelope the InitParams struct uses). Production envelope enforced on-chain: [0.001, 1.0] (Constants.LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18) — values outside this band will be rejected by the factory at deploy time. Slider mapping is cubic with fine resolution near the lower bound (production envelope 0.001..1.0 occupies the left ~46 % of the slider)."
+                    title="λ — plateau-width knob. A = a/2 at λ·D = W (half-amplification distance). Larger λ narrows the plateau; smaller λ widens it. Curve Lab uses the production range [0.001, 1.0] (Constants.LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18). Slider mapping is cubic with fine resolution near the lower bound."
                     >&lambda;</label
                   >
                   <input
@@ -1681,20 +1681,20 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
 
       const NUM_SAMPLES = 80;
 
-      // ─── Research-band bounds — the SINGLE source in this file ────
-      // The PRODUCTION envelope for the Equilibra knobs is enforced
-      // on-chain by contracts/libraries/Constants.sol:
+      // ─── Production bounds — the SINGLE source in this file ───────
+      // Mirrors contracts/libraries/Constants.sol:
       //   A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16   (display 0.1 .. 0.99)
       //   LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18 (0.001 .. 1.0)
-      // The Curve Lab deliberately exposes this WIDER research band
-      // for calibration; out-of-envelope values are rejected by the
-      // factory at deploy time. These constants are pushed into the
-      // DOM min/max attributes at init (applyResearchBandBoundsToDom)
-      // — do not repeat the literals anywhere else in this file.
-      const PW_ALPHA_MIN = 0.01;
-      const PW_ALPHA_MAX = 0.99;
-      const PW_LAMBDA_MIN = 0.0001;
-      const PW_LAMBDA_MAX = 10;
+      // These constants are pushed into the DOM min/max attributes at init.
+      const PW_WAD = 1000000000000000000n;
+      const PW_ALPHA_MIN_WAD = 100000000000000000n;
+      const PW_ALPHA_MAX_WAD = 990000000000000000n;
+      const PW_LAMBDA_MIN_WAD = 1000000000000000n;
+      const PW_LAMBDA_MAX_WAD = 1000000000000000000n;
+      const PW_ALPHA_MIN = Number(PW_ALPHA_MIN_WAD) / Number(PW_WAD);
+      const PW_ALPHA_MAX = Number(PW_ALPHA_MAX_WAD) / Number(PW_WAD);
+      const PW_LAMBDA_MIN = Number(PW_LAMBDA_MIN_WAD) / Number(PW_WAD);
+      const PW_LAMBDA_MAX = Number(PW_LAMBDA_MAX_WAD) / Number(PW_WAD);
       // YieldBasis reference-AMM kernel bounds (mirrors
       // simulator/src/runtime_quoter/curve.rs). Applied to the A / γ
       // number inputs' min/max at init; out-of-range submissions are
@@ -1982,12 +1982,30 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       // user's full typed precision); the slider is a positioner only.
       // `pw{Alpha,Lambda}DisplayValue()` falls back to the cubic
       // mapping of the slider position if the fine field is empty.
+      function pwDisplayValueToWad(value, min, max, minWad, maxWad) {
+        if (value <= min) return minWad;
+        if (value >= max) return maxWad;
+        return decimalStringToWad(value.toFixed(18));
+      }
+
       function getPwLegacySolidityParams() {
         const aDisplay = pwAlphaDisplayValue();
         const lambdaDisplay = pwLambdaDisplayValue();
         return {
-          aWad: decimalStringToWad(aDisplay.toFixed(18)),
-          lambdaWad: decimalStringToWad(lambdaDisplay.toFixed(18)),
+          aWad: pwDisplayValueToWad(
+            aDisplay,
+            PW_ALPHA_MIN,
+            PW_ALPHA_MAX,
+            PW_ALPHA_MIN_WAD,
+            PW_ALPHA_MAX_WAD,
+          ),
+          lambdaWad: pwDisplayValueToWad(
+            lambdaDisplay,
+            PW_LAMBDA_MIN,
+            PW_LAMBDA_MAX,
+            PW_LAMBDA_MIN_WAD,
+            PW_LAMBDA_MAX_WAD,
+          ),
         };
       }
 
@@ -2524,8 +2542,8 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       //  cube root mapping whenever the fine value changes externally
       //  (preset load, snapshot restore, manual typing).
       // ─────────────────────────────────────────────────────────────────
-      // (Band bounds PW_ALPHA_MIN/MAX + PW_LAMBDA_MIN/MAX live in the
-      //  single-source research-band block at the top of this script.)
+      // (Bounds PW_ALPHA_MIN/MAX + PW_LAMBDA_MIN/MAX live in the
+      //  single-source production block at the top of this script.)
       const PW_NONLINEAR_K = 3; // cubic ramp
 
       function _pwClamp(value, lo, hi) {
@@ -5056,11 +5074,11 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       //  Init
       // ═══════════════════════════════════════════════════════════════
 
-      // Push the single-source research-band / kernel bounds (declared
+      // Push the single-source production / kernel bounds (declared
       // once at the top of this script) into the DOM min/max attributes.
       // The HTML carries no bound literals of its own, so the constants
       // cannot drift apart from what the inputs enforce.
-      function applyResearchBandBoundsToDom() {
+      function applyProductionBoundsToDom() {
         const setBounds = (id, min, max) => {
           const el = document.getElementById(id);
           if (!el) return;
@@ -5089,7 +5107,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
           return;
         }
 
-        applyResearchBandBoundsToDom();
+        applyProductionBoundsToDom();
         initCharts();
         relocateControlsSection();
         applyPriceCoverageCollapsed();

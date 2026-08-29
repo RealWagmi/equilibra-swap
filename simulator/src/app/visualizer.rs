@@ -386,6 +386,64 @@ fn equilibra_viz_quote_exact_in(
         .map_err(|_| anyhow!("amountOut exceeds u128"))
 }
 
+/// Analytic marginal rate at a requested token1 depletion. The chart's x-axis
+/// already fixes that exact output, so solve the corresponding math-space
+/// state directly instead of inverting approximate exact-input quotes. Keeping
+/// the result in math-space also avoids irrelevant raw-token rounding; the
+/// price-scale/decimal conversion cancels in `base_rate / rate`.
+fn equilibra_viz_marginal_at_depletion(
+    config: &EquilibraVizConfig,
+    state: &EquilibraVizState,
+    d_bps: u64,
+) -> Result<u128> {
+    if d_bps as u128 >= BPS {
+        return Err(anyhow!("equilibra visualizer depletion must be < BPS"));
+    }
+    let price_scale = U256::from(state.price_scale_wad);
+    let x_wad = U256::from(state.reserve1) * config.token1_scale;
+    let y_wad = U256::from(state.reserve0) * config.token0_scale;
+    if x_wad.is_zero() || y_wad.is_zero() || price_scale.is_zero() {
+        return Ok(0);
+    }
+    let (x_math, y_math) = equilibra_math::to_math_space(x_wad, y_wad, price_scale)?;
+    if x_math.is_zero() || y_math.is_zero() {
+        return Ok(0);
+    }
+    let target_out_raw = state
+        .reserve1
+        .saturating_mul(BPS.saturating_sub(d_bps as u128))
+        / BPS;
+    let amount_out_raw = state.reserve1 - target_out_raw;
+    let amount_out_math = U256::from(amount_out_raw) * config.token1_scale;
+    let (input_post, output_post) = if amount_out_math.is_zero() {
+        (y_math, x_math)
+    } else {
+        if amount_out_math >= x_math {
+            return Ok(0);
+        }
+        let (amount_in_math, _) = equilibra_math::quote_exact_out_forward(
+            y_math,
+            x_math,
+            amount_out_math,
+            config.a_wad,
+            config.lambda_wad,
+        )?;
+        if amount_in_math.is_zero() {
+            return Ok(0);
+        }
+        (y_math + amount_in_math, x_math - amount_out_math)
+    };
+    let marginal_math = equilibra_math::marginal_price_from_state(
+        input_post,
+        output_post,
+        config.a_wad,
+        config.lambda_wad,
+    )?;
+    marginal_math
+        .try_into()
+        .map_err(|_| anyhow!("marginal rate exceeds u128"))
+}
+
 fn pow10_u128(exp: u32) -> Result<u128> {
     let mut out = 1u128;
     for _ in 0..exp {
@@ -473,6 +531,25 @@ fn scaled_rate_from_quote(
         probe = (probe.saturating_mul(10)).min(probe_max);
     }
     Ok(0)
+}
+
+fn marginal_rate_for_sampling(
+    quoter: &mut LocalQuoter,
+    amm_state: &VisualizerAmmState,
+    token_in: &str,
+    probe_in: u128,
+) -> Result<u128> {
+    match amm_state {
+        VisualizerAmmState::Equilibra { config, state }
+            if token_in.eq_ignore_ascii_case(&config.token0_lower) =>
+        {
+            equilibra_viz_marginal_at_depletion(config, state, 0)
+        }
+        VisualizerAmmState::Equilibra { .. } => {
+            Err(anyhow!("equilibra sampler expects token0 input"))
+        }
+        _ => scaled_rate_from_quote(quoter, amm_state, token_in, probe_in),
+    }
 }
 
 fn quote_exact_input_for_amm(
@@ -927,9 +1004,10 @@ fn build_coverage(
     }
 }
 
-/// Sample a single `d_bps` point on the slippage curve. Mirrors the per-point
-/// loop body of the historical uniform sampler so it can be reused both for
-/// the initial uniform pass and for adaptive subdivision.
+/// Sample a single `d_bps` point on the slippage curve. Equilibra solves the
+/// already-known output target directly and reads its analytic marginal
+/// price; the secondary AMMs retain the generic exact-input inversion path.
+/// The helper is reused by both the initial pass and adaptive subdivision.
 fn sample_penalty_at_d_bps(
     quoter: &mut LocalQuoter,
     quote_state: &VisualizerAmmState,
@@ -940,6 +1018,24 @@ fn sample_penalty_at_d_bps(
     d_bps: u64,
 ) -> SeriesPoint {
     let token_in = TOKEN0;
+    if let VisualizerAmmState::Equilibra { config, state } = quote_state {
+        let rate = equilibra_viz_marginal_at_depletion(config, state, d_bps).unwrap_or(0);
+        let penalty = if rate > 0 {
+            (base_rate.saturating_mul(PENALTY_SCALE) / rate) as f64 / PENALTY_SCALE as f64 - 1.0
+        } else {
+            f64::INFINITY
+        };
+        return SeriesPoint {
+            d_bps,
+            penalty: if penalty.is_finite() {
+                penalty.max(0.0)
+            } else {
+                f64::INFINITY
+            },
+            liquidity: 0.0,
+        };
+    }
+
     let mut sim_state = quote_state.clone();
     let target_out = base_reserve_out.saturating_mul(BPS.saturating_sub(d_bps as u128)) / BPS;
     if base_reserve_out > target_out {
@@ -968,11 +1064,7 @@ fn sample_penalty_at_d_bps(
                 liquidity: 0.0,
             };
         }
-        // `settle_swap` (vs raw `update_after_swap`) deliberately skips
-        // recomputing Curve's `D` so the liquidity invariant persists
-        // across swaps. Without this, round-trip quotes can yield
-        // positive PnL, masking real slippage and producing
-        // artefactual penalty curves.
+        // `settle_swap` deliberately leaves Curve's cached D unchanged.
         if sim_state
             .settle_swap(true, solved.amount_in, solved.amount_out)
             .is_err()
@@ -1019,12 +1111,10 @@ fn sample_uniform_at_grid(
     let base_reserve_in = quote_state.reserve0();
     let base_reserve_out = quote_state.reserve1();
     let probe_in = (base_reserve_in / 1_000_000).max(1);
-    // Base rate comes from a tiny probe swap on the baseline (fee-free) state.
-    // If the kernel rejects this probe (extreme slider values pushing the
-    // state distance `(y - x)²/(xy)` into a 512→256 overflow), we return
-    // an all-unreachable series rather than a 400 — keeps the visualizer
-    // responsive while the user tweaks parameters.
-    let base_rate = match scaled_rate_from_quote(quoter, baseline_state, token_in, probe_in) {
+    // Equilibra uses its analytic derivative; secondary AMMs retain a tiny
+    // fee-free quote probe. A failed baseline produces an all-unreachable
+    // series rather than a 400 while the user tweaks parameters.
+    let base_rate = match marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in) {
         Ok(v) => v,
         Err(_) => 0,
     };
@@ -1078,7 +1168,7 @@ fn adaptive_refine_points(
     let base_reserve_in = quote_state.reserve0();
     let base_reserve_out = quote_state.reserve1();
     let probe_in = (base_reserve_in / 1_000_000).max(1);
-    let base_rate = match scaled_rate_from_quote(quoter, baseline_state, token_in, probe_in) {
+    let base_rate = match marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in) {
         Ok(v) => v,
         Err(_) => return Ok(points),
     };
@@ -1696,6 +1786,124 @@ mod tests {
             d_bps,
             penalty,
             liquidity: 0.0,
+        }
+    }
+
+    fn equilibra_corner_state() -> (VisualizerAmmState, u128, u128) {
+        let reserve0 = 500_000u128 * 1_000_000_000_000_000_000u128;
+        let reserve1 = 500_000u128 * 1_000_000u128;
+        let config = EquilibraVizConfig {
+            token0_lower: TOKEN0.to_string(),
+            token1_lower: TOKEN1.to_string(),
+            token0_decimals: 18,
+            token1_decimals: 6,
+            token0_scale: U256::one(),
+            token1_scale: U256::from(1_000_000_000_000u128),
+            a_wad: U256::from(989_999_999_999_999_991u128),
+            lambda_wad: U256::from(1_290_000_000_000_000u128),
+        };
+        (
+            VisualizerAmmState::Equilibra {
+                config,
+                state: EquilibraVizState {
+                    reserve0,
+                    reserve1,
+                    price_scale_wad: equilibra_math::WAD,
+                },
+            },
+            reserve0,
+            reserve1,
+        )
+    }
+
+    /// Regression for the production corner that used to show a staircase:
+    /// the generic outer exact-in inversion sampled a distant MAX_ITER branch
+    /// around d=0.85, then `enforce_monotonic_penalty` hid the following drop
+    /// as a plateau. The Equilibra-specific exact-out sampler must be monotone
+    /// before any presentation post-processing touches the values.
+    #[test]
+    fn equilibra_corner_sampler_is_monotone_before_postprocessing() {
+        let (state, reserve0, reserve1) = equilibra_corner_state();
+        let mut quoter = LocalQuoter::new();
+        let probe = reserve0 / 1_000_000;
+        let base_rate = marginal_rate_for_sampling(&mut quoter, &state, TOKEN0, probe).unwrap();
+        let d_values = [
+            8_495u64, 8_501, 8_557, 8_564, 8_570, 8_705, 8_712, 8_804, 8_811, 8_935, 9_151, 9_182,
+        ];
+        let points: Vec<SeriesPoint> = d_values
+            .iter()
+            .map(|d| {
+                sample_penalty_at_d_bps(
+                    &mut quoter,
+                    &state,
+                    base_rate,
+                    reserve0,
+                    reserve1,
+                    probe,
+                    *d,
+                )
+            })
+            .collect();
+
+        for pair in points.windows(2) {
+            assert!(pair[0].penalty.is_finite());
+            assert!(pair[1].penalty.is_finite());
+            assert!(
+                pair[1].penalty + 1e-9 >= pair[0].penalty,
+                "raw penalty fell from d={} ({}) to d={} ({})",
+                pair[0].d_bps,
+                pair[0].penalty,
+                pair[1].d_bps,
+                pair[1].penalty,
+            );
+        }
+        assert!(
+            points[1].penalty < 0.27,
+            "d=0.8501 landed on the distant branch"
+        );
+        assert!(
+            points[6].penalty < 0.37,
+            "d=0.8712 landed on the distant branch"
+        );
+
+        let raw_penalties: Vec<f64> = points.iter().map(|p| p.penalty).collect();
+        let mut displayed = points;
+        enforce_monotonic_penalty(&mut displayed);
+        for (raw, post) in raw_penalties.iter().zip(displayed.iter()) {
+            assert_eq!(*raw, post.penalty, "post-processing changed a raw sample");
+        }
+    }
+
+    /// The same requested depletion must have the same penalty regardless of
+    /// neighbouring samples. Before the exact-output sampler, the running-max
+    /// post-processing inherited different false peaks from the 80- and
+    /// 400-point grids around d≈0.86/0.89.
+    #[test]
+    fn equilibra_corner_penalty_is_sample_density_independent() {
+        const MAX_D_BPS: u64 = 9_600;
+        let (state, _, _) = equilibra_corner_state();
+        let grid = |samples: u64| -> Vec<u64> {
+            (0..=samples)
+                .map(|i| (MAX_D_BPS * i + samples / 2) / samples)
+                .collect()
+        };
+
+        let coarse_grid = grid(80);
+        let dense_grid = grid(400);
+        let mut quoter = LocalQuoter::new();
+        let coarse =
+            build_series_for_amm(&mut quoter, &state, &state, coarse_grid.as_slice()).unwrap();
+        let dense =
+            build_series_for_amm(&mut quoter, &state, &state, dense_grid.as_slice()).unwrap();
+
+        for d_bps in coarse_grid {
+            let a = coarse.iter().find(|p| p.d_bps == d_bps).unwrap();
+            let b = dense.iter().find(|p| p.d_bps == d_bps).unwrap();
+            assert_eq!(
+                a.penalty.to_bits(),
+                b.penalty.to_bits(),
+                "penalty depends on sample density at d={d_bps}"
+            );
         }
     }
 
