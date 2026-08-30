@@ -711,7 +711,129 @@
     }
   }
 
+  // ── Equilibra parameter explainers ─────────────────────────────
+  // One "i" badge per Equilibra field (both preset columns share a key).
+  // A single fixed-position panel serves all badges: it lives on
+  // document.body so renderSetup() re-renders cannot orphan it, and it is
+  // closed on re-render, outside click, Escape, scroll and resize.
+  // Content mirrors the factory bounds and the CLAUDE.md parameter table —
+  // when a bound changes there, update the matching entry here.
+  const EQ_PARAM_INFO = {
+    baseTokenPosition: {
+      t: "Base token slot",
+      b: "Which pair slot holds the base token. <code>token0</code> matches the mainnet address sort (WETH and WBTC sort before USDT); <code>token1</code> keeps the quote in slot 0. Equilibra only — the Curve baseline always models its quote as token0. Flipping it mirrors the internal token1 direction, so the two repeg dead-bands swap roles (see their notes).",
+    },
+    aWad: {
+      t: "a — depth at anchor (WAD)",
+      b: "At the anchor the amplification equals <code>a</code>: larger values deepen the central plateau, concentrating depth near the anchor price. Range <code>[1e17, 99e16]</code> (0.1–0.99 of WAD). Fully decoupled from λ — moving <code>a</code> never shifts the cliff position. <code>a = 1e18</code> is forbidden: the depth solve degenerates at pure constant-sum.",
+    },
+    lambdaWad: {
+      t: "λ — plateau width (WAD)",
+      b: "At <code>λ·D = WAD</code> the amplification halves. Larger λ narrows the plateau (earlier hand-off to the constant-product tail); smaller widens it. Range <code>[1e15, 1e18]</code>. Subtlety: with <code>a</code> near its ceiling, the bottom decade of λ makes the swap solver miss on trades larger than the output-side reserve — check the solver lamp in Curve Lab for the live safe price range, and prefer <code>λ ≥ 1e16</code> at high <code>a</code>.",
+    },
+    feeBps: {
+      t: "Fee ceiling (bps)",
+      b: "Ceiling of the dynamic swap fee, in bps of the input. Range <code>[5, 2000]</code>. With the ramp off this is simply the flat fee; with a live ramp the per-swap fee climbs from the floor toward this value as the post-swap state distance grows.",
+    },
+    feeRampBps: {
+      t: "Fee ramp width (bps)",
+      b: "Smoothstep warm-up width, in bps of one full state-distance unit. <code>0</code> disables the ramp — every swap pays the flat ceiling. Counter-intuitive: <code>10000</code> is the WIDEST ramp, so most swaps pay near the floor; to bias fees high pick a SMALL ramp (≤ 100). A live ramp must clear the monotonicity guard <code>ramp·(10000−ceiling)² ≥ 12·10000·(ceiling−floor)²</code>, and floor == ceiling with a live ramp is rejected outright.",
+    },
+    feeFloorBps: {
+      t: "Fee floor (bps)",
+      b: "Lower bound of the dynamic fee; tiny mean-reverting flow near the anchor pays this. Range <code>[0, ceiling]</code>; equality with the ceiling is allowed only when the ramp is off. With auto-repeg live the floor also sets the stall-guard scale: each repeg dead-band must stay ≤ <code>floor·1e14</code> (flat ceiling when the ramp is off), so a floor of 0 with a live ramp is undeployable while auto-repeg is on.",
+    },
+    repegShareBps: {
+      t: "Repeg budget share (bps)",
+      b: "Share of accumulated LP unit-value growth the auto-repeg gate may spend on anchor moves. <code>0</code> disables auto-repeg entirely; <code>5000</code> is the conservative 50/50 reference. Bounded by <code>share + protocolFee·100 ≤ 10000</code>. Calibration from the benchmark runs: ~7000 without a donation stream, ~5000–5500 alongside a 3–4 %/yr stream.",
+    },
+    emaPeriod: {
+      t: "EMA period (s)",
+      b: "Half-life of the geometric price EMA the anchor follows, in seconds. Range <code>[60, 419731]</code> (≈ 4.86 days). Longer periods are harder to manipulate through the oracle but track repricings more slowly. Immutable after pool creation on chain — treat it as a launch decision, not a tuning knob.",
+    },
+    donationAprBps: {
+      t: "Donation stream (bps of TVL per year; 0 = off)",
+      b: "Exogenous donation stream: at every tick the donor makes a proportional deposit and parks the minted LP shares on the pool itself. That parked buffer funds the donation parachute — the mechanism that keeps the anchor tracking after the fee-growth budget is exhausted. <code>0</code> disables the stream.",
+    },
+    donationIntervalSec: {
+      t: "Donation interval (s)",
+      b: "Seconds between donation ticks; the first tick lands at t = 0 and each tranche funds exactly the elapsed gap. Capped at one year. With the APR at 0 the interval is canonicalized to 0 — the pair is validated together.",
+    },
+    repegStepWad: {
+      t: "Repeg step cap (WAD)",
+      b: "Per-repeg cap on the log-domain anchor step, committed as <code>priceScale·exp(±applied)</code> with <code>applied = min(cap, deviation/5)</code> — at most once per block and never more than once per second. Bounds the anchor's slew rate and therefore its manipulability through the EMA. Sizing note: a cap far below expected daily move ÷ swaps per day leaves the anchor bandwidth-limited in fast repricings.",
+    },
+    repegThresholdUp: {
+      t: "Dead-band, token1 up (WAD)",
+      b: "Auto-repeg activation dead-band while <code>ema &gt; priceScale</code> — token1 priced ABOVE the anchor. Geometric deviation, so ±2× reads 1.0 either way. Layout subtlety: with the base in slot 0 a RISING base market is an internal token1-DOWN move, so bull-market catch-up is tuned by the Down knob; this one damps drawdown tracking. Stall guard: with auto-repeg live each band must stay ≤ <code>feeScale·1e14</code> or the first permitted move is already unaffordable and the anchor stalls.",
+    },
+    repegThresholdDown: {
+      t: "Dead-band, token1 down (WAD)",
+      b: "Same dead-band for <code>ema &lt; priceScale</code> — with the base in slot 0 this is the base asset RISING. Setting Down &lt; Up chases base rallies more eagerly than drawdowns (momentum asymmetry; the bundled presets ship 2.5e15 / 1.5e15). Pegged pools prefer tiny symmetric bands (1e14) instead — the split is a volatile-pair tool. Same stall-guard rule as the Up band.",
+    },
+    protocolFeePercent: {
+      t: "Protocol fee (%)",
+      b: "Protocol slice of every swap fee, in PERCENT — not bps. Range <code>[0, 25]</code>. Funded from the LPs' residual, not from the repeg budget: two pools differing only in this value fire repegs after the same total volume.",
+    },
+  };
+
+  function eqInfo(key) {
+    return `<button type="button" class="eq-info-btn" data-eq-info="${key}" aria-expanded="false" aria-label="About this parameter">i</button>`;
+  }
+
+  let eqInfoPopEl = null;
+  function ensureEqInfoPop() {
+    if (!eqInfoPopEl) {
+      eqInfoPopEl = document.createElement("div");
+      eqInfoPopEl.className = "eq-info-pop";
+      eqInfoPopEl.hidden = true;
+      document.body.appendChild(eqInfoPopEl);
+    }
+    return eqInfoPopEl;
+  }
+  function closeEqInfo() {
+    if (eqInfoPopEl) eqInfoPopEl.hidden = true;
+    document
+      .querySelectorAll('.eq-info-btn[aria-expanded="true"]')
+      .forEach((b) => b.setAttribute("aria-expanded", "false"));
+  }
+  function openEqInfo(btn, key) {
+    const info = EQ_PARAM_INFO[key];
+    if (!info) return;
+    const pop = ensureEqInfoPop();
+    pop.innerHTML = `<h4></h4><p></p>`;
+    pop.querySelector("h4").textContent = info.t;
+    pop.querySelector("p").innerHTML = info.b;
+    pop.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    const r = btn.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    pop.style.left = `${Math.max(12, Math.min(r.right - w, window.innerWidth - w - 12))}px`;
+    let top = r.bottom + 8;
+    const h = pop.offsetHeight;
+    if (top + h > window.innerHeight - 12) top = Math.max(12, r.top - h - 8);
+    pop.style.top = `${top}px`;
+  }
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest?.(".eq-info-btn");
+    if (btn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const wasOpen = btn.getAttribute("aria-expanded") === "true";
+      closeEqInfo();
+      if (!wasOpen) openEqInfo(btn, btn.dataset.eqInfo);
+      return;
+    }
+    if (eqInfoPopEl && !eqInfoPopEl.hidden && !eqInfoPopEl.contains(e.target)) closeEqInfo();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeEqInfo();
+  });
+  window.addEventListener("resize", closeEqInfo);
+  window.addEventListener("scroll", closeEqInfo, true);
+
   function renderSetup() {
+    closeEqInfo();
     const c = state.config;
     const d = state.defaults;
     const v = (p, f = "") => {
@@ -834,7 +956,7 @@
                 </div>
                 <div class="fields-stack">
                   <div class="field">
-                    <label title="Slot of the base token in this pair. token0 matches mainnet address sort (base before USDT). Equilibra only — the Curve baseline keeps its quote in slot 0.">base token slot</label>
+                    <label>base token slot ${eqInfo("baseTokenPosition")}</label>
                     <select ${eqDisabled} data-path="amms.equilibra.presets.WETH.baseTokenPosition" data-type="string">
                       <option value="token0" ${v("amms.equilibra.presets.WETH.baseTokenPosition") === "token0" ? "selected" : ""}>token0</option>
                       <option value="token1" ${v("amms.equilibra.presets.WETH.baseTokenPosition") === "token1" ? "selected" : ""}>token1</option>
@@ -842,41 +964,41 @@
                   </div>
                   <div class="alpha-beta-import-grid">
                     <div class="field">
-                      <label title="Depth-at-anchor knob (WAD). Range [1e17, 99e16].">a (WAD)</label>
+                      <label>a (WAD) ${eqInfo("aWad")}</label>
                       <input ${eqDisabled} data-path="amms.equilibra.presets.WETH.aWad" data-type="string" value="${esc(v("amms.equilibra.presets.WETH.aWad"))}"/>
                     </div>
                     <div class="field">
-                      <label title="Plateau-width knob (WAD). Range [1e15, 1e18].">λ (WAD)</label>
+                      <label>λ (WAD) ${eqInfo("lambdaWad")}</label>
                       <input ${eqDisabled} data-path="amms.equilibra.presets.WETH.lambdaWad" data-type="string" value="${esc(v("amms.equilibra.presets.WETH.lambdaWad"))}"/>
                     </div>
                     <button ${eqDisabled} class="import-btn" type="button" id="eqImportApplyWETH">Import from Curve Lab</button>
                   </div>
                   <div class="field-row">
-                  <div class="field"><label>fee bps (ceiling) : ${pctSpan("amms.equilibra.presets.WETH.feeBps", "bps", v("amms.equilibra.presets.WETH.feeBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeBps" data-type="int" type="number" ${limAttr("baseFee")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeBps"))}"/></div>
-                  <div class="field"><label>fee ramp bps (0 = off) : ${pctSpan("amms.equilibra.presets.WETH.feeRampBps", "bps", v("amms.equilibra.presets.WETH.feeRampBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeRampBps" data-type="int" type="number" ${limAttr("feeRampBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeRampBps"))}"/></div>
-                  <div class="field"><label>fee floor bps : ${pctSpan("amms.equilibra.presets.WETH.feeFloorBps", "bps", v("amms.equilibra.presets.WETH.feeFloorBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeFloorBps" data-type="int" type="number" ${limAttr("feeFloorBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeFloorBps"))}"/></div>
+                  <div class="field"><label>fee bps (ceiling) : ${pctSpan("amms.equilibra.presets.WETH.feeBps", "bps", v("amms.equilibra.presets.WETH.feeBps"))} % ${eqInfo("feeBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeBps" data-type="int" type="number" ${limAttr("baseFee")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeBps"))}"/></div>
+                  <div class="field"><label>fee ramp bps (0 = off) : ${pctSpan("amms.equilibra.presets.WETH.feeRampBps", "bps", v("amms.equilibra.presets.WETH.feeRampBps"))} % ${eqInfo("feeRampBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeRampBps" data-type="int" type="number" ${limAttr("feeRampBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeRampBps"))}"/></div>
+                  <div class="field"><label>fee floor bps : ${pctSpan("amms.equilibra.presets.WETH.feeFloorBps", "bps", v("amms.equilibra.presets.WETH.feeFloorBps"))} % ${eqInfo("feeFloorBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.feeFloorBps" data-type="int" type="number" ${limAttr("feeFloorBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.feeFloorBps"))}"/></div>
                   </div>
-                  <div class="field"><label>repeg share bps : ${pctSpan("amms.equilibra.presets.WETH.repegShareBps", "bps", v("amms.equilibra.presets.WETH.repegShareBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.repegShareBps" data-type="int" type="number" ${limAttr("repegShareBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.repegShareBps"))}"/></div>
-                  <div class="field"><label>EMA period</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.emaPeriod" data-type="int" type="number" ${limAttr("emaPeriod")} step="1" value="${esc(v("amms.equilibra.presets.WETH.emaPeriod"))}"/></div>
+                  <div class="field"><label>repeg share bps : ${pctSpan("amms.equilibra.presets.WETH.repegShareBps", "bps", v("amms.equilibra.presets.WETH.repegShareBps"))} % ${eqInfo("repegShareBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.repegShareBps" data-type="int" type="number" ${limAttr("repegShareBps")} step="1" value="${esc(v("amms.equilibra.presets.WETH.repegShareBps"))}"/></div>
+                  <div class="field"><label>EMA period ${eqInfo("emaPeriod")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.emaPeriod" data-type="int" type="number" ${limAttr("emaPeriod")} step="1" value="${esc(v("amms.equilibra.presets.WETH.emaPeriod"))}"/></div>
                   <div class="field-row">
-                  <div class="field"><label>donationAprBps : ${pctSpan("amms.equilibra.presets.WETH.donationAprBps", "bps", v("amms.equilibra.presets.WETH.donationAprBps"))} % of TVL/yr (0 = off)</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.donationAprBps" data-type="int" type="number" min="0" max="10000" step="1" value="${esc(v("amms.equilibra.presets.WETH.donationAprBps"))}"/></div>
-                  <div class="field"><label>donationIntervalSec</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.donationIntervalSec" data-type="int" type="number" min="0" max="31536000" step="1" value="${esc(v("amms.equilibra.presets.WETH.donationIntervalSec"))}"/></div>
+                  <div class="field"><label>donationAprBps : ${pctSpan("amms.equilibra.presets.WETH.donationAprBps", "bps", v("amms.equilibra.presets.WETH.donationAprBps"))} % ${eqInfo("donationAprBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.donationAprBps" data-type="int" type="number" min="0" max="10000" step="1" value="${esc(v("amms.equilibra.presets.WETH.donationAprBps"))}"/></div>
+                  <div class="field"><label>donationIntervalSec ${eqInfo("donationIntervalSec")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.donationIntervalSec" data-type="int" type="number" min="0" max="31536000" step="1" value="${esc(v("amms.equilibra.presets.WETH.donationIntervalSec"))}"/></div>
                   </div>
                   <div class="field-row">
                   <div class="field">
-                    <label>repeg step wad : ${pctSpan("amms.equilibra.presets.WETH.repegStepWad", "wad", v("amms.equilibra.presets.WETH.repegStepWad"))} %</label>
+                    <label>repeg step wad : ${pctSpan("amms.equilibra.presets.WETH.repegStepWad", "wad", v("amms.equilibra.presets.WETH.repegStepWad"))} % ${eqInfo("repegStepWad")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WETH.repegStepWad" data-type="string" value="${esc(v("amms.equilibra.presets.WETH.repegStepWad"))}"/>
                   </div>
                   <div class="field">
-                    <label title="Dead-band while ema > priceScale (token1 priced in token0 ABOVE the anchor). With base in slot 0, a rising base market is an internal token1-DOWN move — bull-market catch-up is the Down knob.">repeg threshold token1 up : ${pctSpan("amms.equilibra.presets.WETH.repegThresholdToken1UpWad", "wad", v("amms.equilibra.presets.WETH.repegThresholdToken1UpWad"))} %</label>
+                    <label>repeg threshold token1 up : ${pctSpan("amms.equilibra.presets.WETH.repegThresholdToken1UpWad", "wad", v("amms.equilibra.presets.WETH.repegThresholdToken1UpWad"))} % ${eqInfo("repegThresholdUp")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WETH.repegThresholdToken1UpWad" data-type="string" value="${esc(v("amms.equilibra.presets.WETH.repegThresholdToken1UpWad"))}"/>
                   </div>
                   <div class="field">
-                    <label title="Dead-band while ema < priceScale.">repeg threshold token1 down : ${pctSpan("amms.equilibra.presets.WETH.repegThresholdToken1DownWad", "wad", v("amms.equilibra.presets.WETH.repegThresholdToken1DownWad"))} %</label>
+                    <label>repeg threshold token1 down : ${pctSpan("amms.equilibra.presets.WETH.repegThresholdToken1DownWad", "wad", v("amms.equilibra.presets.WETH.repegThresholdToken1DownWad"))} % ${eqInfo("repegThresholdDown")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WETH.repegThresholdToken1DownWad" data-type="string" value="${esc(v("amms.equilibra.presets.WETH.repegThresholdToken1DownWad"))}"/>
                   </div>
                   </div>
-                  <div class="field"><label>protocol fee %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.protocolFeePercent" data-type="int" type="number" ${limAttr("protocolFeePercent")} step="1" value="${esc(v("amms.equilibra.presets.WETH.protocolFeePercent"))}"/></div>
+                  <div class="field"><label>protocol fee % ${eqInfo("protocolFeePercent")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WETH.protocolFeePercent" data-type="int" type="number" ${limAttr("protocolFeePercent")} step="1" value="${esc(v("amms.equilibra.presets.WETH.protocolFeePercent"))}"/></div>
                 </div>
               </div>
               <div class="token-preset-col">
@@ -885,7 +1007,7 @@
                 </div>
                 <div class="fields-stack">
                   <div class="field">
-                    <label title="Slot of the base token in this pair. token0 matches mainnet address sort (base before USDT). Equilibra only — the Curve baseline keeps its quote in slot 0.">base token slot</label>
+                    <label>base token slot ${eqInfo("baseTokenPosition")}</label>
                     <select ${eqDisabled} data-path="amms.equilibra.presets.WBTC.baseTokenPosition" data-type="string">
                       <option value="token0" ${v("amms.equilibra.presets.WBTC.baseTokenPosition") === "token0" ? "selected" : ""}>token0</option>
                       <option value="token1" ${v("amms.equilibra.presets.WBTC.baseTokenPosition") === "token1" ? "selected" : ""}>token1</option>
@@ -893,41 +1015,41 @@
                   </div>
                   <div class="alpha-beta-import-grid">
                     <div class="field">
-                      <label title="Depth-at-anchor knob (WAD). Range [1e17, 99e16].">a (WAD)</label>
+                      <label>a (WAD) ${eqInfo("aWad")}</label>
                       <input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.aWad" data-type="string" value="${esc(v("amms.equilibra.presets.WBTC.aWad"))}"/>
                     </div>
                     <div class="field">
-                      <label title="Plateau-width knob (WAD). Range [1e15, 1e18].">λ (WAD)</label>
+                      <label>λ (WAD) ${eqInfo("lambdaWad")}</label>
                       <input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.lambdaWad" data-type="string" value="${esc(v("amms.equilibra.presets.WBTC.lambdaWad"))}"/>
                     </div>
                     <button ${eqDisabled} class="import-btn" type="button" id="eqImportApplyWBTC">Import from Curve Lab</button>
                   </div>
                   <div class="field-row">
-                  <div class="field"><label>fee bps (ceiling) : ${pctSpan("amms.equilibra.presets.WBTC.feeBps", "bps", v("amms.equilibra.presets.WBTC.feeBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeBps" data-type="int" type="number" ${limAttr("baseFee")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeBps"))}"/></div>
-                  <div class="field"><label>fee ramp bps (0 = off) : ${pctSpan("amms.equilibra.presets.WBTC.feeRampBps", "bps", v("amms.equilibra.presets.WBTC.feeRampBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeRampBps" data-type="int" type="number" ${limAttr("feeRampBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeRampBps"))}"/></div>
-                  <div class="field"><label>fee floor bps : ${pctSpan("amms.equilibra.presets.WBTC.feeFloorBps", "bps", v("amms.equilibra.presets.WBTC.feeFloorBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeFloorBps" data-type="int" type="number" ${limAttr("feeFloorBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeFloorBps"))}"/></div>
+                  <div class="field"><label>fee bps (ceiling) : ${pctSpan("amms.equilibra.presets.WBTC.feeBps", "bps", v("amms.equilibra.presets.WBTC.feeBps"))} % ${eqInfo("feeBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeBps" data-type="int" type="number" ${limAttr("baseFee")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeBps"))}"/></div>
+                  <div class="field"><label>fee ramp bps (0 = off) : ${pctSpan("amms.equilibra.presets.WBTC.feeRampBps", "bps", v("amms.equilibra.presets.WBTC.feeRampBps"))} % ${eqInfo("feeRampBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeRampBps" data-type="int" type="number" ${limAttr("feeRampBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeRampBps"))}"/></div>
+                  <div class="field"><label>fee floor bps : ${pctSpan("amms.equilibra.presets.WBTC.feeFloorBps", "bps", v("amms.equilibra.presets.WBTC.feeFloorBps"))} % ${eqInfo("feeFloorBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.feeFloorBps" data-type="int" type="number" ${limAttr("feeFloorBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.feeFloorBps"))}"/></div>
                   </div>
-                  <div class="field"><label>repeg share bps : ${pctSpan("amms.equilibra.presets.WBTC.repegShareBps", "bps", v("amms.equilibra.presets.WBTC.repegShareBps"))} %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.repegShareBps" data-type="int" type="number" ${limAttr("repegShareBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.repegShareBps"))}"/></div>
-                  <div class="field"><label>EMA period</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.emaPeriod" data-type="int" type="number" ${limAttr("emaPeriod")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.emaPeriod"))}"/></div>
+                  <div class="field"><label>repeg share bps : ${pctSpan("amms.equilibra.presets.WBTC.repegShareBps", "bps", v("amms.equilibra.presets.WBTC.repegShareBps"))} % ${eqInfo("repegShareBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.repegShareBps" data-type="int" type="number" ${limAttr("repegShareBps")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.repegShareBps"))}"/></div>
+                  <div class="field"><label>EMA period ${eqInfo("emaPeriod")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.emaPeriod" data-type="int" type="number" ${limAttr("emaPeriod")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.emaPeriod"))}"/></div>
                   <div class="field-row">
-                  <div class="field"><label>donationAprBps : ${pctSpan("amms.equilibra.presets.WBTC.donationAprBps", "bps", v("amms.equilibra.presets.WBTC.donationAprBps"))} % of TVL/yr (0 = off)</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.donationAprBps" data-type="int" type="number" min="0" max="10000" step="1" value="${esc(v("amms.equilibra.presets.WBTC.donationAprBps"))}"/></div>
-                  <div class="field"><label>donationIntervalSec</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.donationIntervalSec" data-type="int" type="number" min="0" max="31536000" step="1" value="${esc(v("amms.equilibra.presets.WBTC.donationIntervalSec"))}"/></div>
+                  <div class="field"><label>donationAprBps : ${pctSpan("amms.equilibra.presets.WBTC.donationAprBps", "bps", v("amms.equilibra.presets.WBTC.donationAprBps"))} % ${eqInfo("donationAprBps")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.donationAprBps" data-type="int" type="number" min="0" max="10000" step="1" value="${esc(v("amms.equilibra.presets.WBTC.donationAprBps"))}"/></div>
+                  <div class="field"><label>donationIntervalSec ${eqInfo("donationIntervalSec")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.donationIntervalSec" data-type="int" type="number" min="0" max="31536000" step="1" value="${esc(v("amms.equilibra.presets.WBTC.donationIntervalSec"))}"/></div>
                   </div>
                   <div class="field-row">
                   <div class="field">
-                    <label>repeg step wad : ${pctSpan("amms.equilibra.presets.WBTC.repegStepWad", "wad", v("amms.equilibra.presets.WBTC.repegStepWad"))} %</label>
+                    <label>repeg step wad : ${pctSpan("amms.equilibra.presets.WBTC.repegStepWad", "wad", v("amms.equilibra.presets.WBTC.repegStepWad"))} % ${eqInfo("repegStepWad")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.repegStepWad" data-type="string" value="${esc(v("amms.equilibra.presets.WBTC.repegStepWad"))}"/>
                   </div>
                   <div class="field">
-                    <label title="Dead-band while ema > priceScale (token1 priced in token0 ABOVE the anchor). With base in slot 0, a rising base market is an internal token1-DOWN move — bull-market catch-up is the Down knob.">repeg threshold token1 up : ${pctSpan("amms.equilibra.presets.WBTC.repegThresholdToken1UpWad", "wad", v("amms.equilibra.presets.WBTC.repegThresholdToken1UpWad"))} %</label>
+                    <label>repeg threshold token1 up : ${pctSpan("amms.equilibra.presets.WBTC.repegThresholdToken1UpWad", "wad", v("amms.equilibra.presets.WBTC.repegThresholdToken1UpWad"))} % ${eqInfo("repegThresholdUp")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.repegThresholdToken1UpWad" data-type="string" value="${esc(v("amms.equilibra.presets.WBTC.repegThresholdToken1UpWad"))}"/>
                   </div>
                   <div class="field">
-                    <label title="Dead-band while ema < priceScale.">repeg threshold token1 down : ${pctSpan("amms.equilibra.presets.WBTC.repegThresholdToken1DownWad", "wad", v("amms.equilibra.presets.WBTC.repegThresholdToken1DownWad"))} %</label>
+                    <label>repeg threshold token1 down : ${pctSpan("amms.equilibra.presets.WBTC.repegThresholdToken1DownWad", "wad", v("amms.equilibra.presets.WBTC.repegThresholdToken1DownWad"))} % ${eqInfo("repegThresholdDown")}</label>
                     <input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.repegThresholdToken1DownWad" data-type="string" value="${esc(v("amms.equilibra.presets.WBTC.repegThresholdToken1DownWad"))}"/>
                   </div>
                   </div>
-                  <div class="field"><label>protocol fee %</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.protocolFeePercent" data-type="int" type="number" ${limAttr("protocolFeePercent")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.protocolFeePercent"))}"/></div>
+                  <div class="field"><label>protocol fee % ${eqInfo("protocolFeePercent")}</label><input ${eqDisabled} data-path="amms.equilibra.presets.WBTC.protocolFeePercent" data-type="int" type="number" ${limAttr("protocolFeePercent")} step="1" value="${esc(v("amms.equilibra.presets.WBTC.protocolFeePercent"))}"/></div>
                 </div>
               </div>
             </div>
