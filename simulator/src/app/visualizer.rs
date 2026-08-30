@@ -91,6 +91,58 @@ pub struct VisualizerSeriesResponse {
     pub slippage: VisualizerSlippageResponse,
     pub coverage: VisualizerCoverageResponse,
     pub isolated_swaps: VisualizerIsolatedSwapsResponse,
+    pub solver_health: VisualizerSolverHealthResponse,
+}
+
+/// Health of the kernel's secant solver for the requested `(a, λ)`.
+///
+/// `EquilibraSwapMath._solveCounterpart` seeds its secant with a
+/// constant-product proxy and gives up after a fixed iteration cap,
+/// returning the best iterate seen. On curves whose plateau is still wide
+/// far from the anchor the seed can sit an order of magnitude away from
+/// the root, and the returned iterate then misses it by a percent-scale
+/// margin — which shows up as exact-in output that DECREASES when the
+/// input grows. The miss is always in the pool's favour, so this is a
+/// quote-quality property, not a solvency one.
+///
+/// The probe re-solves the same settlements exactly (bisection on the
+/// depth `L`, which is monotone in the output reserve and constant along
+/// a `K = const` level set) and reports how far the shipped solver
+/// strays. Off-chain only: nothing here runs on chain.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualizerSolverHealthResponse {
+    /// `"ok"` — every probed quote sits within `SOLVER_HEALTH_OK_PCT` of
+    /// the exact settlement. `"warn"` — the solver strays measurably but
+    /// output still grows with input. `"bad"` — output regresses somewhere,
+    /// or the stray exceeds `SOLVER_HEALTH_BAD_PCT`; a larger trade can
+    /// then return less than a smaller one.
+    pub status: String,
+    /// Worst relative shortfall of quoted output vs the exact root, percent.
+    pub worst_error_pct: f64,
+    /// Input size at the worst point, as a multiple of the OUTPUT-side
+    /// reserve — the quantity the failure scales with (at the anchor the
+    /// two sides are equal, which is why anchor-only sweeps hide it).
+    pub worst_input_ratio: Option<f64>,
+    /// Pre-state imbalance `y / x` at the worst point.
+    pub worst_imbalance: Option<f64>,
+    /// Smallest probed input ratio that already quotes outside tolerance.
+    pub first_bad_input_ratio: Option<f64>,
+    /// Number of probed quotes and how many regressed against the previous
+    /// (smaller) input.
+    pub samples: u32,
+    pub monotonicity_breaks: u32,
+    /// How far one swap may move the price out of a balanced pool while
+    /// still settling exactly, as the post-swap price relative to the
+    /// anchor. Walked outward from the anchor — the state a pool with a
+    /// tracking auto-repeg actually sits at — and stopped at the first
+    /// mis-solved size. The kernel is symmetric in `(x, y)`, so the usable
+    /// corridor is `[safe_price_low, 1 / safe_price_low]`.
+    pub safe_price_low: Option<f64>,
+    /// Post-swap price of the first mis-solved size on that same walk —
+    /// where the boundary sits. `None` when the walk never fails, in which
+    /// case `safe_price_low` is simply the furthest price probed.
+    pub first_bad_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1539,6 +1591,190 @@ fn build_isolated_swaps(
     })
 }
 
+/// Math-space reserve the solver probe runs against. Large enough that
+/// integer quantization is not the dominant term, matching the depth a
+/// real pool carries.
+const SOLVER_HEALTH_SCALE: u128 = 1_000_000_000_000_000_000_000_000;
+
+/// Below this the solver is exact for practical purposes — converged
+/// configurations land many orders of magnitude under it (the shipped
+/// presets measure a flat zero).
+const SOLVER_HEALTH_OK_PCT: f64 = 0.01;
+
+/// At or above this the miss is large enough to matter to a taker on its
+/// own, independently of whether monotonicity survived.
+const SOLVER_HEALTH_BAD_PCT: f64 = 1.0;
+
+/// Pre-state imbalances probed, as `y = x · num / den`. The kernel is
+/// symmetric in `(x, y)`, so probing one side covers both.
+const SOLVER_HEALTH_IMBALANCES: [(u64, u64); 4] = [(1, 1), (1, 2), (1, 4), (1, 10)];
+
+/// Input sizes probed, in permille of the OUTPUT-side reserve.
+const SOLVER_HEALTH_RATIOS_PERMILLE: [u64; 10] =
+    [250, 500, 750, 900, 1_000, 1_100, 1_250, 1_500, 2_000, 3_000];
+
+/// Exact settlement for `dx` on the frozen pre-state depth `l_pre`.
+///
+/// `solve_l_from_state(xPost, ·)` is monotone in the output reserve and
+/// recovers `l_pre` exactly on the pre-state's own level set, so the
+/// smallest `y` whose recovered depth reaches `l_pre` IS the settlement
+/// the invariant prescribes. Bisection on that predicate cannot miss it,
+/// whatever the curve shape.
+fn exact_counterpart(
+    x_post: U256,
+    l_pre: U256,
+    y_hi: U256,
+    a_wad: U256,
+    lambda_wad: U256,
+) -> Result<U256> {
+    let mut lo = U256::one();
+    let mut hi = y_hi;
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        let l_mid = equilibra_math::solve_l_from_state(x_post, mid, a_wad, lambda_wad)?;
+        if l_mid < l_pre {
+            lo = mid + U256::one();
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Probe the shipped solver across imbalances and input sizes for one
+/// `(a, λ)` pair. See {VisualizerSolverHealthResponse}.
+pub fn check_solver_health(
+    a_wad: U256,
+    lambda_wad: U256,
+) -> Result<VisualizerSolverHealthResponse> {
+    let x = U256::from(SOLVER_HEALTH_SCALE);
+    let mut worst_error_pct = 0.0f64;
+    let mut worst_input_ratio: Option<f64> = None;
+    let mut worst_imbalance: Option<f64> = None;
+    let mut first_bad_input_ratio: Option<f64> = None;
+    let mut samples: u32 = 0;
+    let mut monotonicity_breaks: u32 = 0;
+
+    // Corridor walk: out of a balanced pool, growing the trade until the
+    // first mis-solved size. Finer than the imbalance ladder because the
+    // point of interest is exactly where it stops being exact.
+    let (safe_price_low, first_bad_price) = {
+        let l_pre = equilibra_math::solve_l_from_state(x, x, a_wad, lambda_wad)?;
+        let mut low: Option<f64> = None;
+        let mut bad: Option<f64> = None;
+        if !l_pre.is_zero() {
+            let mut permille = 500u64;
+            while permille <= 3_000 {
+                let dx = x * U256::from(permille) / U256::from(1_000u64);
+                let (quoted, _) =
+                    equilibra_math::quote_exact_in_forward(x, x, dx, a_wad, lambda_wad)?;
+                if quoted.is_zero() || quoted >= x {
+                    break;
+                }
+                let exact_y = exact_counterpart(x + dx, l_pre, x, a_wad, lambda_wad)?;
+                if exact_y >= x {
+                    break;
+                }
+                let exact_out = x - exact_y;
+                // Price of the state the curve prescribes — not the one a
+                // mis-solved quote would settle at, which reads higher purely
+                // because the output came up short.
+                let post_price =
+                    equilibra_math::marginal_price_from_state(x + dx, exact_y, a_wad, lambda_wad)
+                        .map(|p| p.as_u128() as f64 / 1e18f64)
+                        .unwrap_or(f64::NAN);
+                let failed = exact_out > quoted
+                    && ((exact_out - quoted) * U256::from(1_000_000u64) / exact_out).as_u128()
+                        as f64
+                        / 10_000.0f64
+                        > SOLVER_HEALTH_OK_PCT;
+                if failed {
+                    if post_price.is_finite() {
+                        bad = Some(post_price);
+                    }
+                    break;
+                }
+                if post_price.is_finite() {
+                    low = Some(post_price);
+                }
+                permille += 20;
+            }
+        }
+        (low, bad)
+    };
+
+    for (num, den) in SOLVER_HEALTH_IMBALANCES {
+        let y = x * U256::from(num) / U256::from(den);
+        let l_pre = equilibra_math::solve_l_from_state(x, y, a_wad, lambda_wad)?;
+        if l_pre.is_zero() {
+            continue;
+        }
+        let imbalance = num as f64 / den as f64;
+        let mut previous_out = U256::zero();
+
+        for permille in SOLVER_HEALTH_RATIOS_PERMILLE {
+            let dx = y * U256::from(permille) / U256::from(1_000u64);
+            if dx.is_zero() {
+                continue;
+            }
+            let (quoted, _) = equilibra_math::quote_exact_in_forward(x, y, dx, a_wad, lambda_wad)?;
+            // Zero is the kernel's documented unquotable-dust sentinel.
+            if quoted.is_zero() {
+                continue;
+            }
+            samples += 1;
+            if quoted < previous_out {
+                monotonicity_breaks += 1;
+            }
+            previous_out = quoted;
+
+            let exact_y = exact_counterpart(x + dx, l_pre, y, a_wad, lambda_wad)?;
+            if exact_y >= y {
+                continue;
+            }
+            let exact_out = y - exact_y;
+
+            if exact_out <= quoted {
+                continue;
+            }
+            let shortfall = exact_out - quoted;
+            // Percent, carried through f64 only after the ratio is taken so
+            // the U256 magnitudes never reach the mantissa.
+            let error_pct =
+                (shortfall * U256::from(1_000_000u64) / exact_out).as_u128() as f64 / 10_000.0f64;
+            let input_ratio = permille as f64 / 1_000.0f64;
+            if error_pct > SOLVER_HEALTH_OK_PCT && first_bad_input_ratio.is_none() {
+                first_bad_input_ratio = Some(input_ratio);
+            }
+            if error_pct > worst_error_pct {
+                worst_error_pct = error_pct;
+                worst_input_ratio = Some(input_ratio);
+                worst_imbalance = Some(imbalance);
+            }
+        }
+    }
+
+    let status = if monotonicity_breaks > 0 || worst_error_pct >= SOLVER_HEALTH_BAD_PCT {
+        "bad"
+    } else if worst_error_pct > SOLVER_HEALTH_OK_PCT {
+        "warn"
+    } else {
+        "ok"
+    };
+
+    Ok(VisualizerSolverHealthResponse {
+        status: status.to_string(),
+        worst_error_pct,
+        worst_input_ratio,
+        worst_imbalance,
+        first_bad_input_ratio,
+        samples,
+        monotonicity_breaks,
+        safe_price_low,
+        first_bad_price,
+    })
+}
+
 pub fn build_visualizer_series(raw_request: Value) -> Result<VisualizerSeriesResponse> {
     let req: VisualizerSeriesRequest = serde_json::from_value(raw_request)
         .map_err(|e| anyhow!("Invalid visualizer request: {e}"))?;
@@ -1758,9 +1994,12 @@ pub fn build_visualizer_series(raw_request: Value) -> Result<VisualizerSeriesRes
         initial_price,
     )?;
 
+    let solver_health = check_solver_health(U256::from(eq_a_wad), U256::from(eq_lambda_wad))?;
+
     Ok(VisualizerSeriesResponse {
         preset_key: req.preset_key,
         initial_price,
+        solver_health,
         slippage: VisualizerSlippageResponse {
             equilibra: points_to_serializable(eq_series.as_slice()),
             uniswap_v2: points_to_serializable(uni_series.as_slice()),
@@ -1993,5 +2232,95 @@ mod tests {
         assert_eq!(price_from_penalty_capped(100.0, p_inf, 2_000, 9_000), None);
         // Beyond the sampled depth: capped to None regardless of penalty.
         assert_eq!(price_from_penalty_capped(100.0, 1.0, 9_500, 9_000), None);
+    }
+
+    /// The shipped presets must read clean, the near-constant-sum corner
+    /// must not, and widening lambda must be enough to leave the region —
+    /// those three facts are what the Curve Lab lamp reports.
+    #[test]
+    fn solver_health_separates_the_deployable_corner() {
+        let preset = check_solver_health(
+            U256::from(909_610_000_000_000_030u128),
+            U256::from(16_780_000_000_000_000u128),
+        )
+        .expect("preset probe");
+        assert_eq!(preset.status, "ok", "shipped preset must read clean");
+        assert_eq!(preset.monotonicity_breaks, 0);
+        assert!(preset.samples > 0, "probe must actually quote something");
+
+        let cp_like = check_solver_health(
+            U256::from(100_000_000_000_000_000u128),
+            U256::from(1_000_000_000_000_000_000u128),
+        )
+        .expect("cp-like probe");
+        assert_eq!(cp_like.status, "ok", "CP-leaning curve must read clean");
+
+        let corner = check_solver_health(
+            U256::from(990_000_000_000_000_000u128),
+            U256::from(1_000_000_000_000_000u128),
+        )
+        .expect("corner probe");
+        assert_eq!(
+            corner.status, "bad",
+            "a at A_MAX with lambda at LAMBDA_MIN mis-solves large trades"
+        );
+        assert!(
+            corner.monotonicity_breaks > 0,
+            "the corner must show output regressing as input grows"
+        );
+        assert!(
+            corner.worst_error_pct > 1.0,
+            "corner shortfall should be percent-scale, got {}",
+            corner.worst_error_pct
+        );
+        // The failure scales with the OUTPUT-side reserve, so the first
+        // affected size sits at or just above 1.0x of it.
+        let first = corner
+            .first_bad_input_ratio
+            .expect("corner must report a first affected size");
+        assert!(
+            first >= 1.0,
+            "failure must start once the input reaches the output reserve, got {first}"
+        );
+
+        // Same depth-at-anchor, one decade wider plateau: out of the region.
+        let widened = check_solver_health(
+            U256::from(990_000_000_000_000_000u128),
+            U256::from(10_000_000_000_000_000u128),
+        )
+        .expect("widened probe");
+        assert_ne!(
+            widened.status, "bad",
+            "widening lambda by a decade must clear the hard failure"
+        );
+        assert_eq!(widened.monotonicity_breaks, 0);
+
+        // The corridor is the operator-facing form of the same boundary:
+        // walked out of a balanced pool, quotes stay exact until one swap
+        // pushes the price past it. A curve that fails must report both
+        // edges, ordered; a clean one reports how far it was probed with no
+        // boundary at all.
+        let safe = corner
+            .safe_price_low
+            .expect("a failing curve must report how far it stayed exact");
+        let boundary = corner
+            .first_bad_price
+            .expect("a failing curve must report where it stops being exact");
+        assert!(
+            boundary < safe,
+            "the first mis-solved price {boundary} must sit past the safe edge {safe}"
+        );
+        assert!(
+            safe > 0.0 && safe < 1.0,
+            "the corridor edge is a price below the anchor, got {safe}"
+        );
+        assert!(
+            preset.first_bad_price.is_none(),
+            "the shipped preset must not report a boundary"
+        );
+        assert!(
+            preset.safe_price_low.is_some_and(|p| p < 0.1),
+            "the preset probe must reach far past the anchor without failing"
+        );
     }
 }

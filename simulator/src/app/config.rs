@@ -482,6 +482,48 @@ pub fn build_default_config(oracle_start_ts: u64, oracle_end_ts: u64) -> Benchma
             donation_interval_sec: 2_592_000,
         },
     );
+    // Constant-product reference preset. Not inserted — kept here as the
+    // known-good starting point for a pool meant to behave like a plain
+    // `x·y = k` venue with a flat 0.30 % fee, since the two knobs reach
+    // that shape at the edges of their range rather than through a
+    // dedicated mode:
+    //
+    //     EquilibraPresetCfg {
+    //         base_token_position: BaseTokenPosition::Token0,
+    //         a_wad: string_u256(100_000_000_000_000_000),       // 0.1 · W = A_MIN_WAD
+    //         lambda_wad: string_u256(1_000_000_000_000_000_000), // 1.0 · W = LAMBDA_MAX_WAD
+    //         fee_bps: 30,                                       // flat 0.30 %
+    //         fee_floor_bps: 30,                                 // == fee_bps: no ramp headroom
+    //         fee_ramp_bps: 0,                                   // ramp off, so the equality is legal
+    //         ema_period: 600,
+    //         repeg_share_bps: 0,                                // auto-repeg off
+    //         repeg_step_wad: string_u256(1),
+    //         repeg_threshold_token1_up_wad: string_u256(1),
+    //         repeg_threshold_token1_down_wad: string_u256(1),
+    //         protocol_fee_percent: 0,
+    //         rebalance_enabled: false,
+    //         donation_apr_bps: 0,
+    //         donation_interval_sec: 0,
+    //     }
+    //
+    // Why these values: `a` at its floor with `λ` at its ceiling leaves the
+    // narrowest plateau the factory accepts, so the kernel spends nearly
+    // the whole range on its constant-product asymptote `K → W · x · y`.
+    // Measured against `x·y = k` from a balanced pool, output runs +0.05 %
+    // at a trade of 1 % of the reserve, +0.46 % at 10 % and +1.02 % at 50 %
+    // — marginally deeper than plain CP throughout, never shallower,
+    // because `a` bottoms out at `0.1 · W` rather than at zero. Relaxing
+    // `λ` to `1e17` widens that gap (+2.16 % at a full-reserve trade), so
+    // the ceiling is the right end of the range for this shape.
+    // With `repeg_share_bps = 0` the anchor never moves, which is what
+    // makes the shape stable — the step and both dead-bands are then inert
+    // and sit at their minimum legal value rather than at a meaningful one.
+    // `fee_floor_bps == fee_bps` is accepted only because the ramp is off;
+    // pairing it with `fee_ramp_bps != 0` is rejected at deploy time
+    // (`FeeRampNoHeadroom`). Every field is required — a partial preset is
+    // a parse error, not a merge with the defaults.
+    //
+    // Pinned by `constant_product_hint_preset_validates`.
     eq_presets.insert(
         "WBTC".to_string(),
         EquilibraPresetCfg {
@@ -1595,5 +1637,45 @@ mod tests {
             validate_run_config(&value2).is_err(),
             ">50 iterations invalid"
         );
+    }
+
+    /// The commented constant-product preset above the WBTC insert is a
+    /// deployable configuration, not an illustration: every value sits
+    /// inside the factory's bounds and the combination passes the same
+    /// validator a dashboard run goes through. Keeps the hint from rotting
+    /// if a bound moves.
+    #[test]
+    fn constant_product_hint_preset_validates() {
+        let mut value = default_config_value();
+        for base in ["WETH", "WBTC"] {
+            let preset = &mut value["amms"]["equilibra"]["presets"][base];
+            preset["aWad"] = serde_json::json!("100000000000000000");
+            preset["lambdaWad"] = serde_json::json!("1000000000000000000");
+            preset["feeBps"] = serde_json::json!(30);
+            preset["feeFloorBps"] = serde_json::json!(30);
+            preset["feeRampBps"] = serde_json::json!(0);
+            preset["emaPeriod"] = serde_json::json!(600);
+            preset["repegShareBps"] = serde_json::json!(0);
+            preset["repegStepWad"] = serde_json::json!("1");
+            preset["repegThresholdToken1UpWad"] = serde_json::json!("1");
+            preset["repegThresholdToken1DownWad"] = serde_json::json!("1");
+            preset["protocolFeePercent"] = serde_json::json!(0);
+            preset["rebalanceEnabled"] = serde_json::json!(false);
+            preset["donationAprBps"] = serde_json::json!(0);
+            preset["donationIntervalSec"] = serde_json::json!(0);
+        }
+        // The five legacy-shaped rebalance flags are one global policy and
+        // validation requires them to agree.
+        value["amms"]["uniswapV2"]["rebalanceEnabled"] = serde_json::json!(false);
+        value["amms"]["curve"]["presets"]["WETH"]["rebalanceEnabled"] = serde_json::json!(false);
+        value["amms"]["curve"]["presets"]["WBTC"]["rebalanceEnabled"] = serde_json::json!(false);
+
+        let cfg = validate_run_config(&value)
+            .expect("the documented constant-product preset must validate");
+        let weth = &cfg.amms.equilibra.presets["WETH"];
+        assert_eq!(weth.a_wad, "100000000000000000");
+        assert_eq!(weth.lambda_wad, "1000000000000000000");
+        assert_eq!(weth.fee_bps, 30);
+        assert_eq!(weth.repeg_share_bps, 0);
     }
 }

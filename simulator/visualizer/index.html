@@ -229,6 +229,152 @@
         gap: var(--spacing-sm) var(--spacing-md);
         min-width: 0;
       }
+      /* Solver-health lamp. The kernel's secant solver can miss the root
+         on curves whose plateau stays wide far from the anchor; the lamp
+         reports the backend probe for the live (a, lambda) pair. */
+      .solver-health {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 9px;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        background: var(--bg-tertiary);
+        font-size: 0.78rem;
+        font-family: monospace;
+        white-space: nowrap;
+        cursor: help;
+      }
+      .solver-health-lamp {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #6e7681;
+        box-shadow: 0 0 6px rgba(110, 118, 129, 0.7);
+        flex: none;
+      }
+      .solver-health-lines {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.25;
+      }
+      .solver-health-text {
+        color: var(--text-muted);
+      }
+      .solver-health-range {
+        color: var(--text-muted);
+        opacity: 0.75;
+        font-size: 0.72rem;
+      }
+      .solver-health-range:empty {
+        display: none;
+      }
+      .solver-info-live {
+        margin-bottom: 10px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--border-color);
+        color: var(--text-primary);
+      }
+      .solver-info-live:empty {
+        display: none;
+      }
+      .solver-info-live div {
+        margin: 2px 0;
+      }
+      .solver-info-live .solver-info-probe {
+        margin-top: 6px;
+        color: var(--text-muted);
+        font-size: 0.72rem;
+      }
+      .solver-info-btn {
+        width: 15px;
+        height: 15px;
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid var(--border-color);
+        border-radius: 50%;
+        background: transparent;
+        color: var(--text-muted);
+        font-family: serif;
+        font-style: italic;
+        font-size: 0.72rem;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .solver-info-btn:hover,
+      .solver-info-btn[aria-expanded="true"] {
+        color: var(--text-primary);
+        border-color: var(--text-muted);
+      }
+      .solver-info-pop {
+        position: fixed;
+        z-index: 200;
+        width: min(430px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        overflow-y: auto;
+        padding: 12px 14px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        background: var(--bg-secondary, #161b22);
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+        font-size: 0.78rem;
+        line-height: 1.5;
+        color: var(--text-primary);
+      }
+      .solver-info-pop[hidden] {
+        display: none;
+      }
+      .solver-info-pop h4 {
+        margin: 10px 0 4px;
+        font-size: 0.78rem;
+        color: #3fb950;
+      }
+      .solver-info-pop h4:first-child {
+        margin-top: 0;
+      }
+      .solver-info-pop p {
+        margin: 0;
+        color: var(--text-muted);
+      }
+      .solver-info-pop code {
+        font-family: monospace;
+        color: #f6c177;
+      }
+      .solver-info-pop strong {
+        color: var(--text-primary);
+      }
+      .solver-info-pop .solver-info-foot {
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border-color);
+        font-size: 0.72rem;
+      }
+      .solver-health[data-status="ok"] .solver-health-lamp {
+        background: #3fb950;
+        box-shadow: 0 0 6px rgba(63, 185, 80, 0.85);
+      }
+      .solver-health[data-status="ok"] .solver-health-text {
+        color: #3fb950;
+      }
+      .solver-health[data-status="warn"] .solver-health-lamp {
+        background: #f6c177;
+        box-shadow: 0 0 6px rgba(246, 193, 119, 0.85);
+      }
+      .solver-health[data-status="warn"] .solver-health-text {
+        color: #f6c177;
+      }
+      .solver-health[data-status="bad"] .solver-health-lamp {
+        background: #f85149;
+        box-shadow: 0 0 7px rgba(248, 81, 73, 0.9);
+      }
+      .solver-health[data-status="bad"] .solver-health-text {
+        color: #f85149;
+      }
+
       .controls-inline-main .amm-toggle-row {
         gap: 6px 10px;
       }
@@ -522,7 +668,9 @@
         margin-right: 8px;
         vertical-align: middle;
         cursor: pointer;
-        transition: border-color 0.15s, color 0.15s;
+        transition:
+          border-color 0.15s,
+          color 0.15s;
       }
       .card-toggle:hover {
         color: var(--text-primary);
@@ -666,7 +814,10 @@
         font-size: 14px;
         line-height: 1;
         color: var(--text-secondary);
-        transition: border-color 0.15s, color 0.15s, background 0.15s;
+        transition:
+          border-color 0.15s,
+          color 0.15s,
+          background 0.15s;
       }
       .zoom-trigger:hover {
         border-color: rgba(86, 212, 221, 0.7);
@@ -1077,6 +1228,97 @@
                 />
                 Uniswap x&middot;y=k</label
               >
+              <div
+                id="solverHealth"
+                class="solver-health"
+                data-status="unknown"
+              >
+                <span class="solver-health-lamp"></span>
+                <span class="solver-health-lines">
+                  <span class="solver-health-text" id="solverHealthText"
+                    >solver: &mdash;</span
+                  >
+                  <span
+                    class="solver-health-range"
+                    id="solverHealthRange"
+                  ></span>
+                </span>
+                <button
+                  type="button"
+                  class="solver-info-btn"
+                  id="solverInfoBtn"
+                  aria-label="What the solver lamp means"
+                  aria-expanded="false"
+                >
+                  i
+                </button>
+              </div>
+            </div>
+            <div class="solver-info-pop" id="solverInfoPop" hidden>
+              <div class="solver-info-live" id="solverInfoLive"></div>
+              <h4>What this lamp means</h4>
+              <p>
+                The kernel has no closed-form solution, so every swap solves its
+                invariant iteratively. On curves whose plateau stays wide far
+                from the anchor &mdash; <code>a</code> near its ceiling with
+                <code>&lambda;</code> near its floor &mdash; that solver can
+                miss the root once a trade is large enough, and then a bigger
+                trade can return <em>less</em> output than a smaller one. The
+                miss always favours the pool: takers are short-changed, LP funds
+                are never at risk.
+              </p>
+              <h4>How much room there is</h4>
+              <p>
+                The boundary is a price, not a trade size: quotes stay exact
+                while a single swap leaves the pool price inside a corridor
+                around the anchor. Even on the worst deployable curve (<code
+                  >a = 0.99</code
+                >, <code>&lambda; = 1e15</code>) that corridor spans roughly
+                &minus;57% to +134% in one swap; for the shipped presets no
+                boundary exists at all &mdash; a swap twenty times the pool's
+                size still quotes exactly. The live corridor for the curve you
+                have selected is shown at the top of this panel and on the badge
+                itself.
+              </p>
+              <h4>Why the anchor matters</h4>
+              <p>
+                That corridor is measured from the anchor, so what counts is how
+                far the pool sits from it when a trade arrives. With auto-repeg
+                tracking spot the pool stays at ~0 lag, and breaking a quote
+                then takes a single trade worth about
+                <strong>52% of the whole pool</strong>. Every percent of anchor
+                lag shrinks that: 18% of the pool at 5% lag, 8% at 50%. Repeg
+                runs between swaps, so it cannot shrink one oversized trade
+                &mdash; what it prevents is a standing offset that would leave
+                every later trade closer to the edge.
+              </p>
+              <h4>Reading the badge</h4>
+              <p>
+                <strong>Top line</strong> &mdash;
+                <code>worst &minus;X%</code> is how much <em>less</em> output
+                the taker would receive than the curve owes, at the single worst
+                size out of 40 probes (four pool imbalances &times; ten sizes,
+                up to three times the output-side reserve). It is the solver's
+                error <em>on top of</em>
+                ordinary slippage &mdash; not the slippage itself, and not what
+                a normal-sized trade pays, which is exact.
+                <code>exact</code> replaces it when nothing strays.
+              </p>
+              <p>
+                <strong>Bottom line</strong> &mdash;
+                <code>exact in [low, high]</code> is the price corridor, not a
+                trade size: quotes are exact as long as one swap leaves the pool
+                price inside it, measured against the anchor (1.0 = at the
+                anchor). It is walked outward from a balanced pool and stops at
+                the first mis-solved size, so it answers &ldquo;how far can a
+                single trade move the price before the quote stops being
+                trustworthy&rdquo;. The edges are reciprocal because the kernel
+                is symmetric, and a wider corridor is a safer curve.
+              </p>
+              <p class="solver-info-foot">
+                Probed off-chain against the exact settlement; nothing here runs
+                on chain.
+              </p>
             </div>
             <div class="overlay-row curve-row">
               <label class="curve-toggle"
@@ -1286,7 +1528,11 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                     >0.01</span
                   >
                 </div>
-                <div class="slider-group" style="display: none" aria-hidden="true">
+                <div
+                  class="slider-group"
+                  style="display: none"
+                  aria-hidden="true"
+                >
                   <input
                     type="range"
                     id="pwGamma"
@@ -1479,13 +1725,18 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                     🔍
                   </button>
                   <canvas id="penaltyChart"></canvas>
-                  <div class="zoom-popover zoom-popover-left" id="slippageZoomPopover">
+                  <div
+                    class="zoom-popover zoom-popover-left"
+                    id="slippageZoomPopover"
+                  >
                     <button
                       type="button"
                       class="zoom-popover-close"
                       onclick="toggleZoomPopover('slippage')"
                       aria-label="Close zoom"
-                    >✕</button>
+                    >
+                      ✕
+                    </button>
                     <div class="zoom-popover-title">Zoom: d = 0.00 .. 0.20</div>
                     <canvas id="penaltyZoomChart"></canvas>
                   </div>
@@ -1547,13 +1798,18 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                     🔍
                   </button>
                   <canvas id="liquidityChart"></canvas>
-                  <div class="zoom-popover zoom-popover-right" id="liquidityZoomPopover">
+                  <div
+                    class="zoom-popover zoom-popover-right"
+                    id="liquidityZoomPopover"
+                  >
                     <button
                       type="button"
                       class="zoom-popover-close"
                       onclick="toggleZoomPopover('liquidity')"
                       aria-label="Close zoom"
-                    >✕</button>
+                    >
+                      ✕
+                    </button>
                     <div class="zoom-popover-title">
                       Zoom: d = 0.70 .. 0.90, L max = 0.5
                     </div>
@@ -1570,7 +1826,9 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                   onclick="togglePriceCoverage()"
                   aria-label="Toggle Price Coverage section"
                   id="priceCoverageToggleBtn"
-                >+</button>
+                >
+                  +
+                </button>
                 Price Coverage by Sold Liquidity
                 <span class="chart-subtitle"
                   >Price ranges for each 10% of initial quote liquidity sold
@@ -1618,16 +1876,19 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                   <tbody id="coverageTableBody"></tbody>
                 </table>
               </div>
-              <div class="chart-container" style="margin-top: var(--spacing-lg)">
+              <div
+                class="chart-container"
+                style="margin-top: var(--spacing-lg)"
+              >
                 <h3>
                   Isolated Swap Quotes (round-trip)
                   <span class="chart-subtitle"
-                    >Each row swaps `pct% × reserve1` USDT into the pool
-                    (token1 → token0), captures post-fwd marginal
-                    price, then immediately reverses the received
-                    token0 back through the same post-fwd state. State
-                    is reset between rows. Same `amountIn` across all
-                    AMMs — different `out` reflects curve shape.</span
+                    >Each row swaps `pct% × reserve1` USDT into the pool (token1
+                    → token0), captures post-fwd marginal price, then
+                    immediately reverses the received token0 back through the
+                    same post-fwd state. State is reset between rows. Same
+                    `amountIn` across all AMMs — different `out` reflects curve
+                    shape.</span
                   >
                 </h3>
                 <div
@@ -1779,8 +2040,13 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
 
           eqOut[key] = {
             aWad: parseStrictBigIntString(e.aWad, `equilibra.${key}.aWad`),
-            lambdaWad: parseStrictBigIntString(e.lambdaWad, `equilibra.${key}.lambdaWad`),
-            feeBps: Math.trunc(requireNumberField(e.feeBps, `equilibra.${key}.feeBps`)),
+            lambdaWad: parseStrictBigIntString(
+              e.lambdaWad,
+              `equilibra.${key}.lambdaWad`,
+            ),
+            feeBps: Math.trunc(
+              requireNumberField(e.feeBps, `equilibra.${key}.feeBps`),
+            ),
           };
         }
 
@@ -1942,7 +2208,6 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       // That code path is gone; chart precision now matches the pool
       // contract bit-for-bit modulo float quantisation in Chart.js.
 
-
       // Convert a positive decimal string (e.g. "25", "12.5", "200")
       // straight into a WAD-scaled BigInt (`value * 1e18`).
       function decimalStringToWad(rawValue) {
@@ -2064,11 +2329,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
             setLegacySliderFromScaled("pwAlpha", BigInt(snap.aWad), 5);
           }
           if (typeof snap.lambdaWad === "string" && snap.lambdaWad.length > 0) {
-            setLegacySliderFromScaled(
-              "pwLambda",
-              BigInt(snap.lambdaWad),
-              5,
-            );
+            setLegacySliderFromScaled("pwLambda", BigInt(snap.lambdaWad), 5);
           }
         } catch {
           // malformed snapshot: keep factory defaults already in the DOM
@@ -2079,7 +2340,8 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const snap = readVisualizerCurveSnapshotFor(presetKey);
         if (!snap) return;
         const aRaw = typeof snap.A === "string" ? snap.A.trim() : "";
-        const gammaRaw = typeof snap.gamma === "string" ? snap.gamma.trim() : "";
+        const gammaRaw =
+          typeof snap.gamma === "string" ? snap.gamma.trim() : "";
         if (aRaw !== "") {
           const el = document.getElementById("curveA");
           if (el) el.value = aRaw;
@@ -2346,6 +2608,168 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       // Populate the initial-price field from the backend echo when the
       // user has not typed a value. A user-typed value always wins until
       // the next preset switch clears the field (see onCurvePresetChange).
+      // Explainer panel next to the lamp. Hover reveals it, a click pins it
+      // open (touch input has no hover), Escape or an outside click closes.
+      // Coordinates are computed at open time because the controls block
+      // clips horizontally, so the panel cannot live inside it.
+      function placeSolverInfoPop() {
+        const btn = document.getElementById("solverInfoBtn");
+        const pop = document.getElementById("solverInfoPop");
+        if (!btn || !pop || pop.hidden) return;
+        const r = btn.getBoundingClientRect();
+        const w = pop.offsetWidth;
+        const left = Math.max(
+          12,
+          Math.min(r.right - w, window.innerWidth - w - 12),
+        );
+        pop.style.left = `${left}px`;
+        pop.style.top = `${r.bottom + 8}px`;
+      }
+
+      function openSolverInfo() {
+        const pop = document.getElementById("solverInfoPop");
+        const btn = document.getElementById("solverInfoBtn");
+        if (!pop || !btn) return;
+        pop.hidden = false;
+        btn.setAttribute("aria-expanded", "true");
+        placeSolverInfoPop();
+      }
+
+      function closeSolverInfo() {
+        const pop = document.getElementById("solverInfoPop");
+        const btn = document.getElementById("solverInfoBtn");
+        if (!pop || !btn) return;
+        pop.hidden = true;
+        btn.setAttribute("aria-expanded", "false");
+      }
+
+      function initSolverInfo() {
+        const btn = document.getElementById("solverInfoBtn");
+        const pop = document.getElementById("solverInfoPop");
+        if (!btn || !pop) return;
+        // Click, not hover: the panel is scrollable, and a hover-driven
+        // popover closes as soon as the pointer crosses the gap to it.
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (pop.hidden) {
+            openSolverInfo();
+          } else {
+            closeSolverInfo();
+          }
+        });
+        document.addEventListener("click", (e) => {
+          if (pop.hidden) return;
+          if (pop.contains(e.target) || btn.contains(e.target)) return;
+          closeSolverInfo();
+        });
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") closeSolverInfo();
+        });
+        window.addEventListener("resize", placeSolverInfoPop);
+        window.addEventListener("scroll", placeSolverInfoPop, true);
+      }
+
+      // Paint the solver-health lamp from the backend probe. The backend
+      // re-solves each probed settlement exactly (bisection on the depth
+      // `L`) and reports how far the shipped secant strays, so the lamp
+      // reflects the same kernel a real swap would run — not a heuristic.
+      // The stray is always in the pool's favour, hence the wording:
+      // takers are short-changed, liquidity is never at risk.
+      function renderSolverHealth(health) {
+        const box = document.getElementById("solverHealth");
+        const text = document.getElementById("solverHealthText");
+        const range = document.getElementById("solverHealthRange");
+        const live = document.getElementById("solverInfoLive");
+        if (!box || !text || !range) return;
+
+        const status =
+          health && typeof health.status === "string"
+            ? health.status
+            : "unknown";
+        box.dataset.status = status;
+        if (status === "unknown") {
+          text.textContent = "solver: —";
+          range.textContent = "";
+          if (live) live.innerHTML = "";
+          return;
+        }
+
+        const worst = Number(health.worstErrorPct);
+        const pct = Number.isFinite(worst) ? worst : 0;
+        const breaks = Number(health.monotonicityBreaks) || 0;
+        // "worst" is load-bearing: the figure is the largest gap found
+        // anywhere in the probe, not what an ordinary trade pays, and it is
+        // measured against the output the curve owes — not slippage.
+        text.textContent =
+          status === "ok"
+            ? "solver: exact"
+            : `solver: worst −${pct < 0.01 ? pct.toExponential(1) : pct.toFixed(2)}%`;
+
+        // The corridor is the operator-facing form of the boundary: how far
+        // one swap may move the price out of a balanced pool before the
+        // solver stops being exact. Symmetric, so the upper edge mirrors.
+        const low = Number(health.safePriceLow);
+        const hasRange = Number.isFinite(low) && low > 0;
+        range.textContent = hasRange
+          ? `exact in [${low.toFixed(4)}, ${(1 / low).toFixed(4)}]`
+          : "";
+
+        if (!live) return;
+        const rows = [];
+        if (hasRange) {
+          rows.push(
+            `<div><strong>Exact price range:</strong> [${low.toFixed(4)}, ${(
+              1 / low
+            ).toFixed(4)}] of the anchor — ${((low - 1) * 100).toFixed(
+              1,
+            )}% to +${((1 / low - 1) * 100).toFixed(0)}% in one swap.</div>`,
+          );
+        }
+        if (status === "ok") {
+          rows.push(
+            "<div>Every probed trade settles on the curve for this (a, λ) — no boundary found.</div>",
+          );
+        } else {
+          rows.push(
+            `<div><strong>Worst probe:</strong> taker receives ${pct.toFixed(
+              4,
+            )}% less than the curve owes` +
+              (breaks
+                ? `, in ${breaks} case(s) a bigger trade returns less`
+                : "") +
+              ".</div>",
+          );
+          const bad = Number(health.firstBadPrice);
+          if (Number.isFinite(bad) && bad > 0) {
+            rows.push(
+              `<div><strong>Boundary:</strong> the first mis-solved swap lands at price ${bad.toFixed(
+                4,
+              )} (${((bad - 1) * 100).toFixed(1)}% from the anchor).</div>`,
+            );
+          }
+          const ratio = Number(health.worstInputRatio);
+          const imb = Number(health.worstImbalance);
+          if (Number.isFinite(ratio) && Number.isFinite(imb)) {
+            rows.push(
+              `<div>Worst at an input ${ratio.toFixed(
+                2,
+              )}× the output-side reserve, pool imbalance y/x = ${imb.toFixed(
+                2,
+              )}.</div>`,
+            );
+          }
+          rows.push(
+            "<div>Widening λ is the cheapest way out of this region.</div>",
+          );
+        }
+        rows.push(
+          `<div class="solver-info-probe">Probed ${
+            Number(health.samples) || 0
+          } quotes against the exact settlement.</div>`,
+        );
+        live.innerHTML = rows.join("");
+      }
+
       function populateCoverageInitialPriceFromResponse(apiPayload) {
         const el = document.getElementById("coverageInitialPrice");
         if (!el) return;
@@ -2499,7 +2923,11 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const toBigInt = (raw, fallback) => {
           if (typeof raw === "bigint") return raw;
           if (typeof raw === "string" && raw.length > 0) {
-            try { return BigInt(raw); } catch { /* fall through */ }
+            try {
+              return BigInt(raw);
+            } catch {
+              /* fall through */
+            }
           }
           if (typeof raw === "number" && Number.isFinite(raw)) {
             // Treat a bare decimal as a fraction of WAD (legacy preset
@@ -2556,8 +2984,10 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       function pwAlphaTToValue(t) {
         const tt = _pwClamp(t, 0, 1);
         const oneMinus = 1 - tt;
-        return PW_ALPHA_MAX -
-          (PW_ALPHA_MAX - PW_ALPHA_MIN) * Math.pow(oneMinus, PW_NONLINEAR_K);
+        return (
+          PW_ALPHA_MAX -
+          (PW_ALPHA_MAX - PW_ALPHA_MIN) * Math.pow(oneMinus, PW_NONLINEAR_K)
+        );
       }
       function pwAlphaValueToT(value) {
         const v = _pwClamp(value, PW_ALPHA_MIN, PW_ALPHA_MAX);
@@ -2566,8 +2996,10 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       }
       function pwLambdaTToValue(t) {
         const tt = _pwClamp(t, 0, 1);
-        return PW_LAMBDA_MIN +
-          (PW_LAMBDA_MAX - PW_LAMBDA_MIN) * Math.pow(tt, PW_NONLINEAR_K);
+        return (
+          PW_LAMBDA_MIN +
+          (PW_LAMBDA_MAX - PW_LAMBDA_MIN) * Math.pow(tt, PW_NONLINEAR_K)
+        );
       }
       function pwLambdaValueToT(value) {
         const v = _pwClamp(value, PW_LAMBDA_MIN, PW_LAMBDA_MAX);
@@ -2676,9 +3108,10 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
           const fineId = id + "Fine";
           const fineEl = document.getElementById(fineId);
           if (fineEl) fineEl.value = clamped.toFixed(rawDecimals);
-          const t = id === "pwAlpha"
-            ? pwAlphaValueToT(clamped)
-            : pwLambdaValueToT(clamped);
+          const t =
+            id === "pwAlpha"
+              ? pwAlphaValueToT(clamped)
+              : pwLambdaValueToT(clamped);
           el.value = String(t);
           return;
         }
@@ -2943,7 +3376,8 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
 
         const pwLambda = pwLambdaDisplayValue();
         const pwLambdaDisplayEl = document.getElementById("pwLambdaDisplay");
-        if (pwLambdaDisplayEl) pwLambdaDisplayEl.textContent = pwLambda.toFixed(5);
+        if (pwLambdaDisplayEl)
+          pwLambdaDisplayEl.textContent = pwLambda.toFixed(5);
         const pwLambdaFineEl = document.getElementById("pwLambdaFine");
         if (pwLambdaFineEl && document.activeElement !== pwLambdaFineEl) {
           pwLambdaFineEl.value = pwLambda.toFixed(5);
@@ -3122,7 +3556,10 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         // do not change the request payload — re-render from the cached
         // series instead of re-fetching identical server compute.
         const payloadJson = JSON.stringify(payload);
-        if (visualizerSeriesData && payloadJson === visualizerSeriesPayloadJson) {
+        if (
+          visualizerSeriesData &&
+          payloadJson === visualizerSeriesPayloadJson
+        ) {
           renderApiPayload(
             visualizerSeriesData,
             curveParams,
@@ -3175,6 +3612,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
           visualizerSeriesData = apiPayload;
           visualizerSeriesPayloadJson = payloadJson;
           populateCoverageInitialPriceFromResponse(apiPayload);
+          renderSolverHealth(apiPayload?.solverHealth);
           renderApiPayload(
             apiPayload,
             curveParams,
@@ -3213,6 +3651,11 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       /// see *which* curves disappeared (vs whole chart blanking,
       /// which would obscure that they're seeing an error state).
       function clearCurveAndEquilibraOnApiError() {
+        // The solver lamp is a claim about the CURRENT (a, lambda). Both
+        // callers reach here with that pair already changed and no verdict
+        // for it, so leaving the previous reading on screen would assert
+        // something the server never said about these parameters.
+        renderSolverHealth(null);
         const stripDatasets = (chart) => {
           if (!chart || !chart.data || !Array.isArray(chart.data.datasets))
             return;
@@ -3622,10 +4065,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         coverageZoomChart.update("none");
       }
 
-      function updateCoverageComparisonFromApi(
-        apiPayload,
-        curveParams,
-      ) {
+      function updateCoverageComparisonFromApi(apiPayload, curveParams) {
         const tableBody = document.getElementById("coverageTableBody");
         if (!tableBody) return;
         const coverage = apiPayload?.coverage;
@@ -4688,8 +5128,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                 color: "#8b949e",
                 font: { size: 11 },
                 filter: (item) =>
-                  !item.text.startsWith("_") &&
-                  item.text !== "Balanced price",
+                  !item.text.startsWith("_") && item.text !== "Balanced price",
                 usePointStyle: true,
                 pointStyle: "line",
               },
@@ -5096,6 +5535,9 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       }
 
       document.addEventListener("DOMContentLoaded", async () => {
+        // Wired before the preset load so the explainer stays usable even if
+        // the API call below fails and returns early.
+        initSolverInfo();
         try {
           await loadBenchmarkPresetsFromApi();
         } catch (e) {

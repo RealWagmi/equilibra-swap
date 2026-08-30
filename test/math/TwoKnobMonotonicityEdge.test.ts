@@ -160,7 +160,10 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
         // `xMath` keeps the relative size invariant across the
         // test (rather than absolute wei amounts that get tiny
         // at the upper end of the production band).
-        const dxBpsLadder = [1n, 10n, 100n, 1_000n, 2_500n, 5_000n, 6_000n];
+        // The upper end matches the largest input any in-protocol
+        // consumer can quote: `EquilibraPool._bisectAmountInForTarget`
+        // caps its probes at `inputReserve - inputReserve / 100`.
+        const dxBpsLadder = [1n, 10n, 100n, 1_000n, 2_500n, 5_000n, 6_000n, 7_500n, 9_000n, 9_900n];
         const outs: bigint[] = [];
         for (const bps of dxBpsLadder) {
           const dx = (xMath * bps) / 10_000n;
@@ -213,5 +216,96 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
         ).to.be.lte(1n);
       });
     }
+  });
+  describe("Error direction past the whole reserve", function () {
+    // The corner probes above bound the kernel two-sidedly to 1 wei,
+    // which holds while the constant-product seed of
+    // `EquilibraSwapMath._solveCounterpart` lands near the root. Once
+    // the input exceeds the entire reserve on a curve whose plateau
+    // reaches that far — `aWad` near `A_MAX`, `lambdaWad` near
+    // `LAMBDA_MIN` — the seed sits an order of magnitude off, the
+    // 12-iteration cap engages its best-iterate fallback, and the
+    // settled point carries a percent-scale residual. Output is not
+    // monotone in the input over that domain.
+    //
+    // What must never bend is the DIRECTION of that residual: the
+    // settlement may keep more depth than the curve owes, never less.
+    // `solveLFromState` is constant along a `K = const` level set
+    // (path additivity), so `L_post >= L_pre` states exactly that.
+    //
+    // Tolerance is one-sided and loose because quotes floor their
+    // output: `L_post` sits a few wei under `L_pre` on any leg, worst
+    // case ~1.3e-18 of `L_pre` across this grid. `L_pre / 1e15` clears
+    // that by three orders of magnitude while still catching a leak
+    // twelve orders below the percent-scale residual itself.
+
+    const AS: Array<[string, bigint]> = [
+      ["A_MIN", A_MIN],
+      ["preset", 909610000000000030n],
+      ["A_MAX", A_MAX],
+    ];
+    const LAMBDAS: Array<[string, bigint]> = [
+      ["LAMBDA_MIN", LAMBDA_MIN],
+      ["preset", 16780000000000000n],
+      ["LAMBDA_MAX", LAMBDA_MAX],
+    ];
+    // Anchor plus both de-anchored directions; sizes run past the
+    // whole reserve, where the fallback iterate takes over.
+    const STATES: Array<[string, bigint, bigint]> = [
+      ["anchor", 10n ** 22n, 10n ** 22n],
+      ["y = x/4", 10n ** 22n, 10n ** 22n / 4n],
+      ["y = 4x", 10n ** 22n, 4n * 10n ** 22n],
+    ];
+    // Exact-in: past the whole reserve, where the seed degrades.
+    const IN_SIZE_PERMILLE = [900n, 1_000n, 1_050n, 1_500n, 3_000n];
+    // Exact-out: output is bounded by the reserve it is drawn from, so
+    // the demanding end is near-total depletion instead.
+    const OUT_SIZE_PERMILLE = [900n, 990n, 999n];
+
+    it("exact-in never settles below the pre-state depth", async function () {
+      for (const [aTag, a] of AS) {
+        for (const [lTag, lambda] of LAMBDAS) {
+          for (const [sTag, x, y] of STATES) {
+            const lPre = BigInt(await h.solveLFromState(x, y, a, lambda));
+            const tolerance = lPre / 10n ** 15n;
+            for (const permille of IN_SIZE_PERMILLE) {
+              const dx = (x * permille) / 1_000n;
+              const [outRaw] = await h.quoteExactInForward(x, y, dx, a, lambda);
+              const out = BigInt(outRaw);
+              if (out === 0n) continue; // documented unquotable-dust sentinel
+              const lPost = BigInt(await h.solveLFromState(x + dx, y - out, a, lambda));
+              expect(
+                lPost + tolerance,
+                `a=${aTag} λ=${lTag} state=${sTag} dx=${permille}/1000 of x: ` +
+                  `L_post=${lPost} fell below L_pre=${lPre} beyond floor dust`
+              ).to.be.gte(lPre);
+            }
+          }
+        }
+      }
+    });
+
+    it("exact-out never settles below the pre-state depth", async function () {
+      for (const [aTag, a] of AS) {
+        for (const [lTag, lambda] of LAMBDAS) {
+          for (const [sTag, x, y] of STATES) {
+            const lPre = BigInt(await h.solveLFromState(x, y, a, lambda));
+            const tolerance = lPre / 10n ** 15n;
+            for (const permille of OUT_SIZE_PERMILLE) {
+              const dy = (y * permille) / 1_000n;
+              const [inRaw] = await h.quoteExactOutForward(x, y, dy, a, lambda);
+              const paid = BigInt(inRaw);
+              if (paid === 0n) continue;
+              const lPost = BigInt(await h.solveLFromState(x + paid, y - dy, a, lambda));
+              expect(
+                lPost + tolerance,
+                `a=${aTag} λ=${lTag} state=${sTag} dy=${permille}/1000 of y: ` +
+                  `L_post=${lPost} fell below L_pre=${lPre} beyond floor dust`
+              ).to.be.gte(lPre);
+            }
+          }
+        }
+      }
+    });
   });
 });
