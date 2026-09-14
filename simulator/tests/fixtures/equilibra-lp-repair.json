@@ -1,0 +1,79 @@
+{
+  "exact-in": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000000",
+    "reserveIn": "500000000000000000",
+    "reserveOut": "1000000000000000000",
+    "amount": "3",
+    "raw": "3",
+    "expected": "3",
+    "exactOut": false,
+    "error": null
+  },
+  "exact-out": {
+    "aWad": "909610000000000030",
+    "lambdaWad": "16780000000000000",
+    "reserveIn": "1000000000000",
+    "reserveOut": "1000000000000",
+    "amount": "43",
+    "raw": "43",
+    "expected": "45",
+    "exactOut": true,
+    "error": null
+  },
+  "zero-output": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000",
+    "reserveIn": "100000000000000",
+    "reserveOut": "100000000000000",
+    "amount": "2",
+    "raw": "0",
+    "expected": "0",
+    "exactOut": false,
+    "error": "AmountTooSmallAfterNormalization"
+  },
+  "lp-decrease": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000",
+    "reserveIn": "1000000000000",
+    "reserveOut": "1000000000000",
+    "amount": "2",
+    "raw": "2",
+    "expected": "0",
+    "exactOut": false,
+    "error": "LpValueDecreased"
+  },
+  "exact-out-fraction": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000",
+    "reserveIn": "100000000000000",
+    "reserveOut": "114285714285",
+    "amount": "17",
+    "raw": "3786",
+    "expected": "3788",
+    "exactOut": true,
+    "error": null
+  },
+  "exact-out-fee": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000000",
+    "reserveIn": "100000000000000",
+    "reserveOut": "114285714285",
+    "amount": "17",
+    "raw": "14522",
+    "expected": "14530",
+    "exactOut": true,
+    "error": null
+  },
+  "exact-out-lp-decrease": {
+    "aWad": "100000000000000000",
+    "lambdaWad": "1000000000000",
+    "reserveIn": "1000000000000",
+    "reserveOut": "1000000000000",
+    "amount": "17",
+    "raw": "16",
+    "expected": "18",
+    "exactOut": true,
+    "error": null
+  }
+}

@@ -43,7 +43,7 @@ import {
 const WAD = 10n ** 18n;
 
 /// Lift `(reserve0_raw, reserve1_raw, priceScaleWad)` into math-space
-/// via the `EquilibraSwapMath.toMathSpace` helper. Token decimals
+/// via the test-only `SwapMathDiagnostics.toMathSpace` helper. Token decimals
 /// come straight off the deployed ERC20 mocks (the pool stores them
 /// in a packed slot without a public getter, but the IERC20 metadata
 /// is canonical for the parity check).
@@ -83,9 +83,6 @@ async function postRepegFixtureWETH() {
   const preset = buildPreset("WETH", {
     baseFee: 100,
     feeRampBps: 1000,
-    // Production WETH floor (60 bps). The previous 20 bps floor put the
-    // stall-guard cap (floor·1e14 = 2e15) below the preset's 5e15 step,
-    // which the factory now rejects.
     feeFloorBps: 60,
     repegShareBps: 5_000,
   });

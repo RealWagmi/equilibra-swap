@@ -4,9 +4,10 @@
 // single scenarios (away regime, cross-anchor) on a minimal stateful
 // kernel harness — pure curve math, no fees, no router, no LP token.
 //
-// Hypothesis: with state-only K(x, y) and Newton-style secant solve,
-// `Σ small_dy ≈ single_dy` strictly (within ~1 wei × N split-floor
-// noise).
+// Every quote retains the common margin. The single quote may underpay
+// more than its split execution; only the independently measured single
+// underquote may extend the original split-floor budget.
+// Every leg is checked against the same continuous frozen-L invariant.
 //
 // The test also captures gas-per-swap on the harness for cross-
 // reference against the production pool's swap path.
@@ -16,6 +17,7 @@ import { expect } from "chai";
 import hre from "hardhat";
 
 import { REAL_PRESETS, REFERENCE_PRICES, type PresetName } from "../helpers/securityFixtures";
+import { assertQuotePrecision, exactInputReference } from "../helpers/continuousReference";
 
 const QUOTE_DECIMALS = 6;
 const BASE_DECIMALS: Record<PresetName, number> = {
@@ -33,6 +35,8 @@ const PRESETS_UNDER_TEST: PresetName[] = ["WETH", "WBTC"];
 
 interface HarnessFixture {
   harness: any;
+  math: any;
+  presetName: PresetName;
   quoteIsToken0: boolean;
   initialQuoteRaw: bigint;
   initialBaseRaw: bigint;
@@ -61,9 +65,13 @@ async function deployHarness(presetName: PresetName): Promise<HarnessFixture> {
   const Harness = await hre.ethers.getContractFactory("StatefulKernelHarness");
   const harness = await Harness.deploy(r0Wad, r1Wad, preset.aWad, preset.lambdaWad, d0, d1);
   await harness.waitForDeployment();
+  const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+  await math.waitForDeployment();
 
   return {
     harness,
+    math,
+    presetName,
     quoteIsToken0,
     initialQuoteRaw,
     initialBaseRaw,
@@ -77,6 +85,41 @@ interface SplitResult {
   delta: bigint;
   gasSingle: bigint;
   gasSplitsAvg: bigint;
+  singleUnderquote: bigint;
+}
+
+async function checkedKernelSwap(fx: HarnessFixture, zeroForOne: boolean, amount: bigint) {
+  const [base, quote] = await fx.harness.getMathReserves();
+  const scale = BigInt(await fx.harness.priceScaleWad());
+  const quoteIn = zeroForOne === fx.quoteIsToken0;
+  const inputDecimals = quoteIn ? QUOTE_DECIMALS : BASE_DECIMALS[fx.presetName];
+  const outputDecimals = quoteIn ? BASE_DECIMALS[fx.presetName] : QUOTE_DECIMALS;
+  const lifted = amount * 10n ** BigInt(18 - inputDecimals);
+  const dx = quoteIn ? (lifted * 10n ** 18n) / scale : lifted;
+  const preset = REAL_PRESETS[fx.presetName];
+  const ref = await exactInputReference(
+    fx.math,
+    quoteIn ? quote : base,
+    quoteIn ? base : quote,
+    dx,
+    preset.aWad,
+    preset.lambdaWad
+  );
+  const lower = (v: bigint) => (quoteIn ? v : (v * scale) / 10n ** 18n) / 10n ** BigInt(18 - outputDecimals);
+  const tx = await fx.harness.swapExactIn(zeroForOne, amount);
+  const receipt = await tx.wait();
+  const ev = receipt.logs.find((l: any) => l.fragment?.name === "Swap");
+  const out = BigInt(ev.args.amountOutRaw);
+  expect(out).to.equal(lower(ref.quotedMath));
+  expect(BigInt(ev.args.iters)).to.equal(ref.iterations);
+  const referenceOut = lower(ref.referenceMath);
+  assertQuotePrecision(out, referenceOut, ref.iterations, 4096n, "fee-free leg");
+  const [postX, postY] = await fx.harness.getMathReserves();
+  const lAfter = BigInt(await fx.math.solveLFromState(postX, postY, preset.aWad, preset.lambdaWad));
+  // Preserve the existing 4096-WAD-unit kernel-only bound in Q128 units.
+  // Native settlement separately applies the strict post-fee LP guard.
+  expect(lAfter * 10n ** 18n + 4096n * (1n << 128n)).to.be.at.least(ref.lBefore * 10n ** 18n);
+  return { out, gas: BigInt(receipt.gasUsed), referenceOut, iterations: ref.iterations };
 }
 
 async function compareSplitVsSingle(
@@ -89,11 +132,9 @@ async function compareSplitVsSingle(
   const snap1 = await hre.network.provider.send("evm_snapshot", []);
 
   // Single swap.
-  const txSingle = await fx.harness.swapExactIn(zeroForOne, totalAmount);
-  const rcSingle = await txSingle.wait();
-  const evSingle = rcSingle.logs.find((l: any) => l.fragment && l.fragment.name === "Swap");
-  const singleOut = BigInt(evSingle.args.amountOutRaw);
-  const gasSingle = BigInt(rcSingle.gasUsed);
+  const single = await checkedKernelSwap(fx, zeroForOne, totalAmount);
+  const singleOut = single.out;
+  const gasSingle = single.gas;
 
   await hre.network.provider.send("evm_revert", [snap1]);
 
@@ -105,13 +146,11 @@ async function compareSplitVsSingle(
   for (let i = 0; i < splits; i++) {
     const isLast = i === splits - 1;
     const amt = isLast ? totalAmount - baseChunk * BigInt(splits - 1) : baseChunk;
-    const tx = await fx.harness.swapExactIn(zeroForOne, amt);
-    const rc = await tx.wait();
-    const ev = rc.logs.find((l: any) => l.fragment && l.fragment.name === "Swap");
-    const out = BigInt(ev.args.amountOutRaw);
+    const leg = await checkedKernelSwap(fx, zeroForOne, amt);
+    const out = leg.out;
     splitOuts.push(out);
     total += out;
-    totalGas += BigInt(rc.gasUsed);
+    totalGas += leg.gas;
   }
 
   return {
@@ -121,6 +160,7 @@ async function compareSplitVsSingle(
     delta: total - singleOut,
     gasSingle,
     gasSplitsAvg: totalGas / BigInt(splits),
+    singleUnderquote: single.referenceOut > singleOut ? single.referenceOut - singleOut : 0n,
   };
 }
 
@@ -154,7 +194,7 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
     const fixtureFor = async () => deployHarness(presetName);
 
     describe(`${presetName} preset`, function () {
-      it("Splitting USDT→BASE from balanced state matches single swap exactly (1..95% of QUOTE)", async function () {
+      it("Balanced splitting stays within integer dust plus verified single underquote (1..95% of QUOTE)", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
 
@@ -183,7 +223,10 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
               "gas single": r.gasSingle.toString(),
               "gas split avg": r.gasSplitsAvg.toString(),
             });
-            expect(r.delta <= dustBudget, `pct=${pct}bps: delta=${r.delta}, budget=${dustBudget}`).to.equal(true);
+            expect(
+              r.delta <= dustBudget + r.singleUnderquote,
+              `pct=${pct}bps: delta=${r.delta}, dust=${dustBudget}, verified underquote=${r.singleUnderquote}`
+            ).to.equal(true);
           } finally {
             await hre.network.provider.send("evm_revert", [snap]);
           }
@@ -193,7 +236,7 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
         console.table(rows);
       });
 
-      it("Splitting from a pre-depleted away regime matches single swap exactly", async function () {
+      it("Away-regime splitting stays within integer dust plus verified single underquote", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
         const failures: string[] = [];
@@ -245,7 +288,7 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
 
               const r = await compareSplitVsSingle(fx, zeroForOne, totalUsdt, SPLITS);
 
-              const beat = r.delta > dustBudget;
+              const beat = r.delta > dustBudget + r.singleUnderquote;
               rows.push({
                 preDep: `${(Number(preDep) / 100).toFixed(1)}%`,
                 fwdPct: `${(Number(fwdPct) / 100).toFixed(1)}%`,
@@ -275,7 +318,7 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
         ).to.equal(true);
       });
 
-      it("Splitting through an anchor crossing matches single swap exactly", async function () {
+      it("Cross-anchor splitting stays within integer dust plus verified single underquote", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
         const failures: string[] = [];
@@ -301,7 +344,7 @@ describe("PathAdditivity [EquilibraSwapMath — state-only K, single-piece, seca
 
             const r = await compareSplitVsSingle(fx, zeroForOne, totalUsdt, SPLITS);
 
-            const beat = r.delta > dustBudget;
+            const beat = r.delta > dustBudget + r.singleUnderquote;
             rows.push({
               preDep: `${(Number(preDep) / 100).toFixed(1)}%`,
               singleOut: fmtRaw(r.singleOut, BASE_DECIMALS[presetName]),

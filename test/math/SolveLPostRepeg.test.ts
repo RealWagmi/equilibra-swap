@@ -121,8 +121,6 @@ async function postRepegFixtureWETH() {
   const preset = buildPreset("WETH", {
     baseFee: 100,
     feeRampBps: 1000,
-    // Production WETH floor (60 bps): keeps the stall-guard cap
-    // (floor·1e14 = 6e15) above the preset's 5e15 repeg threshold.
     feeFloorBps: 60,
     repegShareBps: 5_000,
   });
@@ -134,9 +132,6 @@ async function postRepegFixtureWBTC() {
   const preset = buildPreset("WBTC", {
     baseFee: 100,
     feeRampBps: 1000,
-    // Floor 60 bps keeps the stall-guard cap (floor·1e14 = 6e15) above
-    // the preset's 5e15 repeg threshold (the flat-fee production preset
-    // has a 1e16 cap via baseFee = 100).
     feeFloorBps: 60,
     repegShareBps: 5_000,
   });

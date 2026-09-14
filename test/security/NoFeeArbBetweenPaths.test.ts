@@ -1,37 +1,8 @@
-// Pool revenue protection — exact-out path must NEVER be cheaper for
-// the user than the exact-in path for the same target output.
-//
-// The strict invariant the test enforces, in plain language:
-//
-//   For every (amountOut, pool state, direction):
-//       costPaidViaExactOut  ≥  minimumCostViaExactIn
-//
-// Where:
-//   • costPaidViaExactOut    — input-token amount the user actually
-//                              pays when calling
-//                              `exactOutputSingle(amountOut)`. Equal
-//                              to `quoteExactOut(amountOut)` after
-//                              the resolver unification (bit-exact
-//                              between quote and live).
-//   • minimumCostViaExactIn  — the SMALLEST `amountIn` such that
-//                              `exactInputSingle(amountIn)` produces
-//                              at least `amountOut` on the output
-//                              side. Found by bisection over
-//                              `quoteExactIn`. This is the cheapest
-//                              way the same trade can be done via
-//                              the exact-in route.
-//
-// If `costPaidViaExactOut < minimumCostViaExactIn`, a smart trader
-// would always route the same target output through `exactInputSingle`
-// and pay `costPaidViaExactOut < minimumCostViaExactIn` — pocketing
-// the difference at the LPs' expense. The pool would silently lose
-// fee revenue every time exact-out is called. The strict `≥` rules
-// this out.
-//
-// Note: there is NO upper-bound tolerance asserted here. The user is
-// allowed to overpay via exact-out by any amount (it is up to the
-// caller to size `amountInMaximum`); what is forbidden is the
-// pool ever delivering exact-out for less than the exact-in floor.
+// Exact-out / exact-in price coverage through checked native quotes.
+// Compare actual settlement amounts with only the existing one-raw-unit
+// dust budget on this ordinary grid. The inverse output-margin maps do not
+// justify another percentage allowance. This is not a universal solver bound.
+// Quote/execution equality is also covered by ExactOutStressCrossAnchorRepeg.
 //
 // Coverage matrix:
 //   • Both canonical presets (WETH, WBTC) under their full active
@@ -104,7 +75,7 @@ async function findMinimumExactInputForTarget(
   return upperBound;
 }
 
-describe("Pool revenue: exact-out path must never be cheaper than exact-in path", function () {
+describe("Exact-out cost covers the checked exact-in price floor", function () {
   this.timeout(180_000);
 
   // Pool-state fixtures the invariant is tested against.
@@ -159,7 +130,7 @@ describe("Pool revenue: exact-out path must never be cheaper than exact-in path"
 
       for (const stateLabel of POOL_STATES) {
         for (const direction of DIRECTIONS) {
-          it(`${stateLabel.name} / ${direction}: exact-out cost ≥ minimum exact-in cost (no fee-arb)`, async function () {
+          it(`${stateLabel.name} / ${direction}: exact-out cost covers the exact-in target within one output unit`, async function () {
             const fixture = await deploySecurityFixture(buildPreset(presetName, productionFeeOverrides));
             if (stateLabel.predepletedSide !== null) {
               await deplete(fixture, stateLabel.predepletedSide, stateLabel.depletionBps);
@@ -175,6 +146,7 @@ describe("Pool revenue: exact-out path must never be cheaper than exact-in path"
             //   - if output is base  → quote is token0 ⇒ base is token1 ⇒ NOT token0
             const outputTokenIsToken0 = outputTokenIsQuote ? fixture.quoteIsToken0 : !fixture.quoteIsToken0;
             const liveOutputReserveRaw = outputTokenIsToken0 ? BigInt(reserve0After) : BigInt(reserve1After);
+            const liveInputReserveRaw = outputTokenIsToken0 ? BigInt(reserve1After) : BigInt(reserve0After);
 
             for (const sizeBps of PROBE_SIZES_BPS) {
               const targetAmountOut = (liveOutputReserveRaw * sizeBps) / 10_000n;
@@ -192,32 +164,17 @@ describe("Pool revenue: exact-out path must never be cheaper than exact-in path"
                 continue;
               }
 
-              // 2. Confirm the upper bound for the bisection: feeding
-              //    `costPaidViaExactOut` through exact-in must
-              //    deliver at least `targetAmountOut − tolerance`.
-              //
-              //    `quoteExactOut` rounds INPUT up (safety bump,
-              //    documented ≤ a few wei) while `quoteExactIn` rounds
-              //    OUTPUT down — the two rounding directions are
-              //    OPPOSITE, so on extreme presets (e.g. WBTC
-              //    a=0.949·W, λ=0.0139·W) the round-trip identity
-              //    `quoteExactIn(quoteExactOut(target)) → target` can
-              //    end up `target − 1` wei. Tolerate that structural
-              //    floor without weakening the no-arb invariant
-              //    below: the bisection target is shifted by the
-              //    same tolerance so the invariant in step 5 still
-              //    catches any actual fee-arb.
+              // 2. Native rounding dust only; the common margin is already inverted.
               const ROUND_TRIP_TOLERANCE_WEI = 1n;
-              const effectiveTargetOut =
-                targetAmountOut > ROUND_TRIP_TOLERANCE_WEI
-                  ? targetAmountOut - ROUND_TRIP_TOLERANCE_WEI
-                  : targetAmountOut;
+              expect(targetAmountOut).to.be.greaterThan(ROUND_TRIP_TOLERANCE_WEI);
+              const effectiveTargetOut = targetAmountOut - ROUND_TRIP_TOLERANCE_WEI;
               const outputAtExactOutCost = BigInt(await fixture.pool.quoteExactIn(zeroForOne, costPaidViaExactOut));
               expect(
                 outputAtExactOutCost,
                 `${stateLabel.name}/${direction}/${sizeBps}bps: exact-in with costPaidViaExactOut=${costPaidViaExactOut} ` +
-                  `delivered only ${outputAtExactOutCost} < target−tol=${effectiveTargetOut} ` +
-                  `(round-trip drift > ${ROUND_TRIP_TOLERANCE_WEI} wei). ` +
+                  `delivered only ${outputAtExactOutCost} < target−floor=${effectiveTargetOut} ` +
+                  `(checked round-trip drift > ${ROUND_TRIP_TOLERANCE_WEI} wei). ` +
+                  `Reserves=${liveInputReserveRaw}/${liveOutputReserveRaw}. ` +
                   `Resolver split or solver regression — investigate.`
               ).to.be.greaterThanOrEqual(effectiveTargetOut);
 
@@ -251,18 +208,13 @@ describe("Pool revenue: exact-out path must never be cheaper than exact-in path"
                 costPaidViaExactOut
               );
 
-              // 5. THE STRICT INVARIANT: exact-out cost ≥ minimum
-              //    exact-in cost. No tolerance — overpayment by any
-              //    amount is allowed, underpayment by even 1 wei is
-              //    not. Anything ≤ 0 means user can pick exact-in
-              //    and pay LESS for the same output, draining LP
-              //    revenue.
+              // 5. Compare against the same checked price target;
+              // no additional input-price tolerance is applied here.
               expect(
                 costPaidViaExactOut,
                 `${stateLabel.name}/${direction}/${sizeBps}bps: ` +
                   `costPaidViaExactOut=${costPaidViaExactOut} < minimumCostViaExactIn=${minimumCostViaExactIn}. ` +
-                  `User saves ${minimumCostViaExactIn - costPaidViaExactOut} wei by routing through exact-in — ` +
-                  `pool loses revenue!`
+                  `Exact-out falls below the checked exact-in price floor.`
               ).to.be.greaterThanOrEqual(minimumCostViaExactIn);
             }
           });

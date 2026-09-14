@@ -1,6 +1,9 @@
 node_modules
 .env
 
+# Local research and developer scratch files
+/.local/
+
 # Local dev-chain deployment documents (real networks ARE tracked)
 deployments/local-*.json
 

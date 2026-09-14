@@ -1,3 +1,4 @@
+import { poolEmaLogWad } from "../helpers/storageLayout";
 // Bit-exact parity between the Solidity exact-out path and the Rust
 // off-chain simulator's `swap_stateful_exact_out`.
 //
@@ -234,6 +235,7 @@ async function snapshotPool(f: PoolFixture): Promise<SnapshotForRustQuote> {
     equilibraE0: BigInt(bal0),
     equilibraE1: BigInt(bal1),
     equilibraEmaPrice: BigInt(oracle.emaPriceWad),
+    equilibraEmaLogWad: await poolEmaLogWad(f.poolAddress),
     equilibraLastTimestamp: BigInt(f.initTs),
     equilibraLastRecenterTimestamp: BigInt(f.initTs),
     equilibraRepegStepWad: BigInt(f.repegStepWad),
@@ -363,6 +365,9 @@ async function assertExactOutParity(f: PoolFixture, amountOut: bigint, label: st
     livePost.anchorPriceWad
   );
   expect(BigInt(rust_post!.equilibraEmaPrice!), `${label}: post emaPriceWad`).to.equal(livePost.emaPriceWad);
+  expect(BigInt(rust_post!.equilibraEmaLogWad!), `${label}: post emaLogWad`).to.equal(
+    await poolEmaLogWad(f.poolAddress)
+  );
   expect(BigInt(rust_post!.equilibraLpUnitValueGenesisWad!), `${label}: post lpUnitValueGenesisWad`).to.equal(
     livePost.lpUnitValueGenesisWad
   );
@@ -380,6 +385,46 @@ async function assertExactOutParity(f: PoolFixture, amountOut: bigint, label: st
 }
 
 describe("ExactOut parity (on-chain vs Rust simulator)", function () {
+  for (const dir of ["token0", "token1"] as const) {
+    it(`maximum alpha WAD-1: exact-out quote/swap/Rust state parity for ${dir}`, async function () {
+      this.timeout(180_000);
+      const f = await deployParityPool("WETH", {
+        aWad: 10n ** 18n - 1n,
+        lambdaWad: 10n ** 15n,
+        baseFee: 10,
+        feeFloorBps: 1,
+        feeRampBps: 0,
+        repegShareBps: 0,
+      });
+      await assertExactOutParity(f, hre.ethers.parseEther("5000"), `solver-max-alpha/${dir}`, dir);
+    });
+  }
+
+  for (const dir of ["token0", "token1"] as const) {
+    it(`former late counterpart solver: exact-out quote/swap/Rust state parity for ${dir}`, async function () {
+      this.timeout(180_000);
+      const harness = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+      await harness.waitForDeployment();
+      const seed = hre.ethers.parseEther("500000");
+      const amountOut = (seed * 99n) / 100n;
+      const f = await deployParityPool("WETH", {
+        aWad: 990000000000000000n,
+        lambdaWad: 1000000000000000n,
+        baseFee: 10,
+        feeFloorBps: 1,
+        feeRampBps: 0,
+        repegShareBps: 0,
+        seed0: seed,
+        seed1: seed,
+      });
+      const [, iterations] = await harness.quoteExactOutForward(seed, seed, amountOut, f.aWad, f.lambdaWad);
+      expect(iterations, "curve-aware seed resolves this former late case early")
+        .to.be.greaterThan(0n)
+        .and.at.most(12n);
+      await assertExactOutParity(f, amountOut, `solver-late/${dir}`, dir);
+    });
+  }
+
   // Probe sizes are expressed in `parseEther` of the (uniform 18-dp)
   // mock tokens; with a 1e6 ETH-equivalent seed on each side, this
   // sweeps from dust (1 wei-of-ether) up to ~30% of the output

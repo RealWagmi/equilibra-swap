@@ -1,29 +1,32 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title IEquilibraFactory
-/// @notice Interface for the Equilibra pool factory
+/**
+ * @title IEquilibraFactory
+ * @notice Deploys Equilibra pools as clones, seeds their genesis liquidity atomically and keeps
+ * the pool registries: per-pair enumeration, the owner-curated whitelist, the private-pool LP
+ * allowlists and the verified Boost bindings.
+ * @dev Pair lookups are order-independent: `(tokenA, tokenB)` is sorted before it is hashed into
+ * the pair key. Several pools may exist per pair; each is addressed by a pair-local index.
+ */
 interface IEquilibraFactory {
     // ============ Events ============
 
-    /// @notice Emitted once per pool deployment with a full snapshot of
-    ///         the pool's identity + initial configuration.
-    /// @dev    Indexed topics (`token0`, `token1`, `pool`) make subgraph
-    ///         filters trivial. `creator` is the `msg.sender` that
-    ///         invoked {createPoolAndAddLiquidity}; not indexed because
-    ///         the event already saturates the 3-topic budget — for
-    ///         creator-keyed enumeration use {getPoolsByCreator}.
-    ///         Privacy is deliberately NOT part of this snapshot:
-    ///         private pools emit the companion {PrivatePoolCreated} in
-    ///         the same transaction, and {isPrivatePool} answers at any
-    ///         later time.
-    ///         `pairPoolIndex` is the per-pair index the factory
-    ///         assigned to this clone; together with `(token0, token1)`
-    ///         it's the only state needed to recompute the pool address
-    ///         off-chain via {computePoolAddress}.
-    ///         `poolCount = allPools.length` after the push.
-    ///         `config` is the full per-pool configuration as accepted
-    ///         by {createPoolAndAddLiquidity} (post-validation).
+    /**
+     * @notice Emitted once per pool deployment with the pool's identity and its validated
+     * initial configuration.
+     * @dev Privacy is not part of the snapshot: a private pool also emits {PrivatePoolCreated}
+     * in the same transaction, and {isPrivatePool} answers at any later time.
+     * @param token0 Lower-sorted token of the pair.
+     * @param token1 Higher-sorted token of the pair.
+     * @param pool Address of the new clone.
+     * @param creator `msg.sender` of the create call. Not indexed (the three topics are taken);
+     * use {getPoolsByCreator} for creator-keyed enumeration.
+     * @param pairPoolIndex Pair-local index of the clone; with `(token0, token1)` it is all that
+     * {computePoolAddress} needs to recompute `pool`.
+     * @param poolCount {allPoolsLength} after this pool was appended.
+     * @param config Configuration accepted by the create call, post-validation.
+     */
     event PoolCreated(
         address indexed token0,
         address indexed token1,
@@ -33,6 +36,13 @@ interface IEquilibraFactory {
         uint256 poolCount,
         PoolConfig config
     );
+    /**
+     * @notice Emitted when the owner adds a pool to or removes it from the whitelist of a pair.
+     * @param token0 First token as passed by the owner (not sorted).
+     * @param token1 Second token as passed by the owner (not sorted).
+     * @param pool Pool whose whitelist status changed.
+     * @param whitelisted `true` after an addition, `false` after a removal.
+     */
     event PoolWhitelistUpdated(
         address indexed token0,
         address indexed token1,
@@ -40,278 +50,174 @@ interface IEquilibraFactory {
         bool whitelisted
     );
 
-    /// @notice A private pool was created: every mint into it must name
-    ///         a recipient on the pool's LP allowlist.
+    /**
+     * @notice Emitted alongside {PoolCreated} when the new pool is private: every mint into it
+     * must name a recipient on the pool's LP allowlist.
+     * @param pool Address of the new clone.
+     * @param admin Creator of the pool, registered as its parameter admin on {paramTimelock}.
+     */
     event PrivatePoolCreated(address indexed pool, address indexed admin);
-    /// @notice The pool admin added or removed an account on a private
-    ///         pool's LP allowlist. Distinct from {PoolWhitelistUpdated},
-    ///         which is the OWNER-curated registry of featured pools.
+    /**
+     * @notice Emitted for every allowlist write of a private pool, including no-op re-sets.
+     * Distinct from {PoolWhitelistUpdated}, the owner-curated registry of featured pools.
+     * @param pool Private pool whose allowlist changed.
+     * @param account Account added to or removed from the allowlist.
+     * @param allowed `true` after an addition, `false` after a removal.
+     */
     event PoolLpAllowlistUpdated(address indexed pool, address indexed account, bool allowed);
 
+    /**
+     * @notice Emitted when the protocol fee percentage changes, including the constructor's
+     * initial setting (from `0`).
+     * @param oldFee Previous protocol fee in percent of the swap fee.
+     * @param newFee New protocol fee in percent of the swap fee.
+     */
     event ProtocolFeeChanged(uint8 oldFee, uint8 newFee);
+    /**
+     * @notice Emitted when the protocol fee collector changes.
+     * @param oldCollector Previous collector.
+     * @param newCollector New collector.
+     */
     event FeeCollectorChanged(address oldCollector, address newCollector);
 
-    /// @notice Owner (re)bound or unbound the verified Boost wrapper of
-    ///         a pool (`newBoost == address(0)` = unbound).
+    /**
+     * @notice Emitted when the owner binds, rebinds or unbinds the verified Boost wrapper of a
+     * pool.
+     * @param pool Pool whose binding changed.
+     * @param oldBoost Previously bound share vault, `address(0)` when there was none.
+     * @param newBoost Newly bound share vault, `address(0)` when the binding was removed.
+     */
     event PoolBoostSet(address indexed pool, address oldBoost, address newBoost);
 
     // ============ Structs ============
 
-    /// @notice Full per-pool configuration. All ranges below are
-    ///         enforced by the factory at deploy time — out-of-range
-    ///         values revert with the matching `Invalid*` error.
-    /// @param aWad             Depth-at-anchor knob of the two-knob
-    ///                         cubic invariant
-    ///                         `K = A·L·(x+y)/2 + (W − A)·xy` with
-    ///                         `A = a·W/(W + λ·D)`, WAD-scaled. Range
-    ///                         `[A_MIN_WAD, A_MAX_WAD] = [0.1·W,
-    ///                         0.99·W]`. Larger `aWad` deepens the
-    ///                         plateau at the anchor; smaller `aWad`
-    ///                         shallows it.
-    /// @param lambdaWad        Plateau-width knob (WAD-scaled). Range
-    ///                         `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD]`.
-    ///                         Larger `lambdaWad` narrows the plateau
-    ///                         (faster transition to CP tail); smaller
-    ///                         `lambdaWad` widens it. Decoupled from
-    ///                         `aWad` — moving one knob does not
-    ///                         affect the other's effect.
-    /// @param baseFee          Maximum swap fee in BPS — also the **flat
-    ///                         fee** charged on every swap when
-    ///                         `feeRampBps == 0` (explicit opt-out). Range
-    ///                         `[MIN_BASE_FEE, MAX_BASE_FEE]`.
-    /// @param emaPeriod        HALF-LIFE of the EMA oracle in seconds.
-    ///                         The factory converts it once to the
-    ///                         internal relaxation time
-    ///                         `τ = ceil(emaPeriod · 1000 / 694)` used in
-    ///                         `α_decay = exp(−Δt / τ)`; the pool's
-    ///                         `getFeeConfig()` returns the half-life via
-    ///                         the exact inverse `τ · 694 / 1000`. Input
-    ///                         floor `MIN_EMA_PERIOD`; ceiling bounds the
-    ///                         CONVERTED τ at `MAX_EMA_PERIOD`, so the
-    ///                         maximum accepted half-life is
-    ///                         `⌊MAX_EMA_PERIOD · 694 / 1000⌋ ≈ 4.86 d`.
-    /// @param repegStepWad     **Maximum relative anchor move per repeg
-    ///                         call**, WAD-scaled (1e15 ≈ 0.1 % of the
-    ///                         anchor per step). The actual move is
-    ///                         further capped by a damping rule
-    ///                         (`deviation / REPEG_DAMPING_DIVISOR`),
-    ///                         so the anchor asymptotically catches up
-    ///                         to the EMA without overshooting. Range
-    ///                         `[MIN_REPEG_STEP, MAX_REPEG_STEP]`.
-    /// @param repegThresholdToken1UpWad **Activation dead-band, upward
-    ///                         direction**: `_tryAutoRepeg`
-    ///                         short-circuits while `ema > priceScale`
-    ///                         (token1's price expressed in token0
-    ///                         ABOVE the anchor) and the geometric
-    ///                         deviation `|max(ema,anchor)/min(ema,
-    ///                         anchor) − 1|` is below this band.
-    ///                         Decoupled from `repegStepWad`: the
-    ///                         threshold decides WHEN the anchor wakes,
-    ///                         the step caps HOW FAR it moves per commit
-    ///                         (`min(repegStepWad, deviation/5)`).
-    ///                         Layout note: under the mainnet
-    ///                         address-sort layout with the base asset
-    ///                         in slot 0, a RISING base market is an
-    ///                         internal token1-DOWN move — bull-market
-    ///                         catch-up is tuned by the Down band.
-    ///                         Subject to the stall guard
-    ///                         `threshold ≤ feeScale · 1e14` whenever
-    ///                         `repegShareBps != 0` (the first
-    ///                         permitted move must be affordable out of
-    ///                         the fee-funded growth budget). Range
-    ///                         `[MIN_REPEG_STEP, MAX_REPEG_STEP]`.
-    /// @param repegThresholdToken1DownWad **Activation dead-band,
-    ///                         downward direction** (`ema <
-    ///                         priceScale`). Same range and stall
-    ///                         guard as the Up band. The split lets
-    ///                         the deployer calibrate catch-up
-    ///                         eagerness per direction explicitly
-    ///                         (e.g. a momentum-style tilt) instead of
-    ///                         inheriting an averaging artifact.
-    /// @param feeRampBps       Smoothstep dynamic-fee warm-up width, in
-    ///                         BPS of WAD. Range `[0, MAX_FEE_RAMP_BPS]`;
-    ///                         `0` disables the ramp entirely (every
-    ///                         swap pays exactly `baseFee`).
-    /// @param feeFloorBps      Lower bound of the dynamic fee in BPS;
-    ///                         paid by swaps that land near the anchor.
-    ///                         The smoothstep climbs from `feeFloorBps`
-    ///                         up to `baseFee` across the configured
-    ///                         ramp. Must satisfy `feeFloorBps ≤ baseFee`
-    ///                         (factory reverts with `InvalidFeeFloor`
-    ///                         on `feeFloorBps > baseFee`). The equality
-    ///                         `feeFloorBps == baseFee` is allowed
-    ///                         **only** with `feeRampBps == 0` (flat-fee
-    ///                         mode); pairing it with a non-zero ramp
-    ///                         reverts with `FeeRampNoHeadroom` because
-    ///                         the smoothstep would have nothing to
-    ///                         interpolate into.
-    /// @param repegShareBps    Fraction (in BPS of `BPS = 10_000`) of
-    ///                         the **total** fee budget that
-    ///                         `_tryAutoRepeg` is allowed to spend on
-    ///                         anchor moves. The pool's threshold
-    ///                         formula compensates for the protocol
-    ///                         slice so this share is independent of
-    ///                         `protocolFeePercent` — see
-    ///                         `EquilibraPool._tryAutoRepeg`.
-    ///                         `0` disables auto-repeg entirely;
-    ///                         `5_000` (conservative reference,
-    ///                         `DEFAULT_REPEG_SHARE_BPS`)
-    ///                         is a 50/50 split; the upper bound is
-    ///                         `min(MAX_REPEG_SHARE_BPS,
-    ///                         BPS − protocolFeePercent · 100)` — the
-    ///                         factory rejects configs that would leave
-    ///                         a negative residual to LPs with
-    ///                         `RepegShareExceedsBudget`.
+    /**
+     * @notice Full per-pool configuration. The factory validates every field at creation and
+     * reverts with the matching `Invalid*` / `FeeRampTooNarrow` / `RepegShareExceedsBudget`
+     * error on a violation.
+     */
     struct PoolConfig {
+        /// Depth-at-anchor knob `a` of `K = A·L·(x+y)/2 + (W − A)·xy`, `A = a·W/(W + λ·D)`;
+        /// WAD. Range `[A_MIN_WAD, A_MAX_WAD] = [1e17, WAD − 1]` (`InvalidA`); larger deepens
+        /// the plateau at the anchor.
         uint64 aWad;
+        /// Plateau-width knob `λ`; WAD. Range `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD] = [1e12, 1e18]`
+        /// (`InvalidLambda`); larger narrows the plateau. Independent of `aWad`.
         uint64 lambdaWad;
+        /// Maximum swap fee in bps, and the flat fee when `feeRampBps == 0`. Range
+        /// `[MIN_BASE_FEE, MAX_BASE_FEE] = [1, 2000]` (`InvalidFee`).
         uint16 baseFee;
+        /// EMA oracle half-life in seconds, stored as `tau = ceil(emaPeriod · 1000 / 694)`.
+        /// Floor `MIN_PUBLIC_EMA_PERIOD` (600 s) for public and `MIN_EMA_PERIOD` (60 s) for
+        /// private pools; `tau ≤ MAX_EMA_PERIOD` (7 d) caps the half-life at ≈ 4.86 d
+        /// (`InvalidEmaPeriod`). The pool's `getFeeConfig()` returns `tau · 694 / 1000`.
         uint32 emaPeriod;
+        /// Cap on the log-domain anchor step per repeg commit; WAD (1e15 ≈ 0.1%). The applied
+        /// step is `min(repegStepWad, deviation / REPEG_DAMPING_DIVISOR)`. Range
+        /// `[MIN_REPEG_STEP, MAX_REPEG_STEP] = [1, WAD]` (`InvalidRepegStep`).
         uint256 repegStepWad;
+        /// Activation dead-band while `ema > priceScale`: no repeg attempt while the geometric
+        /// deviation `max(ema, priceScale) / min(ema, priceScale) − 1` is below it; WAD. Range
+        /// `[1, WAD)` (`InvalidRepegThreshold`). Fee-independent; crossing it permits an
+        /// attempt, the LP-budget gates decide the move.
         uint256 repegThresholdToken1UpWad;
+        /// Same dead-band while `ema < priceScale`; WAD, range `[1, WAD)`
+        /// (`InvalidRepegThreshold`). With the base asset in slot 0 a rising base market reads
+        /// as token1-down, so this band tunes bull-market catch-up.
         uint256 repegThresholdToken1DownWad;
+        /// Smoothstep warm-up width in bps of WAD (`10_000` = one state-distance unit). Range
+        /// `[0, MAX_FEE_RAMP_BPS]` (`InvalidFeeRamp`); `0` disables the ramp. A live ramp must
+        /// pass the monotonicity guard (`FeeRampTooNarrow`).
         uint16 feeRampBps;
+        /// Lower bound of the dynamic fee in bps, paid near the anchor. A live ramp requires
+        /// `1 ≤ feeFloorBps < baseFee` (`InvalidFeeFloor`); ignored when `feeRampBps == 0`.
         uint16 feeFloorBps;
+        /// Share of the total fee budget the auto-repeg gate may spend, in bps. `0` disables
+        /// auto-repeg; `DEFAULT_REPEG_SHARE_BPS = 5_000` is the 50/50 reference. Range
+        /// `[0, MAX_REPEG_SHARE_BPS]` (`InvalidRepegShare`) and
+        /// `repegShareBps + protocolFee · 100 ≤ BPS` (`RepegShareExceedsBudget`). Stored grossed
+        /// up by the protocol slice, so the repeg cadence is independent of `protocolFee`.
         uint16 repegShareBps;
     }
 
     // ============ Pool Creation ============
 
-    /// @notice Atomically create a new pool and seed its initial liquidity.
-    /// @dev    The factory exposes pool creation **only** through this
-    ///         atomic helper to prevent front-running of the initial
-    ///         price (a third party seeding the empty pool first would
-    ///         dictate the anchor and pocket the price-setting bonus).
-    ///         Caller must approve both tokens to the factory beforehand.
-    ///
-    /// === Dynamic fee semantics ===
-    /// The fee charged on every swap is resolved by a smoothstep ramp
-    /// `m(r) = 2r − r²` evaluated at `r = distPostWad / feeRampWad`,
-    /// where `distPostWad` is the post-swap state distance from the
-    /// anchor and `feeRampWad = config.feeRampBps · 1e14`:
-    ///
-    ///   feeBps = config.feeFloorBps
-    ///          + (config.baseFee − config.feeFloorBps) · m(r),
-    ///          clamped into [config.feeFloorBps, config.baseFee]
-    ///
-    /// Behavioural rules enforced by the pool:
-    ///   • `config.baseFee` is the **maximum** fee charged when the swap
-    ///     leaves the pool at or beyond the configured ramp width.
-    ///   • `config.feeFloorBps` is the **minimum** fee; mean-reverting
-    ///     flow (a swap that lands close to the anchor) pays exactly
-    ///     this floor. Any value in `[0, config.baseFee]` is accepted.
-    ///   • The dynamic ramp is **disabled** — every swap simply pays
-    ///     `config.baseFee` — when `config.feeRampBps == 0` (explicit
-    ///     opt-out). Pairing a non-zero ramp with `baseFee ==
-    ///     feeFloorBps` is rejected at deploy time with
-    ///     `FeeRampNoHeadroom` rather than silently collapsing.
-    ///
-    /// === Cost model ===
-    /// Both swap directions resolve the fee rate (a WAD fraction,
-    /// `1 bps == 1e14`) against the same CP-projected post-state
-    /// surface (`_resolveDynamicFeeWadFromCp`), and quote == swap holds
-    /// bit-for-bit on each route. Exact-out charges the endpoint-max of
-    /// that surface, ≥ the fee exact-in resolves at the settled gross —
-    /// the conservatism is LP-favourable, so route choice never
-    /// under-pays the pool. WAD-rate resolution keeps
-    /// the gross → clean-input map monotone up to a dust residual on
-    /// the order of `amountIn / 1e18` wei per rate step (one input wei
-    /// can cross several WAD-quantized rate ulps at once).
-    ///   • **Exact-in** is single-pass: the gross `amountIn` feeds the
-    ///     CP predictor directly. The predictor sees gross rather than
-    ///     post-fee `cleanIn`, which adds a small upward bias — but the
-    ///     CP proxy itself can diverge from the true post-state distance
-    ///     in either direction, so the net bias is NOT guaranteed to
-    ///     favour LPs on large swaps. Enabling the ramp adds only a
-    ///     handful of muls/divs on top of the flat-fee swap path.
-    ///   • **Exact-out** resolves the fee non-iteratively as the max of
-    ///     the CP-proxy fee at the two ends of the realisable gross
-    ///     interval `[grossUp(clean, feeFloor), grossUp(clean, baseFee)]`
-    ///     (the CP distance is quasi-convex in the gross, so a fixed
-    ///     point can oscillate for anchor-crossing trades; a quasi-convex
-    ///     function attains its interval max at an endpoint). This
-    ///     guarantees `exactInput(quoteExactOut(out)) ≥ out`, at the cost
-    ///     of quoting anchor-crossing exact-out trades conservatively —
-    ///     over-charged by up to `baseFee − feeFloor`, always in the
-    ///     LP-favourable direction.
-    /// Pools that do not need the ramp should still opt out via
-    /// `feeRampBps = 0` to skip the prediction entirely.
-    ///
-    /// === Sizing the ramp (`feeFloorBps = 20`, `baseFee = 100`) ===
-    /// Resolved fee (in bps) for a few canonical anchor deviations and
-    /// ramp widths. See `EquilibraSwapMath.smoothstepFeeWad` for the
-    /// full derivation; this table is the operator-facing summary.
-    ///
-    ///   priceMove |  ramp=   10 |  ramp=  100 |  ramp= 1000 |  ramp=10000
-    ///   (% anch)  |     feeBps  |     feeBps  |     feeBps  |     feeBps
-    ///   ----------+-------------+-------------+-------------+-------------
-    ///       1.00% |     35.06   |     21.58   |     20.16   |     20.02
-    ///       2.00% |     70.44   |     26.15   |     20.63   |     20.06
-    ///       5.00% |    100.00   |     53.56   |     23.76   |     20.38
-    ///      10.00% |    100.00   |     99.34   |     33.88   |     21.45
-    ///      20.00% |    100.00   |    100.00   |     64.44   |     25.24
-    ///      50.00% |    100.00   |    100.00   |    100.00   |     44.44
-    ///     100.00% |    100.00   |    100.00   |    100.00   |     80.00
-    ///     162.00% |    100.00   |    100.00   |    100.00   |    100.00
-    ///
-    /// Reading the table:
-    ///   • Each column is one `feeRampBps` setting; rows are the anchor
-    ///     deviation produced by the swap.
-    ///   • Pick a column by deciding "what deviation should saturate at
-    ///     `baseFee`": narrow ramps (≤ 100 bps) are aggressive — even a
-    ///     1-2% move pushes the fee close to the ceiling. Wide ramps
-    ///     (≥ 1000 bps) behave as a soft floor where most realistic
-    ///     swaps stay near `feeFloorBps`.
-    ///   • Setting `feeRampBps = 10000` is NOT equivalent to "max fees"
-    ///     — it is the widest possible smoothstep, so most swaps end up
-    ///     paying close to `feeFloorBps`. To bias fees high, pick a
-    ///     small `feeRampBps` (≤ 100) instead.
-    ///   • The ramp cannot be arbitrarily narrow: `feeRampBps ·
-    ///     (BPS − baseFee)² ≥ FEE_RAMP_GUARD_MULT · BPS · (baseFee −
-    ///     feeFloorBps)²` is enforced (`FeeRampTooNarrow`), keeping the
-    ///     gross → clean-input map monotone — on a steeper ramp the fee
-    ///     on the whole notional could grow faster than the input
-    ///     itself, and the headroom shrinks with the fee ceiling.
-    ///
-    /// @param tokenA    First token address (any order; the factory sorts
-    ///                  the pair lexicographically before storing it as
-    ///                  `pool.token0` / `pool.token1`).
-    /// @param tokenB    Second token address (any order; paired with
-    ///                  `amountB`, both repositioned in lockstep with
-    ///                  the address sort).
-    /// @param config    Full pool configuration: two-knob curve
-    ///                  shape (`aWad` depth, `lambdaWad` width), fees,
-    ///                  repeg knobs and ramp width. See `PoolConfig`
-    ///                  for individual field semantics and enforced
-    ///                  ranges.
-    /// @param amountA   Initial amount of `tokenA` to seed. When native
-    ///                  value is attached and `tokenA` is {WETH9}, this
-    ///                  side is funded by the factory from the wrapped
-    ///                  `msg.value` (see the native-value rules below).
-    /// @param amountB   Initial amount of `tokenB` to seed (same
-    ///                  native-value rule when `tokenB` is {WETH9}).
-    /// @param recipient Address that receives the freshly minted LP shares.
-    ///
-    /// @dev **Native-value seeding.** Attaching `msg.value` funds the
-    ///      {WETH9} side of the pair: the factory wraps the value and
-    ///      pays that leg itself, so the seeder needs no WETH balance
-    ///      or approval for it (the other leg is still pulled via its
-    ///      ERC-20 approval). `msg.value` must equal that side's seed
-    ///      amount EXACTLY — a genesis mint consumes the declared
-    ///      amounts in full, so a legitimate excess cannot exist and
-    ///      no refund path is provided. Reverts: `NoWethLeg` when
-    ///      value is attached but neither token is {WETH9};
-    ///      `NativeValueMismatch` when `msg.value` differs from the
-    ///      WETH-side amount. `msg.value == 0` keeps the pure ERC-20
-    ///      path for both legs, WETH9 included.
-    /// @return pool      Address of the newly created pool.
-    /// @return sharesOut Amount of LP shares minted to `recipient`. No
-    ///                   slippage guard is exposed here: a genesis mint
-    ///                   has no prior pool state to race against and
-    ///                   the seeder controls both inputs **and** the
-    ///                   initial price, so the share count is a
-    ///                   deterministic function of `(amountA, amountB)`
-    ///                   (`sqrt(xWad·yWad) − MIN_INITIAL_LIQUIDITY`).
+    /**
+     * @notice Create a public pool for `(tokenA, tokenB)` and seed its genesis liquidity in one
+     * transaction.
+     * @dev Pools exist only through the atomic create-and-seed entrypoints, so nobody can seed an
+     * empty pool first and dictate its anchor. The factory implements the mint callback: the
+     * caller approves both tokens to the factory, or approves one leg and attaches native value
+     * for a {WETH9} leg. The genesis mint seeds `priceScale = yWad / xWad` from the sorted
+     * amounts (`y` = token0, `x` = token1), burns `MIN_INITIAL_LIQUIDITY` shares and mints
+     * `sqrt(xWad · yWad) − MIN_INITIAL_LIQUIDITY` to `recipient`. No slippage guard is exposed:
+     * a genesis mint has no prior state to race and the seeder fixes both inputs and the price.
+     *
+     * Dynamic fee. Every swap pays `feeWad = floor + (base − floor) · m(r)` with
+     * `m(r) = 2r − r²` and `r = distPost / ramp` clamped to `[0, 1]`, where `distPost` is the
+     * post-swap state distance, `floor = feeFloorBps · 1e14`, `base = baseFee · 1e14` and
+     * `ramp = feeRampBps · 1e14`. Flat mode `feeRampBps == 0` charges `baseFee` on every swap
+     * and ignores `feeFloorBps`. A live ramp requires `feeRampBps ≤ MAX_FEE_RAMP_BPS`
+     * (`InvalidFeeRamp`), `1 ≤ feeFloorBps < baseFee` (`InvalidFeeFloor`) and the monotonicity
+     * guard `feeRampBps · (BPS − baseFee)² ≥ FEE_RAMP_GUARD_MULT · BPS · (baseFee − feeFloorBps)²`
+     * (`FeeRampTooNarrow`); on a narrower ramp a larger exact-in trade can return less output.
+     *
+     * Cost model. Both directions resolve the WAD fee rate on the constant-product proxy of the
+     * post-swap distance, and a quote equals the swap it describes bit-for-bit. Exact-in
+     * evaluates the proxy once at the gross input; the proxy can deviate from the true
+     * post-state distance either way, so the rate is not guaranteed LP-favourable on large
+     * swaps. Exact-out charges the maximum of the proxy fee at both ends of the realisable
+     * gross interval `[grossUp(clean, floor), grossUp(clean, base)]`, at most `base − floor`
+     * above the exact-in rate on anchor-crossing trades. That bounds the rate, not the rounding
+     * of two independent solves: `exactInput(quoteExactOut(out)) >= out` is not guaranteed.
+     *
+     * Sizing the ramp (`feeFloorBps = 20`, `baseFee = 100`). Resolved fee in bps for a few
+     * anchor deviations and ramp widths; see `EquilibraSwapMath.smoothstepFeeWad` for the
+     * derivation:
+     *
+     *   priceMove |  ramp=   10 |  ramp=  100 |  ramp= 1000 |  ramp=10000
+     *   (% anch)  |     feeBps  |     feeBps  |     feeBps  |     feeBps
+     *   ----------+-------------+-------------+-------------+-------------
+     *       1.00% |     35.06   |     21.58   |     20.16   |     20.02
+     *       2.00% |     70.44   |     26.15   |     20.63   |     20.06
+     *       5.00% |    100.00   |     53.56   |     23.76   |     20.38
+     *      10.00% |    100.00   |     99.34   |     33.88   |     21.45
+     *      20.00% |    100.00   |    100.00   |     64.44   |     25.24
+     *      50.00% |    100.00   |    100.00   |    100.00   |     44.44
+     *     100.00% |    100.00   |    100.00   |    100.00   |     80.00
+     *     162.00% |    100.00   |    100.00   |    100.00   |    100.00
+     *
+     * Each column is one `feeRampBps` setting; rows are the anchor deviation produced by the
+     * swap. Narrow ramps (`feeRampBps ≤ 100`) are aggressive: a 1-2% move already pushes the
+     * fee close to the ceiling. Wide ramps (`feeRampBps ≥ 1000`) act as a soft floor where most
+     * realistic swaps stay near `feeFloorBps`. `feeRampBps = 10000` is not "max fees": it is
+     * the widest smoothstep, so most swaps pay close to `feeFloorBps`; to bias fees high, pick
+     * a small `feeRampBps` (`≤ 100`) instead.
+     *
+     * Native value. `msg.value != 0` funds the {WETH9} leg: the factory wraps it and pays that
+     * leg from its own balance; the other leg is pulled through its approval. Reverts
+     * `NoWethLeg` when neither token is {WETH9} and `NativeValueMismatch` when `msg.value`
+     * differs from that leg's amount (a genesis mint consumes the declared amounts in full, so
+     * no refund path exists). `msg.value == 0` pulls both legs as ERC-20s, {WETH9} included.
+     *
+     * Also reverts `IdenticalTokens` for `tokenA == tokenB`, `ZeroAddress` for a zero token and
+     * the `Invalid*` / `FeeRampTooNarrow` / `RepegShareExceedsBudget` errors listed on
+     * {PoolConfig}. The pool's genesis mint rejects a seed ratio that rounds to zero or, for
+     * public pools, lies outside `(MIN_PUBLIC_INITIAL_PRICE_SCALE_WAD,
+     * MAX_PUBLIC_INITIAL_PRICE_SCALE_WAD)` (`InvalidPriceScale`), a geometric mean at or below
+     * `MIN_INITIAL_LIQUIDITY` (`MathInvariantViolation`) and a genesis unit value farther than
+     * `MAX_GENESIS_VP_ERROR_WAD` from `2·WAD` (`GenesisVpImprecise`).
+     * @param tokenA First token, in either order; the factory sorts the pair into
+     * `token0 < token1`.
+     * @param tokenB Second token, in either order.
+     * @param config Full pool configuration; see {PoolConfig} for field semantics and ranges.
+     * @param amountA Seed amount of `tokenA` in raw token units; funded from `msg.value` when
+     * `tokenA` is {WETH9} and native value is attached.
+     * @param amountB Seed amount of `tokenB` in raw token units, under the same {WETH9} rule.
+     * @param recipient Receiver of the genesis LP shares.
+     * @return pool Address of the new clone.
+     * @return sharesOut LP shares minted to `recipient`.
+     */
     function createPoolAndAddLiquidity(
         address tokenA,
         address tokenB,
@@ -321,24 +227,23 @@ interface IEquilibraFactory {
         address recipient
     ) external payable returns (address pool, uint256 sharesOut);
 
-    /// @notice {createPoolAndAddLiquidity} for a PRIVATE pool: every
-    ///         later mint must name a recipient on the pool's LP
-    ///         allowlist ({isLpAllowed}), curated by the pool admin
-    ///         (the creator — see {paramTimelock}'s `poolAdmin`).
-    /// @dev The creator and the genesis `recipient` are allowlisted by
-    ///      this call, so the seeding mint and the admin's own later
-    ///      mints need no extra step. Privacy is immutable for the
-    ///      pool's lifetime. Private pools also run the parameter
-    ///      timelock on the short delay (see
-    ///      `EquilibraParamTimelock.PRIVATE_DELAY`): their LP set is
-    ///      known and consented, so the public exit window is not the
-    ///      protection it is for an open pool.
-    ///      Scope: the allowlist gates MINTING. LP shares stay ERC20-
-    ///      transferable, so an allowlisted LP can pass shares to an
-    ///      outsider; the gate bounds who may join by depositing, not
-    ///      who may hold.
-    ///      Accepts native-value seeding under the exact rules of
-    ///      {createPoolAndAddLiquidity}.
+    /**
+     * @notice {createPoolAndAddLiquidity} for a private pool: every mint into it must name a
+     * recipient on the pool's LP allowlist.
+     * @dev Same validation, seeding and native-value rules as the public entrypoint, except that
+     * `emaPeriod` may go down to `MIN_EMA_PERIOD` and the genesis mint skips the public
+     * price-scale window. The creator and `recipient` are allowlisted by this call. Privacy is
+     * immutable for the pool's lifetime and selects {paramTimelock}'s `PRIVATE_DELAY` for
+     * parameter changes. The allowlist gates minting only: LP shares stay ERC-20 transferable.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param config Full pool configuration; see {PoolConfig}.
+     * @param amountA Seed amount of `tokenA` in raw token units.
+     * @param amountB Seed amount of `tokenB` in raw token units.
+     * @param recipient Receiver of the genesis LP shares; allowlisted by this call.
+     * @return pool Address of the new clone.
+     * @return sharesOut LP shares minted to `recipient`.
+     */
     function createPrivatePoolAndAddLiquidity(
         address tokenA,
         address tokenB,
@@ -348,55 +253,83 @@ interface IEquilibraFactory {
         address recipient
     ) external payable returns (address pool, uint256 sharesOut);
 
-    /// @notice Canonical wrapped-native token used by native-value
-    ///         seeding (immutable, set at construction — the same
-    ///         chain config the router's WETH9 pins).
+    /**
+     * @notice Wrapped-native token whose seed leg attached native value can fund; immutable, set
+     * at construction.
+     * @return Address of the WETH9 contract.
+     */
     function WETH9() external view returns (address);
 
-    /// @notice Whether `pool` was created private (mint-gated).
-    ///         Immutable per pool.
+    /**
+     * @notice Whether `pool` was created private, i.e. its mints are gated by the LP allowlist.
+     * Immutable per pool.
+     * @param pool Pool to query.
+     * @return `true` for a private pool; `false` for a public pool or an unknown address.
+     */
     function isPrivatePool(address pool) external view returns (bool);
 
-    /// @notice Whether `account` may receive freshly minted LP of
-    ///         `pool`. Always `true` for public pools — the pool only
-    ///         consults this when its own privacy flag is set.
+    /**
+     * @notice Whether `account` may receive freshly minted LP shares of `pool`.
+     * @dev Always `true` for public pools; a pool consults this view only when its privacy flag
+     * is set.
+     * @param pool Pool whose allowlist applies.
+     * @param account Prospective mint recipient.
+     * @return `true` when minting to `account` is permitted.
+     */
     function isLpAllowed(address pool, address account) external view returns (bool);
 
-    /// @notice Every account explicitly on `pool`'s LP allowlist.
-    ///         Unordered (removals swap-and-pop) and empty for public
-    ///         pools — {isLpAllowed} is the policy answer, this view is
-    ///         the raw membership list.
+    /**
+     * @notice Every account explicitly on `pool`'s LP allowlist.
+     * @dev Unordered (removals swap-and-pop) and empty for public pools; {isLpAllowed} is the
+     * policy answer, this is the raw membership list.
+     * @param pool Pool to query.
+     * @return Allowlisted accounts.
+     */
     function getLpAllowlist(address pool) external view returns (address[] memory);
 
-    /// @notice Number of accounts on `pool`'s LP allowlist.
+    /**
+     * @notice Number of accounts on `pool`'s LP allowlist.
+     * @param pool Pool to query.
+     * @return Allowlist size.
+     */
     function getLpAllowlistLength(address pool) external view returns (uint256);
 
-    /// @notice Add or remove accounts on a private pool's LP allowlist.
-    ///         Pool admin only (the creator, or whoever the two-step
-    ///         handover on {paramTimelock} moved the role to).
-    /// @dev Reverts `NotPrivatePool` for public pools — a public pool's
-    ///      allowlist would be meaningless state, and silently writing
-    ///      it would suggest a gate that does not exist.
+    /**
+     * @notice Add or remove accounts on a private pool's LP allowlist.
+     * @dev Callable only by the pool admin resolved live from {paramTimelock} (`NotPoolAdmin`
+     * otherwise), so the two-step handover and renounce govern the allowlist too. Reverts
+     * `NotPrivatePool` for public pools. Every entry emits {PoolLpAllowlistUpdated}, including
+     * no-op re-sets.
+     * @param pool Private pool whose allowlist is edited.
+     * @param accounts Accounts to add or remove.
+     * @param allowed `true` to add, `false` to remove.
+     */
     function setLpAllowed(address pool, address[] calldata accounts, bool allowed) external;
 
     // ============ View Functions ============
 
-    /// @notice Get all pools for a token pair
-    /// @dev Pair lookup is order-independent — the factory sorts
-    ///      `(tokenA, tokenB)` internally before hashing the key.
+    /**
+     * @notice All pools of a token pair, ordered by pair-local index.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @return Pool addresses; empty for an unknown pair.
+     */
     function getPoolsByPair(
         address tokenA,
         address tokenB
     ) external view returns (address[] memory);
 
-    /// @notice Get a page of pools for a token pair
-    /// @dev Pair lookup is order-independent.
-    /// @param tokenA First token address (any order)
-    /// @param tokenB Second token address (any order)
-    /// @param offset Start index
-    /// @param limit Max number of items to return
-    /// @return page Pools in requested page
-    /// @return remaining Number of pools remaining after this page
+    /**
+     * @notice A page of the pools of a token pair.
+     * @dev An `offset` past the end returns an empty page with `remaining == 0`; `limit == 0`
+     * returns an empty page with the full remainder.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param offset Pair-local index of the first pool in the page.
+     * @param limit Maximum number of pools in the page.
+     * @return page Pools at indices `[offset, min(offset + limit, total))`.
+     * @return remaining Number of pools after the page.
+     */
     function getPoolsByPairPage(
         address tokenA,
         address tokenB,
@@ -404,129 +337,233 @@ interface IEquilibraFactory {
         uint256 limit
     ) external view returns (address[] memory page, uint256 remaining);
 
-    /// @notice Get number of pools for a token pair
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Number of pools of a token pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @return Pool count; `0` for an unknown pair.
+     */
     function getPoolCountForPair(address tokenA, address tokenB) external view returns (uint256);
 
-    /// @notice Get pool for a token pair by index
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Pool of a token pair by pair-local index.
+     * @dev Reverts on an out-of-range index.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param index Pair-local index in `[0, getPoolCountForPair)`.
+     * @return pool Pool at `index`.
+     */
     function getPoolAt(
         address tokenA,
         address tokenB,
         uint256 index
     ) external view returns (address pool);
 
-    /// @notice Get whitelisted pools for a token pair
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Owner-whitelisted pools of a token pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @return Whitelisted pool addresses, unordered.
+     */
     function getWhitelistedPoolsByPair(
         address tokenA,
         address tokenB
     ) external view returns (address[] memory);
 
-    /// @notice Get whitelisted pool count for a token pair
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Number of owner-whitelisted pools of a token pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @return Whitelisted pool count.
+     */
     function getWhitelistedPoolCountForPair(
         address tokenA,
         address tokenB
     ) external view returns (uint256);
 
-    /// @notice Get whitelisted pool for a token pair by index
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Owner-whitelisted pool of a token pair by index into the unordered whitelist set.
+     * @dev Reverts on an out-of-range index; removals swap-and-pop, so indices are not stable.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param index Index in `[0, getWhitelistedPoolCountForPair)`.
+     * @return pool Pool at `index`.
+     */
     function getWhitelistedPoolAt(
         address tokenA,
         address tokenB,
         uint256 index
     ) external view returns (address pool);
 
-    /// @notice Bind or rebind the verified Boost wrapper of `pool`.
-    ///         Owner-only curation: it does not gate Boost deployment —
-    ///         it attests the canonical stack. The vault must wrap
-    ///         exactly this pool (`BoostPoolMismatch` otherwise); the
-    ///         pool must belong to this factory (`PoolNotFound`).
+    /**
+     * @notice Bind or rebind the verified Boost share vault of `pool`. Owner only.
+     * @dev Curation, not permission: anyone may deploy a Boost stack over any pool; a binding is
+     * the owner's attestation of the canonical stack. Reverts `ZeroAddress` for a zero argument,
+     * `PoolNotFound` when `pool` is not a pool of this factory (membership in the pair set is
+     * the provenance check; the pool's self-reported metadata only selects the pair) and
+     * `BoostPoolMismatch` when `boostVault.pool() != pool`.
+     * @param pool Pool created by this factory.
+     * @param boostVault Share vault of the Boost stack wrapping `pool`.
+     */
     function setPoolBoost(address pool, address boostVault) external;
 
-    /// @notice Remove the verified Boost binding of `pool`
-    ///         (`BoostNotBound` when there is none). Owner-only.
+    /**
+     * @notice Remove the verified Boost binding of `pool`. Owner only.
+     * @dev Reverts `BoostNotBound` when no binding exists.
+     * @param pool Pool whose binding is removed.
+     */
     function removePoolBoost(address pool) external;
 
-    /// @notice Verified Boost share vault of `pool` (0 = none).
+    /**
+     * @notice Verified Boost share vault of `pool`.
+     * @param pool Pool to query.
+     * @return boostVault Bound share vault, `address(0)` when none.
+     */
     function getPoolBoost(address pool) external view returns (address boostVault);
 
-    /// @notice All pools with a verified Boost binding.
+    /**
+     * @notice All pools with a verified Boost binding.
+     * @return pools Bound pools, unordered.
+     */
     function getBoostedPools() external view returns (address[] memory pools);
 
-    /// @notice Count / indexed access over the boosted-pool set.
+    /**
+     * @notice Number of pools with a verified Boost binding.
+     * @return count Size of the boosted-pool set.
+     */
     function getBoostedPoolCount() external view returns (uint256 count);
 
+    /**
+     * @notice Boosted pool by index into the unordered boosted-pool set.
+     * @dev Reverts on an out-of-range index; removals swap-and-pop, so indices are not stable.
+     * @param index Index in `[0, getBoostedPoolCount)`.
+     * @return pool Pool at `index`.
+     */
     function getBoostedPoolAt(uint256 index) external view returns (address pool);
 
-    /// @notice Check whether a pool is whitelisted for a token pair
-    /// @dev Pair lookup is order-independent.
+    /**
+     * @notice Whether `pool` is on the owner-curated whitelist of a token pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param pool Pool to query.
+     * @return `true` when whitelisted for the pair.
+     */
     function isPoolWhitelisted(
         address tokenA,
         address tokenB,
         address pool
     ) external view returns (bool);
 
-    /// @notice Get all pools created by an address
+    /**
+     * @notice All pools created by `creator`, in creation order.
+     * @param creator Address that called a create entrypoint.
+     * @return Pool addresses.
+     */
     function getPoolsByCreator(address creator) external view returns (address[] memory);
 
-    /// @notice Get number of pools created by an address
+    /**
+     * @notice Number of pools created by `creator`.
+     * @param creator Address that called a create entrypoint.
+     * @return Pool count.
+     */
     function getPoolsByCreatorCount(address creator) external view returns (uint256);
 
-    /// @notice Get pool at the **global** index across all pairs (in
-    ///         deployment order). For per-pair indexing use
-    ///         {getPoolAt}.
+    /**
+     * @notice Pool by global index across all pairs, in deployment order.
+     * @dev Reverts on an out-of-range index. See {getPoolAt} for per-pair indexing.
+     * @param index Global index in `[0, allPoolsLength)`.
+     * @return Pool at `index`.
+     */
     function allPools(uint256 index) external view returns (address);
 
-    /// @notice Total number of pools ever created by this factory
-    ///         (across all pairs).
+    /**
+     * @notice Total number of pools created by this factory across all pairs.
+     * @return Pool count.
+     */
     function allPoolsLength() external view returns (uint256);
 
-    /// @notice Compute the deterministic address of a pool without deploying.
+    /**
+     * @notice Deterministic address of the clone at `pairPoolIndex` of a token pair, whether or
+     * not it exists yet.
+     * @dev `CREATE2` of the {poolImplementation} minimal proxy with salt
+     * `keccak256(abi.encode(token0, token1, pairPoolIndex))` over the sorted pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param pairPoolIndex Pair-local index of the pool.
+     * @return Predicted pool address.
+     */
     function computePoolAddress(
         address tokenA,
         address tokenB,
         uint32 pairPoolIndex
     ) external view returns (address);
 
-    /// @notice Get pool implementation address used for cloning.
+    /**
+     * @notice Implementation every pool clone delegates to; immutable.
+     * @return Implementation address.
+     */
     function poolImplementation() external view returns (address);
 
-    /// @notice Get current protocol fee percentage
+    /**
+     * @notice Protocol share of every swap fee in percent (not bps); each pool snapshots it at
+     * creation.
+     * @return Percentage in `[0, MAX_PROTOCOL_FEE]`.
+     */
     function protocolFee() external view returns (uint8);
 
-    /// @notice Get fee collector address
+    /**
+     * @notice Recipient of collected protocol fees; read live by the pools.
+     * @return Collector address.
+     */
     function feeCollector() external view returns (address);
 
-    /// @notice Singleton param timelock: the only account allowed to
-    ///         call the pools' runtime parameter setters.
+    /**
+     * @notice Singleton parameter timelock deployed by the factory constructor: the only account
+     * allowed to call the pools' runtime parameter setters, and the registry of pool admins.
+     * @return Timelock address.
+     */
     function paramTimelock() external view returns (address);
 
-    /// @notice Get factory owner address
+    /**
+     * @notice Factory owner: sets the protocol fee and collector, curates the whitelist and the
+     * Boost registry, and may pause pools.
+     * @return Owner address.
+     */
     function owner() external view returns (address);
 
     // ============ Admin Functions ============
 
-    /// @notice Set protocol fee percentage (owner only)
-    /// @param newFee New protocol fee (% of swap fee)
+    /**
+     * @notice Set the protocol fee percentage. Owner only.
+     * @dev Reverts `InvalidProtocolFee` above `MAX_PROTOCOL_FEE`. Applies to pools created
+     * afterwards; existing pools keep the value snapshotted at their creation.
+     * @param newFee New protocol fee in percent of the swap fee.
+     */
     function setProtocolFee(uint8 newFee) external;
 
-    /// @notice Set fee collector address (owner only)
-    /// @param newCollector New fee collector address
+    /**
+     * @notice Set the protocol fee collector. Owner only.
+     * @dev Reverts `ZeroAddress` for `address(0)`. Takes effect for every pool immediately.
+     * @param newCollector New collector address.
+     */
     function setFeeCollector(address newCollector) external;
 
-    /// @notice Add a pool to whitelist for a token pair (owner only)
-    /// @dev Pair lookup is order-independent.
-    /// @param tokenA First token address (any order)
-    /// @param tokenB Second token address (any order)
-    /// @param pool Pool address to whitelist
+    /**
+     * @notice Add a pool to the owner-curated whitelist of its token pair. Owner only.
+     * @dev Reverts `ZeroAddress` for a zero pool, `PoolNotFound` when `pool` is not a pool of
+     * that pair and `PoolExists` when it is already whitelisted.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param pool Pool to whitelist.
+     */
     function addPoolToWhitelist(address tokenA, address tokenB, address pool) external;
 
-    /// @notice Remove a pool from whitelist for a token pair (owner only)
-    /// @dev Pair lookup is order-independent.
-    /// @param tokenA First token address (any order)
-    /// @param tokenB Second token address (any order)
-    /// @param pool Pool address to remove from whitelist
+    /**
+     * @notice Remove a pool from the whitelist of its token pair. Owner only.
+     * @dev Reverts `PoolNotFound` when `pool` is not whitelisted for that pair.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param pool Pool to remove.
+     */
     function removePoolFromWhitelist(address tokenA, address tokenB, address pool) external;
 }

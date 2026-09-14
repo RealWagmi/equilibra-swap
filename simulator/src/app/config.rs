@@ -4,10 +4,14 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-// v11: the accepted config set gains the tightened floors
-// `feeBps >= 5` and `emaPeriod >= 60 s` (mirrors
-// `Constants.{MIN_BASE_FEE, MIN_EMA_PERIOD}`), so previously-valid
-// dust-fee / fast-EMA presets are now rejected. Schema unchanged.
+// v13 requires an explicit probe-profit trigger in basis points, so both
+// preliminary and final arbitrage gates are part of the hashed config.
+// v12: gas price and per-AMM gas estimates are removed. Transaction gas
+// costs are outside the simulation model; arbitrage profit thresholds stay
+// explicit and unchanged. Older schemas and removed fields are rejected.
+// Current v13 accepts `feeBps >= 1`; the bound is a policy relaxation
+// with no schema-shape change. v11 originally introduced `feeBps >= 5`
+// and `emaPeriod >= 60 s`; simulation retains that private-pool envelope.
 // v10: the Equilibra dynamic fee is resolved and applied as a WAD
 // fraction (`1 bps == 1e14`) instead of integer bps — same schema,
 // different trajectories for every ramp-enabled run — and the accepted
@@ -19,7 +23,7 @@ use std::collections::HashMap;
 // `donationIntervalSec` (0/0 = disabled, the default). v7 added the
 // required `baseTokenPosition`. Older versions are rejected — there is
 // deliberately no migrator.
-pub const BENCHMARK_RUN_CONFIG_VERSION: &str = "benchmark-run-config/v11";
+pub const BENCHMARK_RUN_CONFIG_VERSION: &str = "benchmark-run-config/v13";
 /// Base assets the benchmark supports. Single source for preset-map
 /// validation here AND for shard fan-out in the orchestrator — adding a
 /// base in one place must add it everywhere.
@@ -32,20 +36,20 @@ const PRECISION: u128 = 1_000_000_000_000_000_000u128; // 1e18 (WAD)
 // `validate_run_config` enforces and that `GET /api/config/limits` publishes
 // to the Setup UI. Each constant mirrors `contracts/libraries/Constants.sol`
 // / `EquilibraFactory._validatePoolConfig`; when a bound changes on chain,
-// change it here (and only here).
+// change it here (and only here), except public-only admission policy.
 // ---------------------------------------------------------------------------
 
-/// `baseFee` ∈ [5, 2000] bps. Mirrors `Constants.{MIN_BASE_FEE, MAX_BASE_FEE}`
+/// `baseFee` ∈ [1, 2000] bps. Mirrors `Constants.{MIN_BASE_FEE, MAX_BASE_FEE}`
 /// enforced by `EquilibraFactory._validatePoolConfig`.
-pub const MIN_BASE_FEE_BPS: u64 = 5;
+pub const MIN_BASE_FEE_BPS: u64 = 1;
 pub const MAX_BASE_FEE_BPS: u64 = 2_000;
 /// `feeRampBps` ∈ [0, 10000]. Mirrors `Constants.MAX_FEE_RAMP_BPS`.
 pub const MIN_FEE_RAMP_BPS: u64 = 0;
 pub const MAX_FEE_RAMP_BPS: u64 = 10_000;
-/// `feeFloorBps` ∈ [0, MAX_BASE_FEE]; additionally capped by the live
-/// `baseFee` (relational check in `validate_run_config`).
+/// The stored `uint16 feeFloorBps` remains bounded in flat mode; a live ramp
+/// additionally requires `1 <= feeFloorBps < baseFee`.
 pub const MIN_FEE_FLOOR_BPS: u64 = 0;
-pub const MAX_FEE_FLOOR_BPS: u64 = MAX_BASE_FEE_BPS;
+pub const MAX_FEE_FLOOR_BPS: u64 = u16::MAX as u64;
 /// Ramp monotonicity guard: a live ramp must satisfy `feeRampBps ·
 /// (10000 − feeBps)² ≥ FEE_RAMP_GUARD_MULT · 10000 · (feeBps −
 /// feeFloorBps)²`. Mirrors `Constants.FEE_RAMP_GUARD_MULT`; the check
@@ -58,8 +62,8 @@ pub const MAX_REPEG_SHARE_BPS: u64 = 10_000;
 /// `Constants.MAX_PROTOCOL_FEE`.
 pub const MIN_PROTOCOL_FEE_PERCENT: u64 = 0;
 pub const MAX_PROTOCOL_FEE_PERCENT: u64 = 25;
-/// `emaPeriod` half-life ∈ [60 s, 419731 s]. The floor mirrors
-/// `Constants.MIN_EMA_PERIOD`; the ceiling bounds the STORED internal
+/// Simulation uses the private-pool half-life range [60 s, 419731 s].
+/// `Constants.MIN_EMA_PERIOD` sets the floor; the ceiling bounds the STORED internal
 /// tau = ceil(emaPeriod·1000/694) at `Constants.MAX_EMA_PERIOD`
 /// (7 days), so the largest accepted half-life INPUT is the exact
 /// floor inverse below.
@@ -69,13 +73,13 @@ pub const MAX_EMA_PERIOD_SEC: u64 = 7 * 24 * 60 * 60; // 604_800
 /// This — not the tau cap — is the user-facing input maximum the
 /// dashboard limits must publish.
 pub const MAX_EMA_HALF_LIFE_SEC: u64 = MAX_EMA_PERIOD_SEC * 694 / 1000; // 419_731
-/// `aWad` ∈ [1e17, 99e16] (0.1·W .. 0.99·W). Mirrors
+/// `aWad` ∈ [1e17, WAD-1] (0.1 <= a < 1). Mirrors
 /// `Constants.A_MIN_WAD..A_MAX_WAD`.
 pub const A_MIN_WAD: u128 = 100_000_000_000_000_000u128;
-pub const A_MAX_WAD: u128 = 990_000_000_000_000_000u128;
-/// `lambdaWad` ∈ [1e15, 1e18]. Mirrors
+pub const A_MAX_WAD: u128 = PRECISION - 1;
+/// `lambdaWad` ∈ [1e12, 1e18]. Mirrors
 /// `Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD`.
-pub const LAMBDA_MIN_WAD: u128 = 1_000_000_000_000_000u128;
+pub const LAMBDA_MIN_WAD: u128 = 1_000_000_000_000u128;
 pub const LAMBDA_MAX_WAD: u128 = 1_000_000_000_000_000_000u128;
 /// `repegStepWad` ∈ [1, WAD]. Mirrors `Constants.{MIN,MAX}_REPEG_STEP`.
 pub const REPEG_STEP_MIN_WAD: u128 = 1;
@@ -88,8 +92,6 @@ pub const MIN_PROGRESS_INTERVAL_SEC: u64 = 1;
 pub const MAX_PROGRESS_INTERVAL_SEC: u64 = 86_400;
 
 const MAX_USD_INPUT: f64 = 1_000_000_000.0;
-const MAX_GAS_PRICE_GWEI: f64 = 1_000_000.0;
-const MAX_GAS_USED_ESTIMATE: u128 = 100_000_000;
 const CURVE_MIN_A: u64 = 4_000;
 const CURVE_MAX_A: u64 = 40_000_000;
 const CURVE_MIN_GAMMA: u128 = 10_000_000_000;
@@ -187,11 +189,10 @@ pub struct UserCfg {
 pub struct ArbitrageurCfg {
     pub min_profit_usd: f64,
     pub min_profit_bps: f64,
-    pub gas_price_gwei: f64,
     pub max_search_iterations: u64,
     pub probe_usd: f64,
+    pub probe_trigger_bps: f64,
     pub min_trade_usd: f64,
-    pub gas_used_estimates: HashMap<String, String>,
     pub post_arb_external_swaps: PostArbExternalSwapsCfg,
 }
 
@@ -277,15 +278,14 @@ pub struct EquilibraPresetCfg {
     /// Depth-at-anchor knob `a` (WAD-scaled). At `D = 0` the
     /// amplification `A = a` — larger `aWad` deepens the central
     /// plateau. Decoupled from `lambdaWad`. Bounded by
-    /// `Constants.A_MIN_WAD..A_MAX_WAD` (`1e17 .. 99e16`, i.e.
-    /// `0.1·W .. 0.99·W`); `a == W` is forbidden because it makes
-    /// the L-quadratic ill-conditioned.
+    /// `Constants.A_MIN_WAD..A_MAX_WAD` (`1e17 .. WAD-1`).
+    /// `a == WAD` is excluded: balanced marginal curvature vanishes.
     pub a_wad: String,
     /// Plateau-width knob `λ` (WAD-scaled). At `λ·D = W` the
     /// amplification halves (`A = a/2`). Larger `lambdaWad` narrows
     /// the plateau (faster transition to CP tail); smaller widens
     /// it. Bounded by `Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD`
-    /// (`1e15 .. 1e18`).
+    /// (`1e12 .. 1e18`).
     pub lambda_wad: String,
     /// Ceiling of the dynamic-fee smoothstep ramp in BPS. Mirrors
     /// `PoolConfig.baseFee` on-chain.
@@ -325,10 +325,8 @@ pub struct EquilibraPresetCfg {
     /// `BPS - repegShareBps` stays committed to LPs as part of the
     /// gate threshold. `0` disables auto-repeg entirely; `10_000`
     /// lets every accrued unit fund repegs. Required — must come
-    /// from the canonical preset. Calibration: without a donation
-    /// stream (or with a dust-scale one, as in the WBTC preset)
-    /// prefer ~70%; with a donation stream of 3–4% of TVL per year
-    /// prefer ~50–55%.
+    /// from the canonical preset. Both WETH and WBTC default to
+    /// 70%; per-run calibration may override the share.
     pub repeg_share_bps: u64,
     /// Annual donation stream into the pool's donation-parachute
     /// buffer, in BPS of pool TVL per year (0 = disabled — the
@@ -411,11 +409,11 @@ fn default_post_arb_external_swaps_count() -> u64 {
 }
 
 fn default_post_arb_external_swaps_share_bps() -> u64 {
-    2_500
+    1_500
 }
 
 fn default_post_arb_external_swaps_min_amount_usd() -> f64 {
-    0.1
+    0.05
 }
 
 fn default_post_arb_external_swaps_abnormal_loss_factor() -> f64 {
@@ -433,11 +431,6 @@ fn parse_u128_decimal(value: &str, label: &str) -> Result<u128> {
 }
 
 pub fn build_default_config(oracle_start_ts: u64, oracle_end_ts: u64) -> BenchmarkRunConfig {
-    let mut gas_used_estimates = HashMap::<String, String>::new();
-    gas_used_estimates.insert("equilibra".to_string(), string_u256(160_475));
-    gas_used_estimates.insert("uniswapV2".to_string(), string_u256(80_543));
-    gas_used_estimates.insert("curve".to_string(), string_u256(170_329));
-
     let mut eq_presets = HashMap::<String, EquilibraPresetCfg>::new();
     eq_presets.insert(
         "WETH".to_string(),
@@ -477,7 +470,7 @@ pub fn build_default_config(oracle_start_ts: u64, oracle_end_ts: u64) -> Benchma
             rebalance_enabled: true,
             fee_ramp_bps: 5000,
             fee_floor_bps: 136,
-            repeg_share_bps: 5_500, // 55/45 repeg-budget vs retained-growth split
+            repeg_share_bps: 7_000, // 70/30 repeg-budget vs retained-growth split
             donation_apr_bps: 344,
             donation_interval_sec: 2_592_000,
         },
@@ -519,9 +512,8 @@ pub fn build_default_config(oracle_start_ts: u64, oracle_end_ts: u64) -> Benchma
     // makes the shape stable — the step and both dead-bands are then inert
     // and sit at their minimum legal value rather than at a meaningful one.
     // `fee_floor_bps == fee_bps` is accepted only because the ramp is off;
-    // pairing it with `fee_ramp_bps != 0` is rejected at deploy time
-    // (`FeeRampNoHeadroom`). Every field is required — a partial preset is
-    // a parse error, not a merge with the defaults.
+    // a live ramp would reject it as `InvalidFeeFloor`. Every field is
+    // required: a partial preset is a parse error, not a defaults merge.
     //
     // Pinned by `constant_product_hint_preset_validates`.
     eq_presets.insert(
@@ -614,19 +606,18 @@ pub fn build_default_config(oracle_start_ts: u64, oracle_end_ts: u64) -> Benchma
             },
             arbitrageur: ArbitrageurCfg {
                 min_profit_usd: 1.0,
-                min_profit_bps: 5.0,
-                gas_price_gwei: 0.05,
-                // Cap on golden-section refinements (arb-golden-search/v2:
-                // the tolerance break is the real stop, this is only the
-                // ceiling). 1000 makes the ceiling inert by construction:
+                min_profit_bps: 1.0,
+                // Cap on golden-section refinements: the tolerance break
+                // is the real stop, this is only the ceiling. 1000 makes
+                // the ceiling inert by construction:
                 // golden-section over a u128 bracket shrinks the interval
                 // below any tolerance within ~185 refinements, so every
                 // search exits on the 1% interval-convergence criterion and
                 // never on the iteration cap.
                 max_search_iterations: 1000,
                 probe_usd: 100.0,
+                probe_trigger_bps: 1.0,
                 min_trade_usd: 50.0,
-                gas_used_estimates,
                 post_arb_external_swaps: PostArbExternalSwapsCfg::default(),
             },
         },
@@ -695,10 +686,9 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
             "actors.user.maxTradeUsd must be >= actors.user.minTradeUsd"
         ));
     }
-    // Numeric sanity: every value that reaches a size / cost / profit
+    // Numeric sanity: every value that reaches a size / profit
     // computation must be finite and in a sane range, so a negative or
-    // NaN input can never silently corrupt a run (e.g. a negative gas
-    // price reaching the arbitrage profit calculation as negative cost).
+    // NaN input can never silently corrupt a run.
     for (label, v) in [
         ("actors.user.minTradeUsd", cfg.actors.user.min_trade_usd),
         ("actors.user.maxTradeUsd", cfg.actors.user.max_trade_usd),
@@ -715,8 +705,8 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
             cfg.actors.arbitrageur.min_profit_bps,
         ),
         (
-            "actors.arbitrageur.gasPriceGwei",
-            cfg.actors.arbitrageur.gas_price_gwei,
+            "actors.arbitrageur.probeTriggerBps",
+            cfg.actors.arbitrageur.probe_trigger_bps,
         ),
         (
             "actors.arbitrageur.probeUsd",
@@ -759,9 +749,9 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
             10_000.0,
         ),
         (
-            "actors.arbitrageur.gasPriceGwei",
-            cfg.actors.arbitrageur.gas_price_gwei,
-            MAX_GAS_PRICE_GWEI,
+            "actors.arbitrageur.probeTriggerBps",
+            cfg.actors.arbitrageur.probe_trigger_bps,
+            10_000.0,
         ),
     ] {
         if v > max {
@@ -827,30 +817,6 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
     }
     if cfg.amms.uniswap_v2.fee_bps >= 10_000 {
         return Err(anyhow!("amms.uniswapV2.feeBps must be in [0,9999]"));
-    }
-    const GAS_KEYS: [&str; 3] = ["equilibra", "uniswapV2", "curve"];
-    for key in cfg.actors.arbitrageur.gas_used_estimates.keys() {
-        if !GAS_KEYS.contains(&key.as_str()) {
-            return Err(anyhow!(
-                "actors.arbitrageur.gasUsedEstimates contains unsupported key `{key}`"
-            ));
-        }
-    }
-    for key in GAS_KEYS {
-        let raw = cfg
-            .actors
-            .arbitrageur
-            .gas_used_estimates
-            .get(key)
-            .ok_or_else(|| {
-                anyhow!("actors.arbitrageur.gasUsedEstimates is missing required key `{key}`")
-            })?;
-        let gas = parse_u128_decimal(raw, &format!("actors.arbitrageur.gasUsedEstimates.{key}"))?;
-        if gas == 0 || gas > MAX_GAS_USED_ESTIMATE {
-            return Err(anyhow!(
-                "actors.arbitrageur.gasUsedEstimates.{key} must be in [1,{MAX_GAS_USED_ESTIMATE}]"
-            ));
-        }
     }
     let enabled_count = u8::from(cfg.amms.equilibra.enabled)
         + u8::from(cfg.amms.uniswap_v2.enabled)
@@ -999,9 +965,9 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
             ("repegThresholdToken1UpWad", repeg_threshold_up_wad),
             ("repegThresholdToken1DownWad", repeg_threshold_down_wad),
         ] {
-            if !(REPEG_STEP_MIN_WAD..=REPEG_STEP_MAX_WAD).contains(&value) {
+            if !(REPEG_STEP_MIN_WAD..REPEG_STEP_MAX_WAD).contains(&value) {
                 return Err(anyhow!(
-                    "amms.equilibra.presets.{}.{} must be in [1, 1e18]",
+                    "amms.equilibra.presets.{}.{} must be in [1, 1e18)",
                     base,
                     label
                 ));
@@ -1009,8 +975,8 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
         }
         // Two-knob bounds mirror `Constants.{A_MIN_WAD..A_MAX_WAD,
         // LAMBDA_MIN_WAD..LAMBDA_MAX_WAD}` on-chain. The kernel uses
-        // `A = a·W / (W + λ·D)` — `aWad` ∈ [1e17, 99e16] (0.1·W .. 0.99·W),
-        // `lambdaWad` ∈ [1e15, 1e18].
+        // `A = a·W / (W + λ·D)` — `aWad` ∈ [1e17, WAD-1] (0.1 <= a < 1),
+        // `lambdaWad` ∈ [1e12, 1e18].
         let a_wad = preset.a_wad.parse::<u128>().map_err(|_| {
             anyhow!(
                 "amms.equilibra.presets.{}.aWad must be a valid u128 decimal string",
@@ -1019,7 +985,7 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
         })?;
         if !(A_MIN_WAD..=A_MAX_WAD).contains(&a_wad) {
             return Err(anyhow!(
-                "amms.equilibra.presets.{}.aWad must be in [1e17, 99e16] (0.1·W .. 0.99·W)",
+                "amms.equilibra.presets.{}.aWad must be in [100000000000000000, 999999999999999999]",
                 base
             ));
         }
@@ -1031,15 +997,15 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
         })?;
         if !(LAMBDA_MIN_WAD..=LAMBDA_MAX_WAD).contains(&lambda_wad) {
             return Err(anyhow!(
-                "amms.equilibra.presets.{}.lambdaWad must be in [1e15, 1e18]",
+                "amms.equilibra.presets.{}.lambdaWad must be in [1e12, 1e18]",
                 base
             ));
         }
         // Dynamic-fee bounds mirror `EquilibraFactory._validatePoolConfig`:
         //   feeBps ∈ [MIN_BASE_FEE, MAX_BASE_FEE]
         //   feeRampBps ∈ [0, MAX_FEE_RAMP_BPS]
-        //   feeFloorBps ≤ feeBps (ceiling)
-        //   feeRampBps != 0 ⇒ feeBps > feeFloorBps (strict headroom)
+        //   feeFloorBps <= uint16::MAX in every mode
+        //   feeRampBps != 0 ⇒ 1 ≤ feeFloorBps < feeBps; otherwise ignored
         //   repegShareBps ∈ [0, MAX_REPEG_SHARE_BPS]
         //   emaPeriod ∈ [MIN_EMA_PERIOD, MAX_EMA_PERIOD]
         if !(MIN_BASE_FEE_BPS..=MAX_BASE_FEE_BPS).contains(&preset.fee_bps) {
@@ -1061,55 +1027,46 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
                 preset.ema_period
             ));
         }
-        if preset.fee_ramp_bps > MAX_FEE_RAMP_BPS {
+        if preset.fee_floor_bps > MAX_FEE_FLOOR_BPS {
             return Err(anyhow!(
-                "amms.equilibra.presets.{}.feeRampBps must be in [0, {MAX_FEE_RAMP_BPS}]",
-                base
-            ));
-        }
-        if preset.fee_floor_bps > preset.fee_bps {
-            return Err(anyhow!(
-                "amms.equilibra.presets.{}.feeFloorBps ({}) must be <= feeBps ({})",
+                "amms.equilibra.presets.{}.feeFloorBps ({}) must be <= {MAX_FEE_FLOOR_BPS} (uint16)",
                 base,
-                preset.fee_floor_bps,
-                preset.fee_bps
-            ));
-        }
-        // Smoothstep ramp requires strict headroom: `baseFee > feeFloorBps`
-        // whenever `feeRampBps != 0`. Mirrors {EquilibraFactory.FeeRampNoHeadroom};
-        // a config the contract would refuse must not survive setup here either.
-        if preset.fee_ramp_bps != 0 && preset.fee_bps == preset.fee_floor_bps {
-            return Err(anyhow!(
-                "amms.equilibra.presets.{}.feeRampBps ({}) requires feeBps ({}) > feeFloorBps ({}); the smoothstep ramp has no headroom to interpolate",
-                base,
-                preset.fee_ramp_bps,
-                preset.fee_bps,
                 preset.fee_floor_bps
             ));
         }
-        // Mirrors `EquilibraFactory.FeeRampTooNarrow` (monotonicity
-        // guard, shared helper with the runtime quoter): a live ramp
-        // must satisfy `feeRampBps · (10000 − feeBps)² ≥
-        // FEE_RAMP_GUARD_MULT · 10000 · (feeBps − feeFloorBps)²`,
-        // otherwise the terminal rate climbs faster than the gross
-        // input grows and a larger exact-in trade returns less output.
-        if !crate::runtime_quoter::equilibra::fee_ramp_guard_ok(
-            preset.fee_bps as u128,
-            preset.fee_floor_bps as u128,
-            preset.fee_ramp_bps as u128,
-        ) {
-            let span = (preset.fee_bps - preset.fee_floor_bps) as u128;
-            let inv = 10_000u128 - preset.fee_bps as u128;
-            return Err(anyhow!(
-                "amms.equilibra.presets.{}.feeRampBps ({}) is too narrow for the fee span \
-                 ({} bps at ceiling {} bps): the minimum monotone ramp is \
-                 ceil({FEE_RAMP_GUARD_MULT} · 10000 · span² / (10000 − feeBps)²) = {}",
-                base,
-                preset.fee_ramp_bps,
-                span,
-                preset.fee_bps,
-                (FEE_RAMP_GUARD_MULT * 10_000 * span * span).div_ceil(inv * inv)
-            ));
+        if preset.fee_ramp_bps != 0 {
+            if preset.fee_ramp_bps > MAX_FEE_RAMP_BPS {
+                return Err(anyhow!(
+                    "amms.equilibra.presets.{}.feeRampBps must be in [0, {MAX_FEE_RAMP_BPS}]",
+                    base
+                ));
+            }
+            if preset.fee_floor_bps == 0 || preset.fee_floor_bps >= preset.fee_bps {
+                return Err(anyhow!(
+                    "amms.equilibra.presets.{}.feeFloorBps ({}) must satisfy 1 <= feeFloorBps < feeBps ({}) when feeRampBps is nonzero",
+                    base,
+                    preset.fee_floor_bps,
+                    preset.fee_bps
+                ));
+            }
+            if !crate::runtime_quoter::equilibra::fee_ramp_guard_ok(
+                preset.fee_bps as u128,
+                preset.fee_floor_bps as u128,
+                preset.fee_ramp_bps as u128,
+            ) {
+                let span = (preset.fee_bps - preset.fee_floor_bps) as u128;
+                let inv = 10_000u128 - preset.fee_bps as u128;
+                return Err(anyhow!(
+                    "amms.equilibra.presets.{}.feeRampBps ({}) is too narrow for the fee span \
+                     ({} bps at ceiling {} bps): the minimum monotone ramp is \
+                     ceil({FEE_RAMP_GUARD_MULT} · 10000 · span² / (10000 − feeBps)²) = {}",
+                    base,
+                    preset.fee_ramp_bps,
+                    span,
+                    preset.fee_bps,
+                    (FEE_RAMP_GUARD_MULT * 10_000 * span * span).div_ceil(inv * inv)
+                ));
+            }
         }
         if preset.repeg_share_bps > MAX_REPEG_SHARE_BPS {
             return Err(anyhow!(
@@ -1134,39 +1091,6 @@ pub fn validate_run_config(value: &Value) -> Result<BenchmarkRunConfig> {
                 preset.repeg_share_bps,
                 preset.protocol_fee_percent
             ));
-        }
-        // Mirrors `EquilibraFactory.RepegThresholdExceedsFeeScale` (stall
-        // guard): with auto-repeg live, the activation threshold must
-        // stay at or below the fee scale — the floor when the smoothstep
-        // ramp is live, the flat base fee otherwise (1 bps == 1e14
-        // WAD). A threshold above the fee scale yields a pool whose
-        // repeg can never afford its first permitted move from its own
-        // flow. Skipped when `repegShareBps == 0` (threshold is inert).
-        if preset.repeg_share_bps != 0 {
-            let fee_scale_bps = if preset.fee_ramp_bps == 0 {
-                preset.fee_bps
-            } else {
-                preset.fee_floor_bps
-            };
-            let threshold_cap_wad = (fee_scale_bps as u128) * 100_000_000_000_000u128; // bps → WAD
-            for (label, value) in [
-                ("repegThresholdToken1UpWad", repeg_threshold_up_wad),
-                ("repegThresholdToken1DownWad", repeg_threshold_down_wad),
-            ] {
-                if value > threshold_cap_wad {
-                    return Err(anyhow!(
-                        "amms.equilibra.presets.{}.{} ({}) exceeds the fee scale \
-                         ({} bps → cap {}): a threshold above the fee scale can never fund its \
-                         first repeg — lower the threshold, raise the fee, or disable \
-                         auto-repeg (repegShareBps = 0)",
-                        base,
-                        label,
-                        value,
-                        fee_scale_bps,
-                        threshold_cap_wad
-                    ));
-                }
-            }
         }
         if preset.donation_apr_bps > 10_000 {
             return Err(anyhow!(
@@ -1302,6 +1226,82 @@ mod tests {
     }
 
     #[test]
+    fn canonical_weth_repeg_share_is_seventy_percent() {
+        let config = build_default_config(1, 2);
+        assert_eq!(config.amms.equilibra.presets["WETH"].repeg_share_bps, 7_000);
+        assert_eq!(config.amms.equilibra.presets["WBTC"].repeg_share_bps, 7_000);
+    }
+
+    #[test]
+    fn default_arbitrage_thresholds_use_sensitive_policy() {
+        let config = build_default_config(1, 2);
+        let arb = &config.actors.arbitrageur;
+        assert_eq!(arb.probe_trigger_bps, 1.0);
+        assert_eq!(arb.min_profit_bps, 1.0);
+        assert_eq!(arb.min_profit_usd, 1.0);
+        assert_eq!(arb.probe_usd, 100.0);
+        assert_eq!(arb.min_trade_usd, 50.0);
+        assert_eq!(arb.max_search_iterations, 1_000);
+        assert_eq!(arb.post_arb_external_swaps.count, 3);
+        assert_eq!(arb.post_arb_external_swaps.share_bps, 1_500);
+        assert_eq!(arb.post_arb_external_swaps.min_amount_usd, 0.05);
+    }
+
+    #[test]
+    fn probe_trigger_is_required_and_has_finite_bps_bounds() {
+        let missing = remove_required_field(
+            default_config_value(),
+            "/actors/arbitrageur",
+            "probeTriggerBps",
+        );
+        let err = validate_run_config(&missing).expect_err("probe trigger is required");
+        assert!(err.to_string().contains("probeTriggerBps"));
+
+        for bad in [-1.0, 10_000.01] {
+            let mut value = default_config_value();
+            value["actors"]["arbitrageur"]["probeTriggerBps"] = Value::from(bad);
+            let err = validate_run_config(&value).expect_err("invalid probe trigger must fail");
+            assert!(err.to_string().contains("probeTriggerBps"));
+        }
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut value = default_config_value();
+            // Non-finite numbers become null at the JSON boundary and
+            // must fail instead of silently taking a default threshold.
+            value["actors"]["arbitrageur"]["probeTriggerBps"] = Value::from(bad);
+            validate_run_config(&value).expect_err("non-finite probe trigger must fail");
+        }
+
+        for good in [0.0, 1.0, 100.0, 10_000.0] {
+            let mut value = default_config_value();
+            value["actors"]["arbitrageur"]["probeTriggerBps"] = Value::from(good);
+            let config = validate_run_config(&value).expect("valid probe trigger must pass");
+            assert_eq!(config.actors.arbitrageur.probe_trigger_bps, good);
+        }
+    }
+
+    #[test]
+    fn probe_trigger_changes_config_hash() {
+        let defaults = build_default_config(1, 2);
+        let mut custom = defaults.clone();
+        custom.actors.arbitrageur.probe_trigger_bps = 100.0;
+        assert_ne!(
+            compute_config_hash(&defaults).unwrap(),
+            compute_config_hash(&custom).unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_arbitrage_thresholds_are_not_replaced_by_defaults() {
+        let mut value = default_config_value();
+        value["actors"]["arbitrageur"]["probeTriggerBps"] = Value::from(23.0);
+        value["actors"]["arbitrageur"]["minProfitBps"] = Value::from(7.0);
+        let config = validate_run_config(&value).expect("explicit thresholds must validate");
+        assert_eq!(config.actors.arbitrageur.probe_trigger_bps, 23.0);
+        assert_eq!(config.actors.arbitrageur.min_profit_bps, 7.0);
+    }
+
+    #[test]
     fn v6_rejects_every_missing_post_arb_field_instead_of_defaulting() {
         let parent = "/actors/arbitrageur/postArbExternalSwaps";
         for field in ["count", "shareBps", "minAmountUsd", "abnormalLossFactor"] {
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[test]
     fn base_fee_bounds_are_enforced() {
-        for (bad, expect_fragment) in [(0u64, "feeBps"), (4u64, "feeBps"), (2_001u64, "feeBps")] {
+        for (bad, expect_fragment) in [(0u64, "feeBps"), (2_001u64, "feeBps")] {
             let mut value = default_config_value();
             value["amms"]["equilibra"]["presets"]["WETH"]["feeBps"] = Value::from(bad);
             // Keep floor <= ceiling so we exercise the range check, not the
@@ -1418,12 +1418,8 @@ mod tests {
         }
         // Boundary values mirror the on-chain [MIN_BASE_FEE, MAX_BASE_FEE]
         // envelope.
-        // `repegShareBps = 0` keeps the stall guard out of the way: a zero
-        // floor with a live ramp and auto-repeg enabled is rejected by the
-        // guard (cap = 0), which is not what this test exercises. Flat-fee
-        // mode (`feeRampBps = 0`) likewise keeps the ramp monotonicity
-        // guard inert — a max-span live ramp needs a far wider warm-up
-        // than the preset ships.
+        // Flat-fee mode isolates the base-fee boundaries from the ramp
+        // monotonicity guard.
         for good in [MIN_BASE_FEE_BPS, MAX_BASE_FEE_BPS] {
             let mut value = default_config_value();
             value["amms"]["equilibra"]["presets"]["WETH"]["feeBps"] = Value::from(good);
@@ -1436,50 +1432,91 @@ mod tests {
     }
 
     #[test]
-    fn repeg_stall_guard_mirrors_factory() {
-        // Live ramp: cap = feeFloorBps · 1e14. WETH preset floor =
-        // 136 bps → cap 1.36e16; a threshold just above must fail, the
-        // boundary must pass. The step cap itself is NOT stall-guarded.
-        // Each direction-split threshold is guarded independently.
-        for key in ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] {
-            let mut value = default_config_value();
-            value["amms"]["equilibra"]["presets"]["WETH"][key] = Value::from("13600000000000001");
-            let err = validate_run_config(&value).expect_err("threshold above floor cap must fail");
-            assert!(err.to_string().contains(key), "unexpected error: {err}");
-
-            let mut value = default_config_value();
-            value["amms"]["equilibra"]["presets"]["WETH"][key] = Value::from("13600000000000000"); // == cap, inclusive
-            validate_run_config(&value).expect("boundary threshold must validate");
+    fn repeg_thresholds_are_independent_of_fees() {
+        for (ramp, floor) in [(9500u64, 1u64), (0, 0)] {
+            for share in [0u64, 7000u64] {
+                for key in ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] {
+                    for threshold in ["1", "1000000000000000", "999999999999999999"] {
+                        let mut value = default_config_value();
+                        let preset = &mut value["amms"]["equilibra"]["presets"]["WETH"];
+                        preset["feeBps"] = Value::from(5u64);
+                        preset["feeRampBps"] = Value::from(ramp);
+                        preset["feeFloorBps"] = Value::from(floor);
+                        preset["repegShareBps"] = Value::from(share);
+                        preset[key] = Value::from(threshold);
+                        validate_run_config(&value).unwrap_or_else(|e| {
+                            panic!(
+                                "ramp={ramp}, floor={floor}, share={share}, {key}={threshold}: {e}"
+                            )
+                        });
+                    }
+                }
+            }
         }
+    }
 
-        // The per-repeg step cap is free of the fee-scale guard: only
-        // the [1, 1e18] range applies.
+    #[test]
+    fn flat_fee_floor_u16_boundary_is_enforced() {
         let mut value = default_config_value();
-        value["amms"]["equilibra"]["presets"]["WETH"]["repegStepWad"] =
-            Value::from("500000000000000000");
-        validate_run_config(&value).expect("large step cap must validate");
+        {
+            let preset = &mut value["amms"]["equilibra"]["presets"]["WETH"];
+            preset["feeBps"] = Value::from(MIN_BASE_FEE_BPS);
+            preset["feeRampBps"] = Value::from(0u64);
+            preset["feeFloorBps"] = Value::from(MAX_FEE_FLOOR_BPS);
+        }
+        validate_run_config(&value).expect("flat 1 bps fee accepts the uint16 floor boundary");
 
-        // Flat fee (ramp = 0): cap = baseFee · 1e14. WBTC forced flat
-        // (ramp 0, ceiling 190 bps) → cap 1.9e16.
-        let mut value = default_config_value();
-        value["amms"]["equilibra"]["presets"]["WBTC"]["feeRampBps"] = Value::from(0u64);
-        value["amms"]["equilibra"]["presets"]["WBTC"]["repegThresholdToken1UpWad"] =
-            Value::from("19000000000000001");
-        let err = validate_run_config(&value).expect_err("threshold above flat cap must fail");
-        assert!(
-            err.to_string().contains("repegThresholdToken1UpWad"),
-            "unexpected error: {err}"
-        );
+        value["amms"]["equilibra"]["presets"]["WETH"]["feeFloorBps"] =
+            Value::from(MAX_FEE_FLOOR_BPS + 1);
+        let err =
+            validate_run_config(&value).expect_err("uint16-overflow floor must fail in flat mode");
+        assert!(err
+            .to_string()
+            .contains("feeFloorBps (65536) must be <= 65535 (uint16)"));
+    }
 
-        // Auto-repeg disabled: the threshold is inert, any in-bounds
-        // value passes.
+    #[test]
+    fn live_fee_ramp_requires_a_positive_floor() {
         let mut value = default_config_value();
-        value["amms"]["equilibra"]["presets"]["WETH"]["repegShareBps"] = Value::from(0u64);
-        value["amms"]["equilibra"]["presets"]["WETH"]["repegThresholdToken1UpWad"] =
-            Value::from("500000000000000000");
-        value["amms"]["equilibra"]["presets"]["WETH"]["repegThresholdToken1DownWad"] =
-            Value::from("500000000000000000");
-        validate_run_config(&value).expect("share=0 must skip the stall guard");
+        let preset = &mut value["amms"]["equilibra"]["presets"]["WETH"];
+        preset["feeBps"] = Value::from(1u64);
+        preset["feeRampBps"] = Value::from(9500u64);
+        preset["feeFloorBps"] = Value::from(0u64);
+        let err = validate_run_config(&value).expect_err("zero live fee floor must fail");
+        assert!(err
+            .to_string()
+            .contains("feeFloorBps (0) must satisfy 1 <= feeFloorBps < feeBps (1)"));
+    }
+
+    #[test]
+    fn live_fee_ramp_requires_floor_below_its_ceiling() {
+        let mut value = default_config_value();
+        let preset = &mut value["amms"]["equilibra"]["presets"]["WETH"];
+        preset["feeBps"] = Value::from(2u64);
+        preset["feeRampBps"] = Value::from(9500u64);
+        preset["feeFloorBps"] = Value::from(2u64);
+        let err =
+            validate_run_config(&value).expect_err("live floor equal to the ceiling must fail");
+        assert!(err
+            .to_string()
+            .contains("feeFloorBps (2) must satisfy 1 <= feeFloorBps < feeBps (2)"));
+    }
+
+    #[test]
+    fn repeg_threshold_absolute_bounds_still_apply() {
+        for key in ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] {
+            for share in [0u64, 7000u64] {
+                for threshold in ["0", "1000000000000000000", "1000000000000000001"] {
+                    let mut value = default_config_value();
+                    let preset = &mut value["amms"]["equilibra"]["presets"]["WETH"];
+                    preset["repegShareBps"] = Value::from(share);
+                    preset[key] = Value::from(threshold);
+                    let err =
+                        validate_run_config(&value).expect_err("out-of-range threshold must fail");
+                    assert!(err.to_string().contains(key), "unexpected error: {err}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1495,7 +1532,7 @@ mod tests {
                 "unexpected error for emaPeriod={bad}: {err}"
             );
         }
-        for good in [MIN_EMA_PERIOD_SEC, 419_731] {
+        for good in [MIN_EMA_PERIOD_SEC, 300, 600, 419_731] {
             let mut value = default_config_value();
             value["amms"]["equilibra"]["presets"]["WBTC"]["emaPeriod"] = Value::from(good);
             validate_run_config(&value)
@@ -1579,18 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_invalid_gas_map_and_curve_parameters() {
-        let mut value = default_config_value();
-        value["actors"]["arbitrageur"]["gasUsedEstimates"]
-            .as_object_mut()
-            .expect("gas map")
-            .remove("curve");
-        assert!(validate_run_config(&value).is_err());
-
-        let mut value = default_config_value();
-        value["actors"]["arbitrageur"]["gasUsedEstimates"]["curve"] = serde_json::json!("0");
-        assert!(validate_run_config(&value).is_err());
-
+    fn validation_rejects_invalid_curve_parameters() {
         let mut value = default_config_value();
         value["amms"]["curve"]["mathMode"] = serde_json::json!("typo");
         assert!(validate_run_config(&value).is_err());
@@ -1615,14 +1641,93 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_negative_gas_price() {
-        let cfg = build_default_config(1_600_000_000, 1_700_000_000);
-        let mut value = serde_json::to_value(&cfg).expect("serialize");
-        value["actors"]["arbitrageur"]["gasPriceGwei"] = serde_json::json!(-1.0);
-        assert!(
-            validate_run_config(&value).is_err(),
-            "negative gas price must be rejected before it reaches profit math"
+    fn removed_gas_settings_are_absent_and_rejected() {
+        let defaults = default_config_value();
+        for (key, old_value) in [
+            ("gasPriceGwei", serde_json::json!(0.05)),
+            (
+                "gasUsedEstimates",
+                serde_json::json!({"equilibra": "160475", "uniswapV2": "80543", "curve": "170329"}),
+            ),
+        ] {
+            assert!(defaults["actors"]["arbitrageur"].get(key).is_none());
+            let mut value = defaults.clone();
+            value["actors"]["arbitrageur"][key] = old_value;
+            let error = validate_run_config(&value).expect_err("removed fields must be rejected");
+            assert!(error.to_string().contains(key), "{error:#}");
+        }
+        let mut old_version = defaults;
+        old_version["version"] = serde_json::json!("benchmark-run-config/v11");
+        assert!(validate_run_config(&old_version).is_err());
+    }
+
+    #[test]
+    fn a_upper_bound_is_exactly_one_wad_minus_one_without_changing_presets() {
+        assert_eq!(A_MAX_WAD, 999_999_999_999_999_999);
+        let defaults = default_config_value();
+        for value in [
+            "990000000000000000",
+            "999750062484378906",
+            "999999999999999998",
+            "999999999999999999",
+        ] {
+            let mut config = defaults.clone();
+            config["amms"]["equilibra"]["presets"]["WETH"]["aWad"] = serde_json::json!(value);
+            let parsed = validate_run_config(&config).expect("a below one remains valid");
+            assert_eq!(parsed.amms.equilibra.presets["WETH"].a_wad, value);
+        }
+        for value in ["1000000000000000000", "1000000000000000001"] {
+            let mut config = defaults.clone();
+            config["amms"]["equilibra"]["presets"]["WETH"]["aWad"] = serde_json::json!(value);
+            assert!(validate_run_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("aWad"));
+        }
+        assert_eq!(
+            defaults["amms"]["equilibra"]["presets"]["WETH"]["aWad"],
+            "909610000000000030"
         );
+        assert_eq!(
+            defaults["amms"]["equilibra"]["presets"]["WBTC"]["aWad"],
+            "909610000000000030"
+        );
+    }
+
+    #[test]
+    fn lambda_minimum_matches_kernel_and_preserves_defaults() {
+        assert_eq!(LAMBDA_MIN_WAD, 1_000_000_000_000);
+        assert_eq!(
+            LAMBDA_MIN_WAD,
+            crate::runtime_quoter::equilibra_math::LAMBDA_MIN_WAD
+        );
+        let defaults = default_config_value();
+        for alpha in [A_MIN_WAD, A_MAX_WAD] {
+            for lambda in [LAMBDA_MIN_WAD, 1_000_000_000_000_000, LAMBDA_MAX_WAD] {
+                let mut value = defaults.clone();
+                value["amms"]["equilibra"]["presets"]["WETH"]["aWad"] =
+                    serde_json::json!(alpha.to_string());
+                value["amms"]["equilibra"]["presets"]["WETH"]["lambdaWad"] =
+                    serde_json::json!(lambda.to_string());
+                validate_run_config(&value)
+                    .expect("lambda endpoints must validate at both alpha endpoints");
+            }
+        }
+        for lambda in [LAMBDA_MIN_WAD - 1, LAMBDA_MAX_WAD + 1] {
+            let mut value = defaults.clone();
+            value["amms"]["equilibra"]["presets"]["WETH"]["lambdaWad"] =
+                serde_json::json!(lambda.to_string());
+            assert!(validate_run_config(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("lambdaWad"));
+        }
+        for base in ["WETH", "WBTC"] {
+            assert_eq!(
+                defaults["amms"]["equilibra"]["presets"][base]["lambdaWad"],
+                "16780000000000000"
+            );
+        }
     }
 
     #[test]

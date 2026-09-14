@@ -8,7 +8,7 @@
  * The Rust `equilibra-offchain-config-defaults` binary serialises that
  * config to JSON on stdout; `loadRustBenchmarkDefaults` shells out to
  * it once per process and caches the parsed result. Every TypeScript
- * preset / price / gas-estimate consumed by the test suite or the
+ * preset / price consumed by the test suite or the
  * dashboard flows through this loader, so a change in `config.rs`
  * propagates everywhere on the next test run.
  */
@@ -28,10 +28,10 @@ export const TEST_PRICES = {
 
 export interface EquilibraPoolParams {
   /** Depth-at-anchor knob `a` (WAD). Range `[A_MIN_WAD, A_MAX_WAD]`
-   *  = `[1e17, 99e16]` on-chain (Constants.sol). */
+   *  = `[1e17, WAD-1]` on-chain (Constants.sol). */
   aWad: bigint;
   /** Plateau-width knob `λ` (WAD). Range `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD]`
-   *  = `[1e15, 1e18]` on-chain. */
+   *  = `[1e12, 1e18]` on-chain. */
   lambdaWad: bigint;
   /** Smoothstep fee ceiling in BPS. Mirrors `PoolConfig.baseFee`. */
   feeBps: number;
@@ -84,12 +84,6 @@ export const EQUILIBRA_PRESETS: Record<"WETH" | "WBTC", EquilibraPoolParams> = {
 export const UNISWAP_V2 = {
   feeBps: RUST_CONFIG.amms.uniswapV2.feeBps,
   rebalanceEnabled: RUST_CONFIG.amms.uniswapV2.rebalanceEnabled,
-};
-
-export const GAS_USED_ESTIMATES = {
-  equilibra: BigInt(RUST_CONFIG.actors.arbitrageur.gasUsedEstimates.equilibra),
-  uniswapV2: BigInt(RUST_CONFIG.actors.arbitrageur.gasUsedEstimates.uniswapV2),
-  curve: BigInt(RUST_CONFIG.actors.arbitrageur.gasUsedEstimates.curve),
 };
 
 export interface CurvePoolParams {

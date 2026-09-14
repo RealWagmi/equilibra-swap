@@ -129,20 +129,25 @@ async function deployMultihopFixture() {
 
 describe("MultihopSwap", function () {
   it("exactInput 2-hop: A -> B -> C", async function () {
-    const { router, trader, addrA, addrB, addrC } = await loadFixture(deployMultihopFixture);
+    const { router, trader, addrA, addrB, addrC, poolAB, poolBC, tokenA, tokenC } =
+      await loadFixture(deployMultihopFixture);
     const deadline = (await time.latest()) + 3600;
 
     const amountIn = hre.ethers.parseEther("1000");
     const path = encodePath([addrA, addrB, addrC], [0, 0]);
 
+    const firstQuote = await poolAB.quoteExactIn(BigInt(addrA) < BigInt(addrB), amountIn);
+    const expectedOut = await poolBC.quoteExactIn(BigInt(addrB) < BigInt(addrC), firstQuote);
+    const paidBefore = await tokenA.balanceOf(trader.address);
+    const receivedBefore = await tokenC.balanceOf(trader.address);
     const amountOut = await router.connect(trader).exactInput.staticCall({
       path,
       recipient: trader.address,
       amountIn,
-      amountOutMinimum: 0,
+      amountOutMinimum: expectedOut,
       deadline,
     });
-    expect(amountOut).to.be.gt(0n);
+    expect(amountOut).to.equal(expectedOut);
 
     await router.connect(trader).exactInput({
       path,
@@ -151,6 +156,8 @@ describe("MultihopSwap", function () {
       amountOutMinimum: 0,
       deadline,
     });
+    expect(paidBefore - (await tokenA.balanceOf(trader.address))).to.equal(amountIn);
+    expect((await tokenC.balanceOf(trader.address)) - receivedBefore).to.equal(expectedOut);
   });
 
   it("exactInput 2-hop output >= single-hop-equivalent sanity check", async function () {
@@ -202,23 +209,36 @@ describe("MultihopSwap", function () {
   });
 
   it("exactOutput 2-hop: A -> B -> C", async function () {
-    const { router, trader, addrA, addrB, addrC, tokenA } = await loadFixture(deployMultihopFixture);
+    const { router, trader, addrA, addrB, addrC, tokenA, tokenC, poolAB, poolBC } =
+      await loadFixture(deployMultihopFixture);
     const deadline = (await time.latest()) + 3600;
     const desiredOut = hre.ethers.parseEther("500");
 
     // For exactOutput, the path is reversed: C -> B -> A (output first, input last).
     const path = encodePath([addrC, addrB, addrA], [0, 0]);
 
+    const intermediateIn = await poolBC.quoteExactOut(BigInt(addrB) < BigInt(addrC), desiredOut);
+    const expectedIn = await poolAB.quoteExactOut(BigInt(addrA) < BigInt(addrB), intermediateIn);
     const balanceBefore = await tokenA.balanceOf(trader.address);
+    const receivedBefore = await tokenC.balanceOf(trader.address);
     const amountIn = await router.connect(trader).exactOutput.staticCall({
       path,
       recipient: trader.address,
       amountOut: desiredOut,
-      amountInMaximum: hre.ethers.parseEther("1000"),
+      amountInMaximum: expectedIn,
       deadline,
     });
-    expect(amountIn).to.be.gt(0n);
-    expect(amountIn).to.be.gt(desiredOut); // Should cost more than output due to fees.
+    expect(amountIn).to.equal(expectedIn);
+    expect(amountIn).to.be.gt(desiredOut);
+    await router.connect(trader).exactOutput({
+      path,
+      recipient: trader.address,
+      amountOut: desiredOut,
+      amountInMaximum: expectedIn,
+      deadline,
+    });
+    expect(balanceBefore - (await tokenA.balanceOf(trader.address))).to.equal(expectedIn);
+    expect((await tokenC.balanceOf(trader.address)) - receivedBefore).to.equal(desiredOut);
   });
 
   it("exactOutput 3-hop: A -> B -> C -> A (cyclic, three pools)", async function () {

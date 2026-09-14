@@ -4,6 +4,8 @@ import hre from "hardhat";
 import { MaxUint256 } from "ethers";
 
 import { EQUILIBRA_PRESETS } from "../../simulator/test_helpers/config";
+import { deployNativeQuantumFixture } from "../fixtures/nativeQuantum";
+import { deployNativeRouterFixture } from "../fixtures/nativeRouter";
 
 const PRESET = EQUILIBRA_PRESETS.WETH;
 
@@ -118,7 +120,182 @@ async function freshDeadline(): Promise<number> {
   return (await time.latest()) + 3600;
 }
 
+function integerSqrt(value: bigint): bigint {
+  if (value < 2n) return value;
+  let root = value;
+  let next = value / 2n + 1n;
+  while (next < root) {
+    root = next;
+    next = (root + value / root) / 2n;
+  }
+  return root;
+}
+
+async function deploySplitHarness() {
+  return (await hre.ethers.getContractFactory("MockEquilibraRouter")).deploy();
+}
+
 describe("EquilibraRouter: zap operations", function () {
+  describe("zap split arithmetic", function () {
+    it("rounds the product root once through the uint256 product boundary", async () => {
+      const math = await loadFixture(deploySplitHarness);
+      const maxReserve = (1n << 128n) - 1n;
+      for (const [reserve, input] of [
+        [100000000n, 0n],
+        [100000000n, 10000n],
+        [100000001n, 10000n],
+        [maxReserve, 1n],
+        [maxReserve, 2n],
+      ]) {
+        const product = reserve * (reserve + input);
+        expect(product).to.be.lte(MaxUint256);
+        const split = ((integerSqrt(product) - reserve) * 995n) / 1000n;
+        const expected = split < input / 2n ? split : input / 2n;
+        expect(await math.exposed_calculateOptimalSwap(true, input, reserve, 7n)).to.equal(expected);
+        expect(await math.exposed_calculateOptimalSwap(false, input, 7n, reserve)).to.equal(expected);
+      }
+      expect(await math.exposed_calculateOptimalSwap(true, 10000n, 100000000n, 7n)).to.equal(4974n);
+    });
+
+    it("keeps the conservative fallback only for overflowing products", async () => {
+      const math = await loadFixture(deploySplitHarness);
+      const maxReserve = (1n << 128n) - 1n;
+      for (const [reserve, input] of [
+        [10n ** 38n, 2n * 10n ** 39n],
+        [maxReserve, 3n],
+        [maxReserve, MaxUint256 - maxReserve],
+      ]) {
+        const sum = reserve + input;
+        expect(sum).to.be.lte(MaxUint256);
+        expect(reserve * sum).to.be.gt(MaxUint256);
+        const factoredRoot = integerSqrt(reserve) * integerSqrt(sum);
+        const split = factoredRoot > reserve ? ((factoredRoot - reserve) * 995n) / 1000n : 0n;
+        const expected = split < input / 2n ? split : input / 2n;
+        for (const zeroForOne of [true, false]) {
+          const actual = await math.exposed_calculateOptimalSwap(
+            zeroForOne,
+            input,
+            zeroForOne ? reserve : 7n,
+            zeroForOne ? 7n : reserve
+          );
+          expect(actual).to.equal(expected);
+          expect(actual).to.be.lte(((integerSqrt(reserve * sum) - reserve) * 995n) / 1000n);
+          expect(actual).to.be.lte(input / 2n);
+        }
+      }
+    });
+
+    it("returns zero for an empty input reserve and rejects an overflowing sum explicitly", async () => {
+      const math = await loadFixture(deploySplitHarness);
+      expect(await math.exposed_calculateOptimalSwap(true, MaxUint256, 0n, 7n)).to.equal(0n);
+      for (const zeroForOne of [true, false]) {
+        await expect(math.exposed_calculateOptimalSwap(zeroForOne, MaxUint256, 7n, 7n)).to.be.revertedWithCustomError(
+          math,
+          "MathOutOfRange"
+        );
+      }
+    });
+  });
+
+  describe("native zap rounding regressions", function () {
+    for (const zeroForOne of [true, false]) {
+      for (const imbalanced of [false, true]) {
+        it(`mints from 0.0001 WBTC against a one-WBTC reserve, zeroForOne=${zeroForOne}, imbalanced=${imbalanced}`, async () => {
+          const f = await deployNativeRouterFixture({
+            initialSwap: false,
+            decimals: zeroForOne ? [8, 6] : [6, 8],
+            seedRatio: zeroForOne ? [1n, 100000n] : [100000n, 1n],
+            poolConfig: { baseFee: 1, repegShareBps: 0 },
+          });
+          const tokenIn = f.tokens[zeroForOne ? 0 : 1].target;
+          const tokenOut = f.tokens[zeroForOne ? 1 : 0].target;
+          const [liquidity, split] = await f.router.previewZapIn(tokenIn, tokenOut, 0, 10000n);
+          expect(split).to.equal(4974n);
+          expect(liquidity).to.be.gt(0n);
+          expect(await f.pool.quoteExactIn(zeroForOne, split)).to.be.gt(0n);
+          const before = await f.pool.balanceOf(f.owner.address);
+          if (imbalanced) {
+            await f.router.zapInImbalanced({
+              tokenA: tokenIn,
+              tokenB: tokenOut,
+              poolIndex: 0,
+              amountA: 10000n,
+              amountB: 0n,
+              minLiquidity: liquidity,
+              recipient: f.owner.address,
+              deadline: MaxUint256,
+            });
+          } else {
+            await f.router.zapInSingleSided({
+              tokenIn,
+              tokenOut,
+              poolIndex: 0,
+              amountIn: 10000n,
+              minLiquidity: liquidity,
+              recipient: f.owner.address,
+              deadline: MaxUint256,
+            });
+          }
+          expect((await f.pool.balanceOf(f.owner.address)) - before).to.equal(liquidity);
+          for (const token of f.tokens) expect(await token.balanceOf(f.router.target)).to.equal(0n);
+        });
+      }
+    }
+
+    it("funds a fractional mint leg with one raw token1 unit instead of rounding it to zero", async () => {
+      const f = await deployNativeRouterFixture({
+        initialSwap: false,
+        decimals: [6, 0],
+        seedRatio: [100n, 3n],
+        poolConfig: { aWad: 99n * 10n ** 16n, lambdaWad: 10n ** 15n, baseFee: 1, repegShareBps: 0 },
+      });
+      const input = 100000000n;
+      const [r0, r1] = await f.pool.getReserves();
+      const split = ((integerSqrt(r0 * (r0 + input)) - r0) * 995n) / 1000n;
+      const output = await f.pool.quoteExactIn(true, split);
+      expect(output).to.equal(1n);
+      const used0 = input - split;
+      const postSwapR0 = r0 + split; // Protocol fee and repegs are disabled in this fixture.
+      const postSwapR1 = r1 - output;
+      expect((used0 * postSwapR1) / postSwapR0).to.equal(0n);
+      const used1 = (used0 * postSwapR1 + postSwapR0 - 1n) / postSwapR0;
+      expect(used1).to.equal(1n);
+      const supply = await f.pool.totalSupply();
+      const expectedShares = (used0 * supply) / postSwapR0;
+      const [previewed, previewSplit] = await f.router.previewZapIn(f.tokens[0].target, f.tokens[1].target, 0, input);
+      expect(previewSplit).to.equal(split);
+      expect(previewed).to.equal(expectedShares);
+      expect(previewed).to.be.gt(0n);
+      const before = {
+        lp: await f.pool.balanceOf(f.owner.address),
+        wallet: await Promise.all(f.tokens.map((token) => token.balanceOf(f.owner.address))),
+      };
+      await expect(
+        f.router.zapInSingleSided({
+          tokenIn: f.tokens[0].target,
+          tokenOut: f.tokens[1].target,
+          poolIndex: 0,
+          amountIn: input,
+          minLiquidity: previewed,
+          recipient: f.owner.address,
+          deadline: MaxUint256,
+        })
+      )
+        .to.emit(f.pool, "LiquidityAdded")
+        .withArgs(f.router.target, f.owner.address, used0, used1, expectedShares);
+      expect(Array.from(await f.pool.getReserves())).to.deep.equal([r0 + input, r1]);
+      expect(await f.pool.balanceOf(f.owner.address)).to.equal(before.lp + expectedShares);
+      expect(await f.pool.totalSupply()).to.equal(supply + expectedShares);
+      expect(await Promise.all(f.tokens.map((token) => token.balanceOf(f.owner.address)))).to.deep.equal([
+        before.wallet[0] - input,
+        before.wallet[1],
+      ]);
+      expect(expectedShares * postSwapR0).to.be.at.most(used0 * supply);
+      expect(expectedShares * postSwapR1).to.be.at.most(used1 * supply);
+      for (const token of f.tokens) expect(await token.balanceOf(f.router.target)).to.equal(0n);
+    });
+  });
+
   describe("zapInSingleSided", function () {
     it("mints LP shares from a single token and refunds dust", async function () {
       const { alice, weth, usdc, pool, router, routerAddr, poolAddress } = await loadFixture(deployFixture);
@@ -598,6 +775,97 @@ describe("EquilibraRouter: zap operations", function () {
   });
 
   describe("previews", function () {
+    for (const zeroForOne of [false, true]) {
+      it(`previewZapIn matches funded coarse-decimal mint, zeroForOne=${zeroForOne}`, async function () {
+        const f = await deployNativeQuantumFixture({
+          initialSwap: false,
+          decimals: [0, 0],
+          seedRatio: [100n, 150n],
+        });
+        const router = await (
+          await hre.ethers.getContractFactory("EquilibraRouter")
+        ).deploy(f.factory.target, f.impl.target, f.owner.address);
+        const [tokenIn, tokenOut] = zeroForOne ? f.tokens : [f.tokens[1], f.tokens[0]];
+        await tokenIn.approve(router.target, MaxUint256);
+        const amountIn = 10n;
+        const [previewed] = await router.previewZapIn(tokenIn.target, tokenOut.target, 0, amountIn);
+        const supply = await f.pool.totalSupply();
+        const before = await f.pool.balanceOf(f.owner.address);
+        const [r0, r1] = await f.pool.getReserves();
+        const tx = await router.zapInSingleSided({
+          tokenIn: tokenIn.target,
+          tokenOut: tokenOut.target,
+          poolIndex: 0,
+          recipient: f.owner.address,
+          amountIn,
+          minLiquidity: previewed,
+          deadline: await freshDeadline(),
+        });
+        const receipt = await tx.wait();
+        const events = receipt!.logs
+          .filter((log) => log.address.toLowerCase() === String(f.pool.target).toLowerCase())
+          .map((log) => f.pool.interface.parseLog(log));
+        const swap = events.find((event) => event?.name === "Swap")!.args;
+        const mint = events.find((event) => event?.name === "LiquidityAdded")!.args;
+        const netInput = BigInt(swap.amountIn) - BigInt(swap.protocolFeeAmount);
+        const swapOut = BigInt(swap.amountOut);
+        const shares = BigInt(mint.sharesMinted);
+        const newR0 = zeroForOne ? r0 + netInput : r0 - swapOut;
+        const newR1 = zeroForOne ? r1 - swapOut : r1 + netInput;
+        expect(previewed).to.be.gt(0n);
+        expect(shares).to.equal(previewed);
+        expect((await f.pool.balanceOf(f.owner.address)) - before).to.equal(previewed);
+        expect(shares * newR0).to.be.at.most(BigInt(mint.amount0) * supply);
+        expect(shares * newR1).to.be.at.most(BigInt(mint.amount1) * supply);
+      });
+    }
+
+    it("previewZapOut includes the common margin and strict LP guard and keeps the minimum-output guard", async function () {
+      const { owner, impl, factory, pool, tokens } = await loadFixture(deployNativeQuantumFixture);
+      const weth9 = await (await hre.ethers.getContractFactory("MockWETH9")).deploy();
+      const router = await (
+        await hre.ethers.getContractFactory("EquilibraRouter")
+      ).deploy(await factory.getAddress(), await impl.getAddress(), await weth9.getAddress());
+      await router.waitForDeployment();
+      await pool.approve(await router.getAddress(), MaxUint256);
+      const poolAddress = await pool.getAddress();
+      const [token0, token1] = await Promise.all(tokens.map((t) => t.getAddress()));
+      const capture = async () => ({
+        reserves: Array.from(await pool.getReserves()),
+        lp: Array.from(await pool.getLpValueState()),
+        oracle: Array.from(await pool.getOracleState()),
+        timestamps: Array.from(await pool.getOracleTimestamps()),
+        supply: await pool.totalSupply(),
+        ownerLp: await pool.balanceOf(owner.address),
+        balances: await Promise.all(tokens.map((t) => t.balanceOf(poolAddress))),
+      });
+      const before = await capture();
+      expect(before.reserves.slice(0, 2)).to.deep.equal([1100000000000000000n, 908695586372644233n]);
+      expect(before.supply).to.equal(10n ** 18n);
+      // Burning 10 LP raw withdraws 11 token0 + 9 token1 raw.
+      // The off-side swap is checked at the post-withdrawal state;
+      // preview and execution must share the same math margin and strict guard.
+      const preview = await router.previewZapOut(token0, token1, 0, 10n, token0);
+      // The swap leg pays a minimum fee of one raw input unit.
+      expect(preview).to.equal(20n);
+      const params = {
+        tokenA: token0,
+        tokenB: token1,
+        poolIndex: 0,
+        tokenOut: token0,
+        recipient: owner.address,
+        liquidity: 10n,
+        minAmountOut: preview + 1n,
+        deadline: await freshDeadline(),
+      };
+      await expect(router.zapOutSingleSided(params)).to.be.revertedWithCustomError(router, "InsufficientOutputAmount");
+      expect(await capture()).to.deep.equal(before);
+      const receivedBefore = await tokens[0].balanceOf(owner.address);
+      await router.zapOutSingleSided({ ...params, minAmountOut: preview });
+      expect((await tokens[0].balanceOf(owner.address)) - receivedBefore).to.equal(preview);
+      expect(await pool.balanceOf(owner.address)).to.equal(before.ownerLp - 10n);
+    });
+
     it("previewZapIn returns a non-zero, swap-bounded estimate", async function () {
       const { weth, usdc, router } = await loadFixture(deployFixture);
       const amountIn = hre.ethers.parseEther("1");

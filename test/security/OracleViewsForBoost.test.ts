@@ -14,8 +14,7 @@ describe("Pool views for the Boost fair-value oracle", () => {
   async function fixture() {
     // Default security preset (flat 1 bps fee, auto-repeg disabled). The
     // view tests only need lastEmaTs to advance on a swap and the guard
-    // to toggle across a callback — neither requires a live repeg, and
-    // enabling one here would trip the factory's flat-fee stall guard.
+    // to toggle across a callback — neither requires a live repeg.
     const preset = buildPreset("WETH");
     return deploySecurityFixture(preset);
   }

@@ -234,7 +234,8 @@ describe("HighPrecisionHarness — kernel stress", function () {
     // pinned. This is a much stronger property than the old single-
     // knob test (which only bounded the round-trip drift on `A`).
     const lambdaSamples = [
-      10n ** 15n, // λ_min
+      10n ** 12n, // λ_min
+      10n ** 15n, // historical minimum / Pegged preset
       10n ** 16n, // 0.01 W
       5n * 10n ** 16n, // 0.05 W
       10n ** 17n, // 0.1 W
@@ -242,21 +243,7 @@ describe("HighPrecisionHarness — kernel stress", function () {
       10n ** 18n, // λ_max
     ];
 
-    // The L-quadratic root floors by up to a few wei on arbitrary
-    // reserves (the closed-form root passes through `sqrtWad`, which
-    // truncates the integer square root). The structural invariant we
-    // assert is twofold:
-    //   * `L ≈ x` (within a few wei) at the anchor — drift is bounded
-    //     by integer-sqrt residuals on the L-quadratic root, NOT by
-    //     `λ` (the canonical SwapMathHelpers test uses exact-WAD-
-    //     multiple reserves and gets `L == x` exactly; here we sweep
-    //     random reserves and tolerate the wei-scale floor).
-    //   * `L` is λ-invariant up to the same wei-scale residual: any
-    //     two `(L_λ₁, L_λ₂)` pair for the same `(x, x, a)` must agree
-    //     to ≤ a few wei. Drift larger than that would signal `λ`
-    //     leaking into the anchor depth — exactly what the
-    //     decoupling promises.
-    const LAMBDA_L_DRIFT_TOL = 4n; // wei
+    // The diagonal has an exact normalized root; only conversion to Q128 floors.
     for (let i = 0; i < LAMBDA_DECOUPLING_ITERS; i += 1) {
       const r = rng.nextBigInt(500n * WAD, 20_000n * WAD);
       let expectedL: bigint | null = null;
@@ -265,13 +252,9 @@ describe("HighPrecisionHarness — kernel stress", function () {
         const lBig = BigInt(l);
         if (expectedL === null) {
           expectedL = lBig;
-          // `L ≈ x` at the anchor — bounded by integer-sqrt residual.
-          expect(absDiff(lBig, r)).to.be.lte(LAMBDA_L_DRIFT_TOL);
+          expect(lBig).to.equal((r * (1n << 128n)) / WAD);
         } else {
-          // `L` is λ-invariant up to the same wei-scale residual.
-          expect(absDiff(lBig, expectedL), `λ=${lambda}, drift=${absDiff(lBig, expectedL)}`).to.be.lte(
-            LAMBDA_L_DRIFT_TOL
-          );
+          expect(lBig, `lambda=${lambda}`).to.equal(expectedL);
         }
       }
     }

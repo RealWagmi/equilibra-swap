@@ -28,8 +28,8 @@
 //
 // The starved fixture pairs a 5 bps flat fee (growth per unit of volume
 // stays under the gas guard, so the pool never accrues an own budget)
-// with 1e14 dead-bands (inside the stall-guard cap `feeScale · 1e14 =
-// 5e14`), putting the parachute's activation at `K × 1e14` (0.3% of
+// with 1e14 dead-bands, putting the parachute's activation at
+// `K × 1e14` (0.3% of
 // anchor lag at the canonical K = 30).
 import { expect } from "chai";
 import hre from "hardhat";
@@ -102,10 +102,8 @@ async function deployFixture(repegShareBps: number, baseFee: number): Promise<Fi
       baseFee,
       emaPeriod: 1200,
       repegStepWad: 5n * 10n ** 15n,
-      // Bands sit well inside the stall-guard cap (`baseFee · 1e14` =
-      // 5e14 for a flat 5-bps pool), putting the parachute activation
-      // at `parachuteBandMult × 1e14` (read from getFeeConfig(), never
-      // hardcoded).
+      // Parachute activation is `parachuteBandMult × 1e14`;
+      // the multiplier is read from getFeeConfig(), never hardcoded.
       repegThresholdToken1UpWad: DEAD_BAND_WAD,
       repegThresholdToken1DownWad: DEAD_BAND_WAD,
       feeRampBps: 0,

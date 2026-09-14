@@ -26,11 +26,9 @@ const STEP_WAD = 1_000_000_000_000_000n; // 10 bp probe step (== repegStepWad)
 //     share of both the budget and the per-step impacts, on entry AND on
 //     exit.
 //
-// Combined with the factory floor bounds (MIN_BASE_FEE = 5 bps,
-// MIN_EMA_PERIOD = 60 s), which make the manipulation phase of the report's
-// cycle fee-negative for the attacker, this is the mitigation the protocol
-// ships — no seal-on-mint. This suite pins the proportionality so any
-// future accounting change that breaks it fails loudly.
+// This suite pins that proportionality independently of assumptions about
+// arbitrage latency or the economic profitability of a particular path.
+// Any future accounting change that breaks it fails loudly.
 // ---------------------------------------------------------------------------
 
 async function deployFixture() {
@@ -81,7 +79,7 @@ async function deployFixture() {
       aWad: 909_610_000_000_000_030n,
       lambdaWad: 16_780_000_000_000_000n,
       baseFee: 100, // 1% flat — growth accrues fast, ramp disabled
-      emaPeriod: 60, // current MIN_EMA_PERIOD
+      emaPeriod: 600, // public-pool minimum
       repegStepWad: STEP_WAD,
       repegThresholdToken1UpWad: 100_000_000_000_000n, // 1 bp
       repegThresholdToken1DownWad: 100_000_000_000_000n, // 1 bp
@@ -186,7 +184,8 @@ async function buildHeadroom(
       amountOutMinimum: 0n,
       deadline: MaxUint256,
     });
-    const [reverseAmount] = await pool.quoteSwapToPrice(false, Q96_ONE);
+    const [reverseAmount] = await router.quoteSwapToPrice(token1Address, token0Address, 0, Q96_ONE);
+    expect(reverseAmount, "headroom funding must execute a reverse leg").to.be.gt(0n);
     await hre.network.provider.send("evm_revert", [snapshot]);
 
     await time.setNextBlockTimestamp(timestamp);

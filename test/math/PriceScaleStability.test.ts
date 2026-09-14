@@ -64,8 +64,6 @@ async function snapshotFixtureWETH() {
   const preset = buildPreset("WETH", {
     baseFee: 100,
     feeRampBps: 1000,
-    // Production WETH floor (60 bps): keeps the stall-guard cap
-    // (floor·1e14 = 6e15) above the preset's 5e15 repeg threshold.
     feeFloorBps: 60,
     repegShareBps: 5_000,
   });

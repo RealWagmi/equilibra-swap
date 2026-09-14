@@ -19,6 +19,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { CI_TEST_GREP, selectTestFiles } from "./test-profile";
 
 interface Section {
   name: string;
@@ -151,8 +152,9 @@ async function promptForSection(): Promise<Section> {
   }
 }
 
-function runHardhat(files: string[]): Promise<number> {
+function runHardhat(files: string[], ci: boolean): Promise<number> {
   const args = ["hardhat", "test", "--show-stack-traces", "--typecheck", ...files];
+  if (ci) args.push("--grep", CI_TEST_GREP);
   console.log(`\n$ npx ${args.join(" ")}\n`);
   return new Promise((resolve, reject) => {
     const child = spawn("npx", args, { stdio: "inherit", cwd: REPO_ROOT });
@@ -176,7 +178,11 @@ async function main(): Promise<void> {
     }
   }
 
-  const files = expandGlobs(section.globs);
+  const ci = process.argv.includes("--ci");
+  const allFiles = expandGlobs(section.globs);
+  const files = selectTestFiles(allFiles, ci);
+  if (ci)
+    console.log(`[test] CI profile: excluding ${allFiles.length - files.length} heavy suites and tagged stress cases`);
   if (files.length === 0) {
     console.error(`No test files matched section '${section.name}'.`);
     process.exit(2);
@@ -184,7 +190,11 @@ async function main(): Promise<void> {
 
   const noteSuffix = section.notes ? ` (${section.notes})` : "";
   console.log(`→ '${section.name}' — ${files.length} test file(s)${noteSuffix}`);
-  process.exit(await runHardhat(files));
+  if (process.argv.includes("--list")) {
+    console.log(files.join("\n"));
+    return;
+  }
+  process.exit(await runHardhat(files, ci));
 }
 
 main().catch((err) => {

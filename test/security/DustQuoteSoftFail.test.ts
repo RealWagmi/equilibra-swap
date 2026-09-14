@@ -1,19 +1,9 @@
-// Dust-scale quote semantics on strongly de-anchored pools.
-//
-// In integer arithmetic the secant solver's terminal iterate can land
-// on the wrong side of the pre-state (`yPost > yMath`) when the trade's
-// signal is dominated by the kernel's integer quantization — reachable
-// on pools whose state sits far from the anchor. The kernel fails
-// closed on such iterates with a zero-output sentinel (and the
-// exact-out mirror with a zero input), which the pool's typed dust
-// guards turn into
-// `AmountTooSmallAfterNormalization`; `quoteExactIn` returns 0 like
-// every other unquotable dust case. This suite pins that classification
-// on a state where the overshoot branch demonstrably fires.
-//
-// Vector provenance: bit-exact bigint replica of the kernel, validated
-// against the chain point-for-point; the pinned post-skew state has the
-// overshoot band `dxMath ∈ [2195, 73910]` for the exact-in solver.
+// Dust-scale quote and execution classification on de-anchored pools.
+// Q128 and the common margin change both the setup trade
+// and its subsequent dust quotes. Pin individual reachable amounts:
+// positive quotes must execute exactly; native dust refusals must match
+// the same typed error in both paths and leave the reserves untouched.
+// The historical literal kernel state remains a separate regression below.
 import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
 import hre from "hardhat";
@@ -36,18 +26,21 @@ const SEED = hre.ethers.parseEther("1000");
 const SKEW_IN = hre.ethers.parseEther("11500");
 
 // Pinned post-skew reserves (protocol fee 0 ⇒ reserve0 = seed + skew).
+// The setup quote includes the common 0.000001% output margin.
 const R0_AFTER = 12500000000000000000000n;
-const R1_AFTER = 28483987539843244337n;
+const R1_AFTER = 28483997255003368787n;
 
-// Raw input amounts whose clean input lands inside the overshoot band
-// (clean = amt − ⌊amt·0.003⌋ ∈ [2195, 73910]).
-const IN_BAND = [2210n, 3000n, 50000n, 74000n];
-// Just below the band (clean(2200) = 2194): the solver converges
-// normally there and quotes a 5-wei output.
-const BELOW_BAND = 2200n;
-const BELOW_BAND_OUT = 5n;
+const DUST_CASES = [
+  { amount: 1n, error: "AmountTooSmallAfterNormalization" },
+  { amount: 1000n, output: 1n }, // first LP check passes: no output quantum
+  { amount: 2200n, output: 2n },
+  { amount: 2210n, output: 2n },
+  { amount: 3000n, output: 3n },
+  { amount: 50000n, output: 54n }, // the old WAD-precision cap refusal now converges
+  { amount: 74000n, output: 81n }, // the old zero-output classification no longer applies
+] as const;
 
-describe("Dust quote soft-fail (de-anchored pool)", function () {
+describe("Dust quote and swap classification (de-anchored pool)", function () {
   async function deployFixture() {
     const [owner, trader] = await hre.ethers.getSigners();
     const Token = await hre.ethers.getContractFactory("MockERC20");
@@ -115,41 +108,40 @@ describe("Dust quote soft-fail (de-anchored pool)", function () {
     expect(r1).to.equal(R1_AFTER);
   });
 
-  it("quoteExactIn returns 0 (no revert) across the overshoot band", async function () {
-    const fx = await loadFixture(deployFixture);
-    for (const amt of IN_BAND) {
-      expect(await fx.pool.quoteExactIn(true, amt)).to.equal(0n);
-    }
-    // The band's lower neighbour quotes a nonzero dust output — the
-    // zero classification is confined to the overshoot band itself.
-    expect(await fx.pool.quoteExactIn(true, BELOW_BAND)).to.equal(BELOW_BAND_OUT);
-  });
-
-  it("swapping an in-band amount reverts with the typed dust error", async function () {
-    const fx = await loadFixture(deployFixture);
-    for (const amt of [IN_BAND[1], IN_BAND[2]]) {
-      await expect(
+  for (const c of DUST_CASES) {
+    it(`classifies input ${c.amount} identically in the quote and actual swap`, async function () {
+      const fx = await loadFixture(deployFixture);
+      const swap = () =>
         fx.router.connect(fx.trader).exactInputSingle({
           tokenIn: fx.meta.token0,
           tokenOut: fx.meta.token1,
           poolIndex: 0,
           recipient: fx.trader.address,
-          amountIn: amt,
+          amountIn: c.amount,
           amountOutMinimum: 0,
           deadline: MaxUint256,
-        })
-      ).to.be.revertedWithCustomError(fx.pool, "AmountTooSmallAfterNormalization");
-    }
-  });
+        });
+      if ("error" in c) {
+        const before = Array.from(await fx.pool.getReserves());
+        await expect(fx.pool.quoteExactIn(true, c.amount)).to.be.revertedWithCustomError(fx.pool, c.error);
+        await expect(swap()).to.be.revertedWithCustomError(fx.pool, c.error);
+        expect(Array.from(await fx.pool.getReserves())).to.deep.equal(before);
+      } else {
+        expect(await fx.pool.quoteExactIn(true, c.amount)).to.equal(c.output);
+        const tokenOut = await hre.ethers.getContractAt("MockERC20", fx.meta.token1);
+        const before = await tokenOut.balanceOf(fx.trader.address);
+        await swap();
+        expect((await tokenOut.balanceOf(fx.trader.address)) - before).to.equal(c.output);
+      }
+    });
+  }
 
   it("meaningful amounts stay quotable and swappable", async function () {
     const fx = await loadFixture(deployFixture);
     const amt = hre.ethers.parseEther("1");
     const quoted = await fx.pool.quoteExactIn(true, amt);
     expect(quoted).to.be.gt(0n);
-    const balBefore = await (
-      await hre.ethers.getContractAt("MockERC20", fx.meta.token1)
-    ).balanceOf(fx.trader.address);
+    const balBefore = await (await hre.ethers.getContractAt("MockERC20", fx.meta.token1)).balanceOf(fx.trader.address);
     await fx.router.connect(fx.trader).exactInputSingle({
       tokenIn: fx.meta.token0,
       tokenOut: fx.meta.token1,
@@ -159,19 +151,30 @@ describe("Dust quote soft-fail (de-anchored pool)", function () {
       amountOutMinimum: quoted,
       deadline: MaxUint256,
     });
-    const balAfter = await (
-      await hre.ethers.getContractAt("MockERC20", fx.meta.token1)
-    ).balanceOf(fx.trader.address);
+    const balAfter = await (await hre.ethers.getContractAt("MockERC20", fx.meta.token1)).balanceOf(fx.trader.address);
     expect(balAfter - balBefore).to.equal(quoted);
   });
 
-  it("dust exact-out on this fixture quotes deterministically (branch pinned at kernel level)", async function () {
-    const fx = await loadFixture(deployFixture);
-    // On this state the exact-out solver converges normally for 1/2/5
-    // wei outputs — the wrong-side branch is exercised by the direct
-    // kernel vectors below, not by this fixture.
+  it("rejects zero-clean-input exact-out dust consistently without state changes", async function () {
     for (const outAmt of [1n, 2n, 5n]) {
-      expect(await fx.pool.quoteExactOut(false, outAmt)).to.equal(2n);
+      const fx = await loadFixture(deployFixture);
+      const before = Array.from(await fx.pool.getReserves());
+      await expect(fx.pool.quoteExactOut(false, outAmt)).to.be.revertedWithCustomError(
+        fx.pool,
+        "AmountTooSmallAfterNormalization"
+      );
+      await expect(
+        fx.router.connect(fx.trader).exactOutputSingle({
+          tokenIn: fx.meta.token1,
+          tokenOut: fx.meta.token0,
+          poolIndex: 0,
+          recipient: fx.trader.address,
+          amountOut: outAmt,
+          amountInMaximum: 2n,
+          deadline: MaxUint256,
+        })
+      ).to.be.revertedWithCustomError(fx.pool, "AmountTooSmallAfterNormalization");
+      expect(Array.from(await fx.pool.getReserves())).to.deep.equal(before);
     }
   });
 
@@ -179,7 +182,7 @@ describe("Dust quote soft-fail (de-anchored pool)", function () {
     const fx = await loadFixture(deployFixture);
     const os = await fx.pool.getOracleState();
     const target = (BigInt(os.sqrtPriceX96) * 99n) / 100n;
-    const [amountIn, amountOut] = await fx.pool.quoteSwapToPrice(true, target);
+    const [amountIn, amountOut] = await fx.router.quoteSwapToPrice(fx.meta.token0, fx.meta.token1, 0, target);
     if (amountIn === 0n) {
       expect(amountOut).to.equal(0n);
     } else {
@@ -190,38 +193,37 @@ describe("Dust quote soft-fail (de-anchored pool)", function () {
     }
   });
 
-  it("kernel branch pins: wrong-side iterates report zero sentinels", async function () {
+  it("kernel pins: Q128 resolves the historical wrong-side and stagnation fixtures", async function () {
     const Harness = await hre.ethers.getContractFactory("SwapMathHarness");
     const harness = await Harness.deploy();
     await harness.waitForDeployment();
-    // Exact-out undershoot vector (terminal iterate 106_282 below the
-    // pre-state input axis).
-    const [dx] = await harness.quoteExactOutForward(
+    // This literal used to hit the wrong-side zero sentinel. Pin the
+    // actual Q128 result without claiming exact continuous-root accuracy
+    // for an extremely small pool or deleting the production sentinel.
+    const [dx, exactOutIterations] = await harness.quoteExactOutForward(
       1_000_000_000_000n,
       100_000_000_000n,
       1n,
       990000000000000000n, // a = 0.99
       1000000000000000000n // λ = 1.0
     );
-    expect(dx).to.equal(0n);
-    // Exact-in overshoot twin on this suite's pinned de-anchored state
-    // (clean input 2204 sits inside the [2195, 73910] band).
-    const [dy] = await harness.quoteExactInForward(
+    expect(dx).to.be.greaterThan(0n);
+    expect(exactOutIterations).to.equal(2n);
+    // Historical literal state, deliberately distinct from the reachable
+    // reserves above: Q128 now exits in two iterations with positive output.
+    const [dy, iterations] = await harness.quoteExactInForward(
       12500000000000000000000n,
       28483987539843244337n,
       2204n,
       909610000000000000n,
       16780000000000000n
     );
-    expect(dy).to.equal(0n);
+    expect(dy).to.equal(2n);
+    expect(iterations).to.equal(2n);
   });
 
-  // previewZapIn's zero-swap-quote guard (mirroring the execution's
-  // dust revert) has no deterministically reachable vector through the
-  // public zap surface on the states explored here: the CP-zap
-  // heuristic's swap split jumps discretely past the kernel's
-  // zero-quote bands. The guard exists as defense-in-depth, matching
-  // previewZapOut's identical off-side rule.
+  // RouterZap.test.ts separately exercises typed dust rejection and
+  // quote/execution agreement through the public zap surfaces.
 });
 
 describe("quoteSwapToPrice executability guard (dust-band pool)", function () {
@@ -231,7 +233,7 @@ describe("quoteSwapToPrice executability guard (dust-band pool)", function () {
   // guaranteed to revert.
   const CONFIG2 = {
     aWad: 100000000000000000n, // a = 0.1 (A_MIN)
-    lambdaWad: 1000000000000000n, // λ = 0.001 (LAMBDA_MIN)
+    lambdaWad: 1000000000000000n, // λ = 0.001: retain the original dust regression curve
     baseFee: 30,
     emaPeriod: 1200,
     repegStepWad: hre.ethers.parseUnits("1", 15),
@@ -243,7 +245,7 @@ describe("quoteSwapToPrice executability guard (dust-band pool)", function () {
   };
   const Q96 = 1n << 96n;
 
-  async function deployTinyFixture() {
+  async function deployTinyFixture(seed = 1n) {
     const [owner] = await hre.ethers.getSigners();
     const Token = await hre.ethers.getContractFactory("MockERC20");
     const tokenA = await Token.deploy("TokenA", "TKA", 18);
@@ -260,30 +262,64 @@ describe("quoteSwapToPrice executability guard (dust-band pool)", function () {
       await tokenA.getAddress(),
       await tokenB.getAddress(),
       CONFIG2,
-      hre.ethers.parseEther("1"),
-      hre.ethers.parseEther("1"),
+      seed * hre.ethers.parseEther("1"),
+      seed * hre.ethers.parseEther("1"),
       owner.address
     );
     const pool = await hre.ethers.getContractAt("EquilibraPool", await factory.allPools(0));
-    return { pool };
+    const weth = await (await hre.ethers.getContractFactory("MockWETH9")).deploy();
+    const router = await (
+      await hre.ethers.getContractFactory("EquilibraRouter")
+    ).deploy(await factory.getAddress(), await poolImpl.getAddress(), await weth.getAddress());
+    return { pool, router, meta: await pool.getPoolMetadata() };
   }
 
-  it("folds an unexecutable best iterate into (0, 0, false)", async function () {
+  async function deployDustBoundaryFixture() {
+    return deployTinyFixture(3n);
+  }
+
+  it("skips the refused one-unit input and finds a checked nonzero neighbor", async function () {
     const fx = await loadFixture(deployTinyFixture);
-    const target = Q96 - 100_000_000_000n;
-    const [amountIn, amountOut, crossesAnchor] = await fx.pool.quoteSwapToPrice(true, target);
-    expect(amountIn).to.equal(0n);
-    expect(amountOut).to.equal(0n);
+    const target = Q96 - 1_000_000_000_000n;
+    const [amountIn, amountOut, crossesAnchor] = await fx.router.quoteSwapToPrice(
+      fx.meta.token0,
+      fx.meta.token1,
+      0,
+      target
+    );
+    expect(amountIn).to.be.gte(3n);
+    expect(amountOut).to.be.gt(0n);
+    expect(await fx.pool.quoteExactIn(true, amountIn)).to.equal(amountOut);
     expect(crossesAnchor).to.equal(false);
-    // The would-be pair really is unexecutable on this state.
-    expect(await fx.pool.quoteExactIn(true, 1n)).to.equal(0n);
+    // The smaller input still refuses; recovery must not turn that into an OK quote.
+    await expect(fx.pool.quoteExactIn(true, 1n)).to.be.revertedWithCustomError(
+      fx.pool,
+      "AmountTooSmallAfterNormalization"
+    );
   });
+
+  for (const zeroForOne of [true, false]) {
+    it("preserves a positive price-target dust output that passes its LP guard: " + zeroForOne, async function () {
+      const { pool, router, meta } = await loadFixture(deployDustBoundaryFixture);
+      expect(await pool.quoteExactIn(zeroForOne, 3n)).to.equal(1n);
+      const target = zeroForOne ? Q96 - 400000000000n : Q96 + 400000000000n;
+      const [input, output] = await router.quoteSwapToPrice(
+        zeroForOne ? meta.token0 : meta.token1,
+        zeroForOne ? meta.token1 : meta.token0,
+        0,
+        target
+      );
+      expect(input).to.be.greaterThan(0n);
+      expect(output).to.be.greaterThan(0n);
+      expect(output).to.equal(await pool.quoteExactIn(zeroForOne, input));
+    });
+  }
 
   it("still returns executable pairs for reachable targets", async function () {
     const fx = await loadFixture(deployTinyFixture);
     const os = await fx.pool.getOracleState();
     const target = (BigInt(os.sqrtPriceX96) * 95n) / 100n;
-    const [amountIn, amountOut] = await fx.pool.quoteSwapToPrice(true, target);
+    const [amountIn, amountOut] = await fx.router.quoteSwapToPrice(fx.meta.token0, fx.meta.token1, 0, target);
     expect(amountIn).to.be.gt(0n);
     expect(amountOut).to.be.gt(0n);
     expect(await fx.pool.quoteExactIn(true, amountIn)).to.equal(amountOut);

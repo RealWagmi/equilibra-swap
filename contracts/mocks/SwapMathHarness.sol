@@ -2,11 +2,12 @@
 pragma solidity ^0.8.20;
 
 import { EquilibraSwapMath } from "../libraries/EquilibraSwapMath.sol";
+import { Errors } from "../libraries/Errors.sol";
+import { SwapMathDiagnostics } from "./SwapMathDiagnostics.sol";
 
 /// @dev Thin wrapper around the pure helpers in {EquilibraSwapMath} that
-///      have no on-chain consumer test until now. Keeps the test surface
-///      narrow (5 forwarders) so the deployable production pool stays
-///      untouched.
+///      are exercised independently of pool settlement. Test-only depth
+///      preparation and internal control-flow probes stay in this mock.
 contract SwapMathHarness {
     function smoothstepFeeWad(
         uint256 distPostWad,
@@ -52,23 +53,23 @@ contract SwapMathHarness {
         uint256 pMargWad,
         uint256 pAnchorWad
     ) external pure returns (uint256) {
-        return EquilibraSwapMath.distanceFromAnchorWad(pMargWad, pAnchorWad);
+        return SwapMathDiagnostics.distanceFromAnchorWad(pMargWad, pAnchorWad);
     }
 
     function distanceState(uint256 xWad, uint256 yWad) external pure returns (uint256) {
-        return EquilibraSwapMath.distanceState(xWad, yWad);
+        return SwapMathDiagnostics.distanceState(xWad, yWad);
     }
 
     function toWad(uint256 amountRaw, uint8 decimals) external pure returns (uint256) {
-        return EquilibraSwapMath.toWad(amountRaw, decimals);
+        return SwapMathDiagnostics.toWad(amountRaw, decimals);
     }
 
     function fromWadDown(uint256 amountWad, uint8 decimals) external pure returns (uint256) {
-        return EquilibraSwapMath.fromWadDown(amountWad, decimals);
+        return SwapMathDiagnostics.fromWadDown(amountWad, decimals);
     }
 
     function fromWadUp(uint256 amountWad, uint8 decimals) external pure returns (uint256) {
-        return EquilibraSwapMath.fromWadUp(amountWad, decimals);
+        return SwapMathDiagnostics.fromWadUp(amountWad, decimals);
     }
 
     function computeKAndL(
@@ -76,12 +77,12 @@ contract SwapMathHarness {
         uint256 yMath,
         uint256 aWad,
         uint256 lambdaWad
-    ) external pure returns (uint256 kWad, uint256 lWad) {
-        return EquilibraSwapMath.computeKAndL(xMath, yMath, aWad, lambdaWad);
+    ) external pure returns (uint256 kWad, uint256 lQ128) {
+        return SwapMathDiagnostics.computeKAndL(xMath, yMath, aWad, lambdaWad);
     }
 
     function balanceScaleFromK(uint256 kWad) external pure returns (uint256) {
-        return EquilibraSwapMath.balanceScaleFromK(kWad);
+        return SwapMathDiagnostics.balanceScaleFromK(kWad);
     }
 
     function solveLFromState(
@@ -99,7 +100,7 @@ contract SwapMathHarness {
         uint256 aWad,
         uint256 lambdaWad
     ) external pure returns (uint256) {
-        return EquilibraSwapMath.computeK(xMath, yMath, aWad, lambdaWad);
+        return SwapMathDiagnostics.computeK(xMath, yMath, aWad, lambdaWad);
     }
 
     function marginalPriceFromState(
@@ -126,7 +127,11 @@ contract SwapMathHarness {
         uint256 aWad,
         uint256 lambdaWad
     ) external pure returns (uint256 dyMath, uint256 iters) {
-        return EquilibraSwapMath.quoteExactInForward(xMath, yMath, dxMath, aWad, lambdaWad);
+        // Test-only convenience entry: production callers already carry L.
+        if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
+        if (dxMath == 0) revert Errors.ZeroAmount();
+        uint256 depth = EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad);
+        return EquilibraSwapMath.quoteExactInForward(xMath, yMath, dxMath, aWad, lambdaWad, depth);
     }
 
     function quoteExactOutForward(
@@ -136,7 +141,12 @@ contract SwapMathHarness {
         uint256 aWad,
         uint256 lambdaWad
     ) external pure returns (uint256 dxMath, uint256 iters) {
-        return EquilibraSwapMath.quoteExactOutForward(xMath, yMath, dyMath, aWad, lambdaWad);
+        // Test-only convenience entry: production callers already carry L.
+        if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
+        if (dyMath == 0) revert Errors.ZeroAmount();
+        if (dyMath >= yMath) revert Errors.InsufficientLiquidity();
+        uint256 depth = EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad);
+        return EquilibraSwapMath.quoteExactOutForward(xMath, yMath, dyMath, aWad, lambdaWad, depth);
     }
 
     function toMathSpace(
@@ -144,6 +154,24 @@ contract SwapMathHarness {
         uint256 yWad,
         uint256 priceScaleWad
     ) external pure returns (uint256 xMath, uint256 yMath) {
-        return EquilibraSwapMath.toMathSpace(xWad, yWad, priceScaleWad);
+        return SwapMathDiagnostics.toMathSpace(xWad, yWad, priceScaleWad);
+    }
+    function computeQuoteK(
+        uint256 x,
+        uint256 y,
+        uint256 depth,
+        uint256 a,
+        uint256 lambda
+    ) external pure returns (uint256) {
+        return EquilibraSwapMath.computeQuoteKFromL(x, y, depth, a, lambda);
+    }
+
+    function certifyCounterpart(
+        EquilibraSwapMath.SolverContext memory context,
+        uint256 b,
+        uint256 k,
+        uint256 epsilon
+    ) external pure returns (uint256) {
+        return EquilibraSwapMath._certifyCounterpart(context, b, k, epsilon);
     }
 }

@@ -1,3 +1,4 @@
+import { exactInputReference, assertQuotePrecision } from "../helpers/continuousReference";
 // SPDX-License-Identifier: MIT
 //
 // CP-zone security regression suite.
@@ -109,6 +110,23 @@ const ZIGZAG_CYCLES = 12;
 // directly comparable.
 // ---------------------------------------------------------------------------
 
+const EXPECTED_TRADE_REFUSALS = new hre.ethers.Interface([
+  "error InsufficientLiquidity()",
+  "error InsufficientOutputAmount()",
+  "error AmountTooSmallAfterNormalization()",
+  "error SolverDidNotConverge()",
+]);
+
+// Decode exact custom-error data. Never accept an arbitrary revert message,
+// panic, invariant error, configuration failure or provider exception.
+function requireExpectedTradeRefusal(error: unknown): void {
+  const data = (error as { data?: unknown } | null)?.data;
+  if (typeof data === "string" && /^0x[0-9a-fA-F]{8}$/.test(data)) {
+    if (EXPECTED_TRADE_REFUSALS.parseError(data)) return;
+  }
+  throw error;
+}
+
 async function currentBlockTime(): Promise<number> {
   const block = await hre.ethers.provider.getBlock("latest");
   return Number(block!.timestamp);
@@ -158,7 +176,8 @@ async function maxValidAmountIn(
     try {
       const out = BigInt(await fx.pool.quoteExactIn(zeroForOne, probe));
       return { amountIn: probe, amountOut: out };
-    } catch {
+    } catch (error) {
+      requireExpectedTradeRefusal(error);
       probe = probe / 2n;
     }
   }
@@ -198,7 +217,8 @@ async function bisectAmountInForFraction(
     let out: bigint;
     try {
       out = BigInt(await fx.pool.quoteExactIn(zeroForOne, mid));
-    } catch {
+    } catch (error) {
+      requireExpectedTradeRefusal(error);
       hi = mid;
       continue;
     }
@@ -309,6 +329,25 @@ function fmtAttackerRow(
 describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
   this.timeout(240_000);
 
+  it("only explicit trade refusals may be skipped", function () {
+    for (const name of [
+      "InsufficientLiquidity",
+      "InsufficientOutputAmount",
+      "AmountTooSmallAfterNormalization",
+      "SolverDidNotConverge",
+    ]) {
+      requireExpectedTradeRefusal({ data: EXPECTED_TRADE_REFUSALS.encodeErrorResult(name) });
+    }
+    for (const error of [
+      new Error("provider disconnected"),
+      { data: "0x4e487b710000000000000000000000000000000000000000000000000000000000000011" },
+      { data: hre.ethers.id("MathInvariantViolation()").slice(0, 10) },
+      { message: "SolverDidNotConverge()" },
+    ]) {
+      expect(() => requireExpectedTradeRefusal(error)).to.throw();
+    }
+  });
+
   for (const presetName of PRESETS_UNDER_TEST) {
     const preset = buildPreset(presetName);
     const fixtureFor = async () => deploySecurityFixture(preset);
@@ -369,6 +408,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== A) Deep-CP round-trip — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -427,23 +467,44 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== B) Cross-anchor deep-CP round-trip — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
       // -------------------------------------------------------------------
       // C) Batched-vs-single in deep CP
       // -------------------------------------------------------------------
-      it("C) Splitting a deep-CP swap (target 99% drain) never beats a single swap", async function () {
+      it("C) Deep-CP splitting stays below the independent single root", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
 
         const before = await snapshotPool(fx);
         const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, before.reserveBaseRaw, 9_900n);
-        if (sized.amountIn === 0n) {
-          this.skip();
-          return;
-        }
+        expect(sized.amountIn, "scenario must execute a nonzero swap").to.be.greaterThan(0n);
 
+        // Bound any split advantage by independently measured retention
+        // in the single quote, including its once-only common margin.
+        const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+        const cp = await fx.pool.getCurveParams();
+        const os = await fx.pool.getOracleState();
+        const quoteScale = 10n ** 12n;
+        const baseScale = 10n ** (18n - BigInt(await fx.base.decimals()));
+        const fees = await fx.pool.getFeeConfig();
+        const clean = sized.amountIn - (sized.amountIn * BigInt(fees.baseFee)) / BPS;
+        const ref = await exactInputReference(
+          math,
+          fx.quoteIsToken0
+            ? (before.reserveQuoteRaw * quoteScale * WAD) / BigInt(os.priceScaleWad)
+            : before.reserveQuoteRaw * quoteScale,
+          fx.quoteIsToken0
+            ? before.reserveBaseRaw * baseScale
+            : (before.reserveBaseRaw * baseScale * WAD) / BigInt(os.priceScaleWad),
+          fx.quoteIsToken0 ? (clean * quoteScale * WAD) / BigInt(os.priceScaleWad) : clean * quoteScale,
+          cp.aWad,
+          cp.lambdaWad
+        );
+        const referenceOut =
+          (fx.quoteIsToken0 ? ref.referenceMath : (ref.referenceMath * BigInt(os.priceScaleWad)) / WAD) / baseScale;
         // Single-pass benchmark.
         const singleSnap = await hre.network.provider.send("evm_snapshot", []);
         let singleOut = 0n;
@@ -454,10 +515,12 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
             amountIn: sized.amountIn,
           });
           singleOut = single.amountOut;
+          assertQuotePrecision(singleOut, referenceOut, ref.iterations, ROUNDING_BUDGET_RAW, "deep-CP single");
         } finally {
           await hre.network.provider.send("evm_revert", [singleSnap]);
         }
 
+        let completedSplits = 0;
         for (const splits of [10, 50, 200]) {
           const snap = await hre.network.provider.send("evm_snapshot", []);
           try {
@@ -474,7 +537,8 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
                   amountIn: chunkIn,
                 });
                 totalOut += r.amountOut;
-              } catch {
+              } catch (error) {
+                requireExpectedTradeRefusal(error);
                 // Solver may reject the trailing chunks once the BASE
                 // reserve hits the depletion clamp. Stop the split run
                 // and compare what was actually filled vs the single
@@ -498,17 +562,20 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
             // splits cannot beat the single by construction (they
             // moved less input through the pool).
             if (!abandoned) {
+              completedSplits += 1;
               expect(
                 totalOut,
                 `batched deep-CP split (${splits}) beat the single under ${presetName} by ${totalOut - singleOut} raw`
-              ).to.be.lessThanOrEqual(singleOut + ROUNDING_BUDGET_RAW);
+              ).to.be.lessThanOrEqual(referenceOut + ROUNDING_BUDGET_RAW);
             }
           } finally {
             await hre.network.provider.send("evm_revert", [snap]);
           }
         }
 
+        expect(completedSplits, "at least one complete split comparison must execute").to.be.greaterThan(0);
         console.log(`\n=== C) Batched-vs-single deep CP — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -588,6 +655,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== D) Swap+CP + add + back + remove — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -676,6 +744,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== D') Swap+CP + add + remove + back — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -741,6 +810,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== D.prod) Swap+CP + add + back + remove — ${presetName} (prod fees) ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -765,10 +835,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
 
         const before = await snapshotPool(fx);
         const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, before.reserveBaseRaw, 9_700n);
-        if (sized.amountIn === 0n) {
-          this.skip();
-          return;
-        }
+        expect(sized.amountIn, "scenario must execute a nonzero swap").to.be.greaterThan(0n);
 
         // Baseline: same swap pair without an LP touch.
         const baselineSnap = await hre.network.provider.send("evm_snapshot", []);
@@ -838,6 +905,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         }
 
         console.log(`\n=== E) JIT-LP wrap — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -857,10 +925,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
 
         const before = await snapshotPool(fx);
         const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, before.reserveBaseRaw, 9_700n);
-        if (sized.amountIn === 0n) {
-          this.skip();
-          return;
-        }
+        expect(sized.amountIn, "scenario must execute a nonzero swap").to.be.greaterThan(0n);
 
         const balBeforeQuote = BigInt(await fx.quote.balanceOf(await fx.attacker.getAddress()));
         const balBeforeBase = BigInt(await fx.base.balanceOf(await fx.attacker.getAddress()));
@@ -899,6 +964,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         ).to.equal(true);
 
         console.log(`\n=== E.prod) JIT-LP wrap @ prod fees — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
       });
 
@@ -953,10 +1019,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         );
 
         const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, before.reserveBaseRaw, 9_700n);
-        if (sized.amountIn === 0n) {
-          this.skip();
-          return;
-        }
+        expect(sized.amountIn, "scenario must execute a nonzero swap").to.be.greaterThan(0n);
 
         const fwd = await exactInputSingle(fx, fx.attacker, {
           tokenIn: fx.quoteAddr,
@@ -990,6 +1053,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         });
 
         console.log(`\n=== F) LP-sandwich exit @ prod fees — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
 
         // Production-fees hard-assertion: the full LP-sandwich
@@ -1002,109 +1066,6 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
           attackerUsdWad <= ATTACKER_USD_BUDGET_WAD_PER_LEG,
           `LP-sandwich exit extracted USD under production fees: ${fmtWad(attackerUsdWad, 12)} (budget=${fmtWad(ATTACKER_USD_BUDGET_WAD_PER_LEG, 12)}) under ${presetName}`
         ).to.equal(true);
-      });
-
-      // -------------------------------------------------------------------
-      // F.sweep) LP-sandwich profitability sweep
-      //
-      // Scan a range of swap1 sizes (multiples of the seeded USDT
-      // reserve) and report the attacker's USD-Δ at each size. Helps
-      // identify the *optimal* attack size and verify whether F's
-      // measurement at the bisection cap reflects the global maximum
-      // or a local point on the surface. Diagnostic-only.
-      // -------------------------------------------------------------------
-      it("F.sweep) profitability surface across swap1 sizes × repegShareBps (diagnostic, prod fees)", async function () {
-        this.timeout(900_000);
-        const sweepMultipliers: bigint[] = [1n, 10n, 25n, 50n, 100n, 256n];
-        // The diagnostic shows that `repegShareBps` does NOT
-        // influence single-block atomic LP-sandwich extraction:
-        // numbers are identical to four decimals across the full
-        // [0, 10_000] range. The auto-repeg gate fires at most once
-        // per block (`_lastRepegTs` guard) and `repegStepWad` is
-        // capped well below the imbalance. We probe the post-floor
-        // range as the canonical regression coverage.
-        const shareSweep: number[] = [5000, 7500, 10000];
-        const sweepRows: any[] = [];
-        for (const share of shareSweep) {
-          const shareFixturePreset = buildPreset(presetName, {
-            baseFee: prodPreset.feeBps,
-            feeRampBps: prodPreset.feeRampBps,
-            feeFloorBps: prodPreset.feeFloorBps,
-            repegShareBps: share,
-          });
-          const shareFixture = async () => deploySecurityFixture(shareFixturePreset);
-          for (const mul of sweepMultipliers) {
-            const fx = await loadFixture(shareFixture);
-            // Capture balances BEFORE the LP deposit so the attacker-USD-Δ
-            // accounts for the full sandwich primitive: deposit cost,
-            // imbalanced exit, both swap legs.
-            const balBeforeQuote = BigInt(await fx.quote.balanceOf(await fx.attacker.getAddress()));
-            const balBeforeBase = BigInt(await fx.base.balanceOf(await fx.attacker.getAddress()));
-
-            const sharesPretrade = await addLiquidityAt(
-              fx,
-              fx.attacker,
-              (fx.initialQuoteRaw * 1_000n) / BPS,
-              (fx.initialBaseRaw * 1_000n) / BPS
-            );
-
-            const swap1AmountIn = fx.initialQuoteRaw * mul;
-            // Skip if attacker can't afford this size.
-            const attackerUsdtBal = BigInt(await fx.quote.balanceOf(await fx.attacker.getAddress()));
-            if (swap1AmountIn > attackerUsdtBal) {
-              sweepRows.push({
-                "swap1 ×reserve": `${mul}×`,
-                "swap1 (raw)": swap1AmountIn.toString(),
-                "attacker USD Δ": "skipped (insufficient balance)",
-              });
-              continue;
-            }
-
-            let fwdAmountOut: bigint = 0n;
-            try {
-              const fwd = await exactInputSingle(fx, fx.attacker, {
-                tokenIn: fx.quoteAddr,
-                tokenOut: fx.baseAddr,
-                amountIn: swap1AmountIn,
-              });
-              fwdAmountOut = fwd.amountOut;
-            } catch {
-              sweepRows.push({
-                "swap1 ×reserve": `${mul}×`,
-                "swap1 (raw)": swap1AmountIn.toString(),
-                "attacker USD Δ": "swap1 reverted",
-              });
-              continue;
-            }
-            await removeLiquidityShares(fx, fx.attacker, sharesPretrade);
-            if (fwdAmountOut > 0n) {
-              try {
-                await exactInputSingle(fx, fx.attacker, {
-                  tokenIn: fx.baseAddr,
-                  tokenOut: fx.quoteAddr,
-                  amountIn: fwdAmountOut,
-                });
-              } catch {
-                // swap2 may revert if pool is too imbalanced; attacker
-                // keeps the stranded base position.
-              }
-            }
-
-            const balAfterQuote = BigInt(await fx.quote.balanceOf(await fx.attacker.getAddress()));
-            const balAfterBase = BigInt(await fx.base.balanceOf(await fx.attacker.getAddress()));
-            const quoteDelta = balAfterQuote - balBeforeQuote;
-            const baseDelta = balAfterBase - balBeforeBase;
-            const attackerUsdWad = deltaToUsdWad(fx, quoteDelta, baseDelta);
-            sweepRows.push({
-              "share (bps)": share,
-              "swap1 ×reserve": `${mul}×`,
-              "swap1 (USDT)": fmtQuote(swap1AmountIn),
-              "attacker USD Δ": `${attackerUsdWad >= 0n ? "+" : ""}${fmtWad(attackerUsdWad, 4)}`,
-            });
-          }
-        }
-        console.log(`\n=== F.sweep) LP-sandwich profitability surface — ${presetName} (prod fees, varying share) ===`);
-        console.table(sweepRows);
       });
 
       // -------------------------------------------------------------------
@@ -1138,10 +1099,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         );
 
         const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, before.reserveBaseRaw, 9_700n);
-        if (sized.amountIn === 0n) {
-          this.skip();
-          return;
-        }
+        expect(sized.amountIn, "scenario must execute a nonzero swap").to.be.greaterThan(0n);
 
         const fwd = await exactInputSingle(fx, fx.attacker, {
           tokenIn: fx.quoteAddr,
@@ -1170,6 +1128,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         });
 
         console.log(`\n=== F') LP-sandwich exit DIAGNOSTIC @ 1bps — ${presetName} ===`);
+        expect(rows.length, "scenario must exercise at least one actual case").to.be.greaterThan(0);
         console.table(rows);
         if (attackerUsdWad > 0n) {
           console.log(
@@ -1203,6 +1162,7 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
         // BASE reserve so every iteration spends time deep in the CP
         // tail. The notional LP touch is 5 % of the current QUOTE
         // reserve.
+        let completedCycles = 0;
         for (let i = 0; i < ZIGZAG_CYCLES; i++) {
           const cur = await snapshotPool(fx);
           const sized = await bisectAmountInForFraction(fx, fx.quoteAddr, cur.reserveBaseRaw, 9_500n);
@@ -1218,7 +1178,10 @@ describe("CpZoneSecurity [real presets, fee=1bps, repeg=off]", function () {
           const propAmounts = await proportionalAddAmounts(fx, noteQuote);
           const shares = await addLiquidityAt(fx, fx.attacker, propAmounts.quoteRaw, propAmounts.baseRaw);
           await removeLiquidityShares(fx, fx.attacker, shares);
+          completedCycles += 1;
         }
+
+        expect(completedCycles, "at least one full zigzag cycle must execute").to.be.greaterThan(0);
 
         const after = await snapshotPool(fx);
         const balAfterQuote = BigInt(await fx.quote.balanceOf(await fx.attacker.getAddress()));

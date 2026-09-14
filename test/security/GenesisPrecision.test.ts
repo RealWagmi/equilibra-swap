@@ -65,14 +65,15 @@ const CFG = {
 };
 
 // Deploy one pool with the given raw seeds; returns the pool or throws.
-async function seed(factory: any, ta: any, tb: any, rawA: bigint, rawB: bigint, cfg = CFG) {
+async function seed(factory: any, ta: any, tb: any, rawA: bigint, rawB: bigint, cfg = CFG, isPrivate = false) {
   await ta.approve(await factory.getAddress(), MaxUint256);
   await tb.approve(await factory.getAddress(), MaxUint256);
   const aAddr = (await ta.getAddress()).toLowerCase();
   const bAddr = (await tb.getAddress()).toLowerCase();
   const aIs0 = aAddr < bAddr;
   const owner = (await hre.ethers.getSigners())[0];
-  await factory.createPoolAndAddLiquidity(
+  const create = isPrivate ? factory.createPrivatePoolAndAddLiquidity : factory.createPoolAndAddLiquidity;
+  await create(
     aIs0 ? await ta.getAddress() : await tb.getAddress(),
     aIs0 ? await tb.getAddress() : await ta.getAddress(),
     cfg,
@@ -97,23 +98,12 @@ describe("Genesis precision gate", () => {
     await expect(seed(factory, ta, tb, 1001n, 1001n)).to.be.revertedWithCustomError(Pool, "MathInvariantViolation");
   });
 
-  it("rejects the degenerate (nWad=0) and understated (nWad>0) regions above the supply floor", async () => {
+  it("recovers accurate Q128 depth even where old WAD depth was zero or understated", async () => {
     const { factory } = await loadFixture(fixture);
-    const Pool = await hre.ethers.getContractFactory("EquilibraPool");
-    // 1e8 clears the 1e6 supply floor but floors nWad to 0 -> vp 0.
-    {
+    for (const raw of [10n ** 8n, 10n ** 10n]) {
       const { ta, tb } = await makeTokens(18, 18);
-      await expect(seed(factory, ta, tb, 10n ** 8n, 10n ** 8n))
-        .to.be.revertedWithCustomError(Pool, "GenesisVpImprecise")
-        .withArgs(0n); // degenerate: nWad floors to 0 -> vp 0
-    }
-    // 1e10 has nWad > 0 but a materially understated L -> vp far off 2·WAD.
-    {
-      const { ta, tb } = await makeTokens(18, 18);
-      await expect(seed(factory, ta, tb, 10n ** 10n, 10n ** 10n)).to.be.revertedWithCustomError(
-        Pool,
-        "GenesisVpImprecise"
-      );
+      const pool = await seed(factory, ta, tb, raw, raw);
+      expect((await pool.getLpValueState()).genesisWad).to.equal(TWO_WAD - 1n);
     }
   });
 
@@ -141,28 +131,12 @@ describe("Genesis precision gate", () => {
     }
   });
 
-  it("straddles the tolerance boundary: accepts just inside, rejects just outside", async () => {
+  it("accepts both historical WAD-rounding boundary vectors with precise depth", async () => {
     const { factory } = await loadFixture(fixture);
-    const Pool = await hre.ethers.getContractFactory("EquilibraPool");
-
-    // Exact production-kernel vectors straddling TOL (= 4e10). Acceptance
-    // is a VP-error policy, not a monotone raw-reserve threshold: the
-    // larger second vector has slightly worse fixed-point cancellation and
-    // lands just OUTSIDE the band, so it must be rejected.
-    {
+    for (const raw of [4_116_559_088_214n, 6_215_937_829_629n]) {
       const { ta, tb } = await makeTokens(18, 18);
-      const pool: any = await seed(factory, ta, tb, 4_116_559_088_214n, 4_116_559_088_214n);
-      const lv = await pool.getLpValueState();
-      // 88_308 wei inside the tolerance (TOL - 88_308).
-      expect(absDiff(lv.genesisWad, TWO_WAD)).to.equal(39_999_911_692n);
-      expect(absDiff(lv.genesisWad, TWO_WAD)).to.be.lessThanOrEqual(TOL);
-    }
-    {
-      const { ta, tb } = await makeTokens(18, 18);
-      // vpErr = 40_000_721_825 = TOL + 721_825, just outside the band.
-      await expect(seed(factory, ta, tb, 6_215_937_829_629n, 6_215_937_829_629n))
-        .to.be.revertedWithCustomError(Pool, "GenesisVpImprecise")
-        .withArgs(1_999_999_959_999_278_175n);
+      const pool = await seed(factory, ta, tb, raw, raw);
+      expect((await pool.getLpValueState()).genesisWad).to.equal(TWO_WAD - 1n);
     }
   });
 
@@ -178,7 +152,9 @@ describe("Genesis precision gate", () => {
     // that ratio quantization, so the error text must not promise that it can.
     const rawA = aIsToken0 ? small : large;
     const rawB = aIsToken0 ? large : small;
-    await expect(seed(factory, ta, tb, rawA, rawB))
+    expect((small * WAD) / large).to.equal(1285n);
+    await expect(seed(factory, ta, tb, rawA, rawB)).to.be.revertedWithCustomError(Pool, "InvalidPriceScale");
+    await expect(seed(factory, ta, tb, rawA, rawB, CFG, true))
       .to.be.revertedWithCustomError(Pool, "GenesisVpImprecise")
       .withArgs(2_000_000_056_202_507_187n);
   });

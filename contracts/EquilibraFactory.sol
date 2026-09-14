@@ -30,104 +30,117 @@ import { EquilibraParamTimelock } from "./EquilibraParamTimelock.sol";
 import { Errors } from "./libraries/Errors.sol";
 import { Constants } from "./libraries/Constants.sol";
 
-/// @title EquilibraFactory
-/// @notice Factory contract for creating Equilibra pools using Clone pattern
-/// @dev Pools are indexed by an order-independent pair key.
-///      Multiple pools per pair are allowed.
-///
-///      **Token admissibility (unsupported token classes).**
-///      Equilibra pools assume that token balances change ONLY through
-///      pool-mediated transfers (`transfer` / `transferFrom` from this
-///      pool's own swap / mint / burn flows). The on-chain accounting
-///      stores reserves in `_reservesPacked` and only updates them
-///      from those flows. The strict `received != amountInRaw` delta
-///      check at swap settlement catches deviations during a single
-///      operation, but it does NOT protect against balance changes
-///      that occur between operations. The following token classes
-///      are therefore explicitly NOT supported, and pairing them
-///      may permanently strand LP funds or revert withdrawals with
-///      `MathInvariantViolation`:
-///
-///        * Elastic-supply / rebasing tokens (AMPL-style positive or
-///          negative rebases that mutate `balanceOf` without a
-///          `transfer` call).
-///        * Tokens with admin-controlled balance burns or upgrades
-///          that can shrink the pool's `balanceOf` post hoc.
-///        * Fee-on-transfer / deflationary tokens (caught by the
-///          per-swap strict check, but pool creation does not
-///          pre-screen — every swap will revert with
-///          `UnsupportedTokenBehavior`).
-///        * ERC777 / callback-capable tokens whose `transfer` /
-///          `transferFrom` can reenter (interacts poorly with the
-///          router's exact-output transient-storage accounting).
+/**
+ * @title EquilibraFactory
+ * @notice Deploys Equilibra pools as minimal-proxy clones of one implementation, seeds them
+ * atomically and keeps the pool registries.
+ * @dev Pools are keyed by the order-independent pair key `keccak256(abi.encode(token0, token1))`
+ * over the sorted pair; several pools may exist per pair, addressed by a pair-local index that
+ * also salts the clone.
+ *
+ * Token admissibility. A pool assumes its token balances change only through its own swap, mint
+ * and burn transfers: reserves live in `_reservesPacked` and are updated by those flows alone.
+ * The strict `received != amountInRaw` check at swap settlement catches deviations within one
+ * operation, not balance changes between operations, so these token classes are unsupported and
+ * can strand LP funds or make withdrawals revert `MathInvariantViolation`: rebasing or
+ * elastic-supply tokens; tokens with admin-controlled balance burns or upgrades; fee-on-transfer
+ * tokens (every swap reverts `UnsupportedTokenBehavior`); ERC777-style tokens whose transfers
+ * reenter (they interact badly with the router's exact-output transient-storage accounting).
+ * Pool creation does not pre-screen tokens.
+ */
 contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback {
     using EnumerableSetLib for EnumerableSetLib.AddressSet;
 
     // ============ State ============
 
-    /// @notice Pool implementation contract for cloning (immutable after deployment).
+    /**
+     * @notice Implementation every pool clone delegates to; immutable.
+     */
     address public immutable poolImplementation;
 
-    /// @notice Singleton timelock through which pool creators
-    ///         administer the runtime-safe parameter set of their
-    ///         pools (see {EquilibraParamTimelock}). Deployed by this
-    ///         constructor, so the address is immutable and the pools'
-    ///         `_enforceParamTimelock` check pins to known code.
+    /**
+     * @notice Singleton parameter timelock deployed by the constructor: sole caller of the pools'
+     * runtime parameter setters and the registry of pool admins. Immutable, so the pools'
+     * `_enforceParamTimelock` check pins to known code.
+     */
     address public immutable override paramTimelock;
 
-    /// @notice Canonical wrapped-native token. Funds the WETH9-side
-    ///         seed leg when a create call attaches native value —
-    ///         immutable chain config, the same trust shape as the
-    ///         router's WETH9.
+    /**
+     * @notice Wrapped-native token; funds the WETH9 seed leg when a create call attaches native
+     * value. Immutable chain configuration, the same one the router pins.
+     */
     address public immutable override WETH9;
 
-    /// @notice Protocol fee percentage (% of swap fee, e.g., 10 = 10%).
+    /**
+     * @notice Protocol share of every swap fee in percent (`10` = 10%); each pool snapshots it
+     * at creation.
+     */
     uint8 public protocolFee;
 
-    /// @notice Address that receives protocol fees.
+    /**
+     * @notice Recipient of collected protocol fees; read live by the pools.
+     */
     address public feeCollector;
 
-    /// @notice Array of all created pools.
+    /**
+     * @notice Every pool ever created, in deployment order.
+     */
     address[] public allPools;
 
-    /// @notice Enumerate pools for a token pair (order-independent)
-    /// @dev pairKey = keccak256(min(tokenA, tokenB), max(tokenA, tokenB))
+    /**
+     * @dev Pools per pair key `keccak256(abi.encode(token0, token1))` over the sorted pair.
+     * Append-only, so a pool's position equals its pair-local index.
+     */
     mapping(bytes32 => EnumerableSetLib.AddressSet) private _poolsByPair;
 
-    /// @notice Whitelisted pools for a token pair (order-independent)
-    /// @dev Admin-managed subset of `_poolsByPair`.
+    /**
+     * @dev Owner-curated subset of `_poolsByPair` under the same pair key.
+     */
     mapping(bytes32 => EnumerableSetLib.AddressSet) private _whitelistedPoolsByPair;
 
-    /// @notice Pools created by each address
+    /**
+     * @dev Pools per creator, in creation order.
+     */
     mapping(address => address[]) private _poolsByCreator;
 
-    /// @notice Owner-verified Boost wrapper per pool (address(0) = none).
-    /// @dev Curation, not permission: anyone can deploy a Boost stack
-    ///      over any pool; a binding here is the factory owner's
-    ///      attestation of THE canonical stack for a pool. The stored
-    ///      address is the stack's share vault (its user entry point);
-    ///      the remaining stack contracts are discoverable from it and
-    ///      from the Boost factory registry.
+    /**
+     * @dev Owner-verified Boost share vault per pool, `address(0)` when none. Curation, not
+     * permission: anyone may deploy a Boost stack over any pool; a binding attests the canonical
+     * one. The vault is the stack's user entry point; the other stack contracts are discoverable
+     * from it and from the Boost factory registry.
+     */
     mapping(address => address) private _poolBoost;
 
-    /// @notice Pools that currently have a verified Boost binding.
+    /**
+     * @dev Pools that currently have a verified Boost binding.
+     */
     EnumerableSetLib.AddressSet private _boostedPools;
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     mapping(address => bool) public override isPrivatePool;
 
-    /// @dev Per-pool LP allowlist of the private pools. Lives here, not
-    ///      on the pool, so the gate stays cheap for the pool and the
-    ///      admin surface stays in one contract. Enumerable so the full
-    ///      list is readable on-chain ({getLpAllowlist}); membership
-    ///      (`contains`) is a single mapping read, so the mint-gate hot
-    ///      path costs the same as a bool mapping — only admin writes
-    ///      pay the set bookkeeping. Meaningful only while
-    ///      `isPrivatePool[pool]`.
+    /**
+     * @dev LP allowlist per private pool. Kept on the factory so the pool's mint gate is one
+     * `staticcall` and the admin surface stays in one contract. Enumerable for {getLpAllowlist};
+     * membership is a single mapping read, so only admin writes pay the set bookkeeping.
+     * Meaningful only while `isPrivatePool[pool]`.
+     */
     mapping(address => EnumerableSetLib.AddressSet) private _lpAllowlist;
 
     // ============ Constructor ============
 
+    /**
+     * @notice Deploys the factory and its singleton {EquilibraParamTimelock}.
+     * @dev Reverts `ZeroAddress` for a zero implementation, collector or WETH9 and
+     * `InvalidProtocolFee` above `MAX_PROTOCOL_FEE`; the fee is validated here because pools
+     * snapshot it at creation. Emits {ProtocolFeeChanged} from `0`.
+     * @param _poolImplementation Pool implementation every clone delegates to.
+     * @param _feeCollector Initial recipient of protocol fees.
+     * @param _WETH9 Wrapped-native token of the chain.
+     * @param _protocolFeePercent Initial protocol fee in percent of the swap fee.
+     */
     constructor(
         address _poolImplementation,
         address _feeCollector,
@@ -137,10 +150,7 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         if (_poolImplementation == address(0)) revert Errors.ZeroAddress();
         if (_feeCollector == address(0)) revert Errors.ZeroAddress();
         if (_WETH9 == address(0)) revert Errors.ZeroAddress();
-        // Pools SNAPSHOT the live protocol fee at creation, so the fee
-        // must hold from the very first block — a post-deploy
-        // `setProtocolFee` would leave a window where pools lock in a
-        // zero protocol share forever. Same bounds as the setter.
+        // Same bound as `setProtocolFee`; pools snapshot the value at creation.
         if (_protocolFeePercent > Constants.MAX_PROTOCOL_FEE) revert Errors.InvalidProtocolFee();
 
         poolImplementation = _poolImplementation;
@@ -153,17 +163,23 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
 
     // ============ Atomic Pool Creation + Liquidity ============
 
+    /**
+     * @notice Payload the factory passes to the pool's genesis `addLiquidity` and decodes back in
+     * {equilibraMintCallback}.
+     */
     struct MintCallbackData {
         address token0;
         address token1;
         uint32 pairPoolIndex;
         address payer;
-        // When set, the WETH9 leg is paid from this contract's
-        // just-wrapped balance instead of being pulled from `payer`.
+        /// Pay the WETH9 leg from the factory's just-wrapped balance instead of pulling it from
+        /// `payer`.
         bool wethFromValue;
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function createPoolAndAddLiquidity(
         address tokenA,
         address tokenB,
@@ -175,7 +191,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _createAndSeed(tokenA, tokenB, config, amountA, amountB, recipient, false);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function createPrivatePoolAndAddLiquidity(
         address tokenA,
         address tokenB,
@@ -187,11 +205,21 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _createAndSeed(tokenA, tokenB, config, amountA, amountB, recipient, true);
     }
 
-    /// @dev Shared create-and-seed body of the public and private
-    ///      entrypoints. `isPrivate` is threaded into the pool's
-    ///      `initialize` (immutable there) and mirrored in this
-    ///      contract's registry, which the pool's mint gate and the
-    ///      param timelock's delay selector both read.
+    /**
+     * @dev Shared body of the public and private create entrypoints: validates the config and
+     * the pair, sorts the pair, wraps attached native value, deploys and initialises the clone,
+     * registers the creator as pool admin and runs the genesis mint.
+     * @param tokenA First token, in either order.
+     * @param tokenB Second token, in either order.
+     * @param config Full pool configuration.
+     * @param amountA Seed amount of `tokenA` in raw token units.
+     * @param amountB Seed amount of `tokenB` in raw token units.
+     * @param recipient Receiver of the genesis LP shares.
+     * @param isPrivate Selects the private path: allowlist seeding, the pool's immutable privacy
+     * flag and the timelock's short delay.
+     * @return pool Address of the new clone.
+     * @return sharesOut LP shares minted to `recipient`.
+     */
     function _createAndSeed(
         address tokenA,
         address tokenB,
@@ -201,38 +229,23 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         address recipient,
         bool isPrivate
     ) private returns (address pool, uint256 sharesOut) {
-        // Config validity — first and cheapest gate. Catches malformed
-        // `alpha`, fees, repeg knobs and ramp width before we touch any
-        // pair-level logic or storage.
-        _validatePoolConfig(config);
+        // Cheapest gate first: config bounds before any pair or storage work.
+        _validatePoolConfig(config, isPrivate);
 
-        // Pair validity — fail-fast BEFORE the sort. `tokenA == tokenB`
-        // is symmetric, so checking it pre-sort skips redundant work
-        // (and naturally rejects the `address(0) == address(0)` case
-        // before the zero-address check below).
+        // Symmetric check, so it runs before the sort; it also rejects the all-zero pair.
         if (tokenA == tokenB) revert Errors.IdenticalTokens();
 
-        // Sort the pair to canonical `(token0, token1)` ordering exactly
-        // once at the API boundary; the pool's storage, the CREATE2
-        // salt and the seed amounts all consume the sorted form.
-        // {_createPool} below trusts this ordering and skips its own
-        // sort.
+        // Canonical `(token0, token1)` order, sorted once here: the pool storage, the CREATE2
+        // salt and the amounts consume the sorted form, and `_createPool` does not sort again.
         (address token0, address token1, uint256 amount0, uint256 amount1) = tokenA < tokenB
             ? (tokenA, tokenB, amountA, amountB)
             : (tokenB, tokenA, amountB, amountA);
 
-        // Zero-address check AFTER sort. `address(0)` is the smallest
-        // address, so if either input is zero the sort forces it into
-        // `token0` — a single `token0 == 0` check covers both inputs.
+        // `address(0)` sorts lowest, so one `token0` check covers both inputs.
         if (token0 == address(0)) revert Errors.ZeroAddress();
 
-        // Native-value seeding: attached value funds the WETH9 side of
-        // the pair. Strict equality with that side's declared amount —
-        // a genesis mint consumes the declared amounts exactly, so a
-        // legitimate excess cannot exist and no refund path is needed
-        // (this contract's wrapped balance provably returns to zero
-        // within the call). `msg.value == 0` keeps the pure ERC-20
-        // path for both legs, WETH9 included.
+        // Attached value funds the WETH9 leg and must equal it exactly: a genesis mint consumes
+        // the declared amounts in full, so no refund path is needed.
         bool wethFromValue;
         if (msg.value != 0) {
             if (token0 != WETH9 && token1 != WETH9) revert Errors.NoWethLeg();
@@ -242,28 +255,19 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
             wethFromValue = true;
         }
 
-        // `_createPool` returns the per-pair index it just allocated,
-        // so we forward it into the mint-callback payload without a
-        // second `_poolsByPair[...].length()` read.
+        // Reuse the index `_createPool` allocated instead of re-reading the set length.
         uint32 pairPoolIndex;
         (pool, pairPoolIndex) = _createPool(token0, token1, config, isPrivate);
 
         if (isPrivate) {
             isPrivatePool[pool] = true;
             emit PrivatePoolCreated(pool, msg.sender);
-            // Seed the allowlist with the creator (the pool admin, who
-            // must be able to top the pool up) and the genesis
-            // recipient — otherwise the seeding mint below would fail
-            // its own gate.
+            // Allowlist the admin and the genesis recipient, or the seeding mint fails its gate.
             _setLpAllowed(pool, msg.sender, true);
             if (recipient != msg.sender) _setLpAllowed(pool, recipient, true);
         }
 
-        // The creator becomes the pool's parameter administrator: the
-        // runtime-safe subset of the config stays tunable through the
-        // param timelock — 24-hour delay, or `PRIVATE_DELAY` for
-        // private pools (see {EquilibraParamTimelock} for the trust
-        // model and the change policy).
+        // The creator administers the runtime-tunable parameters through the timelock.
         EquilibraParamTimelock(paramTimelock).registerPool(pool, msg.sender);
 
         bytes memory cbData = abi.encode(
@@ -276,44 +280,33 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
             })
         );
 
-        // No `minShares` slippage guard exposed at the factory API:
-        // a genesis mint has no prior pool state to race against, and
-        // the seeder controls both inputs **and** the initial anchor
-        // price, so `sharesOut = sqrt(xWad · yWad) - MIN_INITIAL_LIQUIDITY`
-        // is fully determined by `(amountA, amountB)`. We pass `0` to
-        // the pool's `addLiquidity` (the parameter still matters for
-        // proportional mints via the router, but not here).
+        // `minShares = 0`: a genesis mint has no prior state to race and the seeder fixes both
+        // inputs and the initial price, so `sharesOut` is determined by `(amountA, amountB)`.
         sharesOut = IEquilibraPool(pool).addLiquidity(amount0, amount1, 0, recipient, cbData);
     }
 
     // ============ Internal Pool Creation ============
 
-    /// @dev Internal pool deployment + initialisation used exclusively by
-    ///      {createPoolAndAddLiquidity}. Kept private to the contract so
-    ///      that no external caller can deploy an empty pool and front-run
-    ///      its initial price (the empty pool would otherwise grant the
-    ///      next caller free anchor placement and the price-setting bonus).
-    ///
-    ///      **Caller contract:** the sole caller is responsible for the
-    ///      pair-level invariants — `token0 < token1` (canonical sort)
-    ///      and `token0 != 0` (which, after the sort, also implies
-    ///      `token1 != 0`) — and for validating `config` via
-    ///      {_validatePoolConfig}. This helper performs no input
-    ///      validation; it just deploys + initialises the clone and
-    ///      bookkeeps the registries. Returning `pairPoolIndex` lets
-    ///      the caller forward it into the mint-callback payload
-    ///      without a second `_poolsByPair[pairKey].length()` storage
-    ///      read.
+    /**
+     * @dev Deploys and initialises one clone and records it in the registries. Internal only, so
+     * no external caller can deploy an empty pool and front-run its anchor. Performs no
+     * validation: the caller guarantees `token0 < token1`, `token0 != address(0)` (which after
+     * the sort implies `token1 != address(0)`) and a config validated by {_validatePoolConfig}.
+     * @param token0 Lower-sorted token.
+     * @param token1 Higher-sorted token.
+     * @param config Validated pool configuration.
+     * @param isPrivate Privacy flag stored immutably in the pool.
+     * @return pool Address of the new clone.
+     * @return pairPoolIndex Pair-local index assigned to the clone, returned so the caller can
+     * forward it into the mint-callback payload without a second set-length read.
+     */
     function _createPool(
         address token0,
         address token1,
         PoolConfig calldata config,
         bool isPrivate
     ) internal returns (address pool, uint32 pairPoolIndex) {
-        // Deterministic clone: salt derived from the sorted pair +
-        // in-pair index. Tokens are already sorted by the caller
-        // (see precondition in the NatSpec above), so we skip the
-        // redundant sort inside `_getPairKey` and hash directly.
+        // Salt = sorted pair + pair-local index; the caller sorted, so hash the pair directly.
         bytes32 pairKey = keccak256(abi.encode(token0, token1));
         pairPoolIndex = uint32(_poolsByPair[pairKey].length());
         {
@@ -330,7 +323,12 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit PoolCreated(token0, token1, pool, msg.sender, pairPoolIndex, allPools.length, config);
     }
 
-    /// @inheritdoc IEquilibraMintCallback
+    /**
+     * @inheritdoc IEquilibraMintCallback
+     * @dev Accepts calls only from the pool registered at the payload's pair key and index
+     * (`InvalidCallbackSender`). A WETH9 leg funded by native value is paid from the factory's
+     * just-wrapped balance; every other leg is pulled from the payer's approval.
+     */
     function equilibraMintCallback(
         uint256 amount0Owed,
         uint256 amount1Owed,
@@ -338,18 +336,12 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
     ) external override {
         MintCallbackData memory cbData = abi.decode(data, (MintCallbackData));
 
-        // `cbData.{token0, token1}` were written by `_createPool` from the
-        // already-sorted pair, so hash directly instead of going through
-        // `_getPairKey` (which would sort again for no benefit).
+        // The payload carries the sorted pair, so hash it directly.
         bytes32 pairKey = keccak256(abi.encode(cbData.token0, cbData.token1));
         if (_poolsByPair[pairKey].at(cbData.pairPoolIndex) != msg.sender)
             revert Errors.InvalidCallbackSender();
 
-        // The WETH9 leg of a native-value seed is paid from this
-        // contract's just-wrapped balance (`_createAndSeed` deposited
-        // exactly that leg's amount in the same call); the other leg —
-        // and every leg of a pure ERC-20 seed — is pulled from the
-        // payer's approval as before.
+        // Native-funded WETH9 leg: pay from the wrapped balance; otherwise pull from the payer.
         if (amount0Owed > 0) {
             if (cbData.wethFromValue && cbData.token0 == WETH9) {
                 SafeTransferLib.safeTransfer(cbData.token0, msg.sender, amount0Owed);
@@ -378,7 +370,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
 
     // ============ View Functions ============
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolsByPair(
         address tokenA,
         address tokenB
@@ -386,7 +380,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _poolsByPair[_getPairKey(tokenA, tokenB)].values();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolsByPairPage(
         address tokenA,
         address tokenB,
@@ -410,12 +406,16 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         remaining = total - end;
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolCountForPair(address tokenA, address tokenB) external view returns (uint256) {
         return _poolsByPair[_getPairKey(tokenA, tokenB)].length();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolAt(
         address tokenA,
         address tokenB,
@@ -424,7 +424,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _poolsByPair[_getPairKey(tokenA, tokenB)].at(index);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getWhitelistedPoolsByPair(
         address tokenA,
         address tokenB
@@ -432,7 +434,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _whitelistedPoolsByPair[_getPairKey(tokenA, tokenB)].values();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getWhitelistedPoolCountForPair(
         address tokenA,
         address tokenB
@@ -440,7 +444,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _whitelistedPoolsByPair[_getPairKey(tokenA, tokenB)].length();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getWhitelistedPoolAt(
         address tokenA,
         address tokenB,
@@ -449,7 +455,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _whitelistedPoolsByPair[_getPairKey(tokenA, tokenB)].at(index);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function isPoolWhitelisted(
         address tokenA,
         address tokenB,
@@ -458,27 +466,37 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         return _whitelistedPoolsByPair[_getPairKey(tokenA, tokenB)].contains(pool);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolsByCreator(address creator) external view returns (address[] memory) {
         return _poolsByCreator[creator];
     }
 
-    /// @notice Get number of pools created by an address.
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolsByCreatorCount(address creator) external view returns (uint256) {
         return _poolsByCreator[creator].length;
     }
 
-    /// @notice Get total number of pools created.
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function allPoolsLength() external view returns (uint256) {
         return allPools.length;
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function owner() public view override(Ownable, IEquilibraFactory) returns (address) {
         return Ownable.owner();
     }
 
-    /// @notice Compute the deterministic address of a pool without deploying.
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function computePoolAddress(
         address tokenA,
         address tokenB,
@@ -492,36 +510,39 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
 
     // ============ Private-pool LP allowlist ============
 
-    /// @inheritdoc IEquilibraFactory
-    /// @dev Self-contained answer to "may `account` receive freshly
-    ///      minted LP of `pool`?": public pools admit everyone, so the
-    ///      raw set (never written for them) must not leak through
-    ///      as a blanket `false` — integrators use this view directly.
+    /**
+     * @inheritdoc IEquilibraFactory
+     * @dev Public pools admit everyone, so their never-written raw set must not leak through as
+     * a blanket `false`.
+     */
     function isLpAllowed(address pool, address account) external view override returns (bool) {
         return !isPrivatePool[pool] || _lpAllowlist[pool].contains(account);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getLpAllowlist(address pool) external view override returns (address[] memory) {
         return _lpAllowlist[pool].values();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getLpAllowlistLength(address pool) external view override returns (uint256) {
         return _lpAllowlist[pool].length();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function setLpAllowed(
         address pool,
         address[] calldata accounts,
         bool allowed
     ) external override {
         if (!isPrivatePool[pool]) revert Errors.NotPrivatePool();
-        // The pool admin is the creator, resolved LIVE from the param
-        // timelock — so the two-step handover (and renounce, which
-        // freezes the allowlist along with the parameters) governs this
-        // registry too, with no second role to keep in sync.
+        // Admin resolved live from the timelock: handover and renounce govern this registry too.
         if (msg.sender != EquilibraParamTimelock(paramTimelock).poolAdmin(pool))
             revert Errors.NotPoolAdmin();
         for (uint256 i; i < accounts.length; ++i) {
@@ -529,9 +550,10 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         }
     }
 
-    /// @dev Idempotent single-entry write + event. Emitting
-    ///      unconditionally (even on a no-op re-set) keeps the event log
-    ///      a faithful record of admin intent.
+    /**
+     * @dev Idempotent single-entry write. Emits unconditionally so the log records every admin
+     * write, including no-op re-sets.
+     */
     function _setLpAllowed(address pool, address account, bool allowed) private {
         if (allowed) {
             _lpAllowlist[pool].add(account);
@@ -543,7 +565,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
 
     // ============ Admin Functions ============
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function setProtocolFee(uint8 newFee) external onlyOwner {
         if (newFee > Constants.MAX_PROTOCOL_FEE) revert Errors.InvalidProtocolFee();
 
@@ -553,7 +577,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit ProtocolFeeChanged(oldFee, newFee);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function setFeeCollector(address newCollector) external onlyOwner {
         if (newCollector == address(0)) revert Errors.ZeroAddress();
 
@@ -563,7 +589,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit FeeCollectorChanged(oldCollector, newCollector);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function addPoolToWhitelist(address tokenA, address tokenB, address pool) external onlyOwner {
         if (pool == address(0)) revert Errors.ZeroAddress();
 
@@ -574,7 +602,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit PoolWhitelistUpdated(tokenA, tokenB, pool, true);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function removePoolFromWhitelist(
         address tokenA,
         address tokenB,
@@ -586,18 +616,17 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit PoolWhitelistUpdated(tokenA, tokenB, pool, false);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function setPoolBoost(address pool, address boostVault) external onlyOwner {
         if (pool == address(0) || boostVault == address(0)) revert Errors.ZeroAddress();
-        // Membership in `_poolsByPair` is the authoritative provenance
-        // check (only `_deployPool` inserts): a crafted contract can
-        // self-report any metadata, but cannot join the set. The
-        // metadata only derives the pair key to look under.
+        // Membership in `_poolsByPair` is the provenance check (only `_createPool` inserts); the
+        // self-reported metadata only selects the pair key to look under.
         IEquilibraPool.PoolMetadata memory meta = IEquilibraPool(pool).getPoolMetadata();
         if (!_poolsByPair[_getPairKey(meta.token0, meta.token1)].contains(pool))
             revert Errors.PoolNotFound();
-        // The vault must wrap exactly this pool — guards against
-        // fat-fingering a stack of a different pool.
+        // The vault must wrap exactly this pool.
         if (IBoostVaultLike(boostVault).pool() != pool) revert Errors.BoostPoolMismatch();
 
         address old = _poolBoost[pool];
@@ -607,7 +636,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit PoolBoostSet(pool, old, boostVault);
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function removePoolBoost(address pool) external onlyOwner {
         address old = _poolBoost[pool];
         if (old == address(0)) revert Errors.BoostNotBound();
@@ -618,28 +649,50 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         emit PoolBoostSet(pool, old, address(0));
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getPoolBoost(address pool) external view returns (address boostVault) {
         return _poolBoost[pool];
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getBoostedPools() external view returns (address[] memory pools) {
         return _boostedPools.values();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getBoostedPoolCount() external view returns (uint256 count) {
         return _boostedPools.length();
     }
 
-    /// @inheritdoc IEquilibraFactory
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
     function getBoostedPoolAt(uint256 index) external view returns (address pool) {
         return _boostedPools.at(index);
     }
 
     // ============ Internal Functions ============
 
+    /**
+     * @dev Packs the validated config into the pool's initialization words and initialises the
+     * clone. Enforces the cross-parameter budget `repegShareBps + protocolFee · 100 ≤ BPS`
+     * (`RepegShareExceedsBudget`): every fee splits into the protocol slice, the repeg share and
+     * the LP residual, and the bound keeps the residual non-negative and the pool's
+     * `BPS − protocolFee · 100` gross-up denominator positive. Token decimal scales are resolved
+     * here so the implementation neither links `IERC20Metadata` nor exponentiates at init.
+     * @param pool Freshly deployed clone.
+     * @param token0 Lower-sorted token.
+     * @param token1 Higher-sorted token.
+     * @param config Validated pool configuration.
+     * @param pairPoolIndex Pair-local index, embedded in the LP token name and symbol.
+     * @param isPrivate Privacy flag stored immutably in the pool.
+     */
     function _initializePool(
         address pool,
         address token0,
@@ -648,54 +701,27 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         uint32 pairPoolIndex,
         bool isPrivate
     ) internal {
-        // Cross-parameter invariant: every fee dollar is split three
-        // ways — `protocolFeePercent / 100` to the protocol, the rest
-        // becomes LP unit-value growth, of which `repegShareBps / BPS`
-        // funds repegs and the residual stays with LPs. To leave a
-        // non-negative residual, `repegShareBps + protocolFee × 100`
-        // must not exceed `BPS`. This is also what guarantees the
-        // `BPS − protocolFeePercent × 100` denominator in the pool's
-        // `_tryAutoRepeg` threshold formula stays strictly positive.
+        // Protocol slice + repeg share + LP residual must fit in BPS.
         if (uint256(config.repegShareBps) + uint256(protocolFee) * 100 > Constants.BPS)
             revert Errors.RepegShareExceedsBudget();
 
         string memory sym0 = _safeSymbol(token0);
         string memory sym1 = _safeSymbol(token1);
 
-        // Decimal-lift scales are computed here (instead of inside
-        // every pool clone's `initialize`) so the implementation
-        // bytecode does not have to link `IERC20Metadata` or run two
-        // `**` ops at init. Validation lives next to the `decimals()`
-        // call so a malformed token never reaches the pool.
+        // Resolved next to the `decimals()` call so a malformed token never reaches the pool.
         (uint64 t0Scale, uint64 t1Scale) = (_resolveTokenScale(token0), _resolveTokenScale(token1));
 
         IEquilibraPool(pool).initialize(
             IEquilibraPool.InitParams({
                 token0: token0,
                 token1: token1,
-                token0Scale: t0Scale,
-                token1Scale: t1Scale,
-                aWad: config.aWad,
-                lambdaWad: config.lambdaWad,
-                baseFee: config.baseFee,
-                // Half-life -> internal relaxation time tau (validated
-                // against MAX_EMA_PERIOD in {_validatePoolConfig}); the
-                // pool's `getFeeConfig()` applies the exact inverse.
-                emaPeriod: uint32((uint256(config.emaPeriod) * 1000 + 693) / 694),
-                repegStepWad: config.repegStepWad,
-                repegThresholdToken1UpWad: config.repegThresholdToken1UpWad,
-                repegThresholdToken1DownWad: config.repegThresholdToken1DownWad,
-                protocolFeePercent: protocolFee,
-                pairPoolIndex: pairPoolIndex,
-                feeRampBps: config.feeRampBps,
-                feeFloorBps: config.feeFloorBps,
-                repegShareBps: config.repegShareBps,
+                feeConfigBits: _packInitialFeeConfig(config),
+                scaleRampConfig: _packInitialScaleConfig(config, t0Scale, t1Scale, pairPoolIndex),
+                curveConfig: _packInitialCurveConfig(config),
+                repegConfig: _packInitialRepegConfig(config),
                 isPrivate: isPrivate,
-                // The pair-local index is part of the metadata because
-                // several pools may exist for one pair — without it
-                // their LP tokens would be indistinguishable by name.
-                // Token symbols are attacker-controlled cosmetics;
-                // addresses remain the only identity.
+                // The pair-local index disambiguates several pools of one pair; symbols are
+                // cosmetic, addresses remain the only identity.
                 lpName: string(
                     abi.encodePacked(
                         "Equilibra LP: ",
@@ -720,41 +746,126 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         );
     }
 
-    /// @dev Read `decimals()` off the ERC-20 metadata extension and
-    ///      lift it into the pool's `token{0,1}Scale` form
-    ///      (`10**(18 - decimals)`). Reverts with
-    ///      `Errors.TokenDecimalsTooLarge` for tokens whose decimals
-    ///      exceed `Constants.MAX_TOKEN_DECIMALS = 18`.
-    ///      No `try/catch` wrapper because non-conformant ERC-20s
-    ///      cannot be paired by Equilibra anyway (every swap path
-    ///      calls `transferFrom` and `transfer`, which already require
-    ///      a real ERC-20). Letting the `decimals()` revert bubble up
-    ///      surfaces the misconfiguration at pool-creation time
-    ///      instead of on the first swap.
+    /**
+     * @dev Packs the fee word the pool stores in the 88 bits above `_factory`, in the pool's
+     * declaration order: `_baseFee` (16 bits at 0), `_protocolFeePercent` (8 at 16),
+     * `_emaPeriod` (32 at 24, holding `tau = ceil(emaPeriod · 1000 / 694)`), `_feeFloorBps`
+     * (16 at 56) and `_repegShareBps` (16 at 72, holding the share grossed up by the protocol
+     * slice, `repegShareBps · BPS / (BPS − protocolFee · 100)`, at most `BPS` by the budget
+     * guard). The top 8 bits are zero. Reached only after {_validatePoolConfig} and the budget
+     * guard, so every field fits its width.
+     * @param config Validated pool configuration.
+     * @return Packed fee word.
+     */
+    function _packInitialFeeConfig(PoolConfig calldata config) private view returns (uint96) {
+        uint256 share = (uint256(config.repegShareBps) * Constants.BPS) /
+            (Constants.BPS - uint256(protocolFee) * 100);
+        uint256 tau = (uint256(config.emaPeriod) * 1000 + 693) / 694;
+        return
+            uint96(
+                uint256(config.baseFee) |
+                    (uint256(protocolFee) << 16) |
+                    (tau << 24) |
+                    (uint256(config.feeFloorBps) << 56) |
+                    (share << 72)
+            );
+    }
+
+    /**
+     * @dev Packs the word the pool stores at `_token0Scale.slot`, in the pool's declaration
+     * order: `_token0Scale` (64 bits at 0), `_token1Scale` (64 at 64), `_pairPoolIndex` (32 at
+     * 128), `_parachuteBandMult` (8 at 160, seeded with `REPEG_PARACHUTE_BAND_MULT`) and
+     * `_feeRampDistWad` (64 at 168, `feeRampBps · 1e14` in WAD). The top 24 bits are zero.
+     * @param config Validated pool configuration.
+     * @param scale0 Decimal-lift scale of token0, `10**(18 − decimals)`.
+     * @param scale1 Decimal-lift scale of token1.
+     * @param index Pair-local index of the pool.
+     * @return Packed scales/index/ramp word.
+     */
+    function _packInitialScaleConfig(
+        PoolConfig calldata config,
+        uint64 scale0,
+        uint64 scale1,
+        uint32 index
+    ) private pure returns (uint256) {
+        return
+            uint256(scale0) |
+            (uint256(scale1) << 64) |
+            (uint256(index) << 128) |
+            (uint256(Constants.REPEG_PARACHUTE_BAND_MULT) << 160) |
+            ((uint256(config.feeRampBps) * 1e14) << 168);
+    }
+
+    /**
+     * @dev Packs the word the pool stores at `_aWad.slot`, in the pool's declaration order:
+     * `_aWad` (64 bits at 0), `_lambdaWad` (64 at 64) and `_repegThresholdToken1DownWad` (64 at
+     * 128). All three are bounded at or below `WAD < 2^64`; the top 64 bits are zero.
+     * @param config Validated pool configuration.
+     * @return Packed curve word.
+     */
+    function _packInitialCurveConfig(PoolConfig calldata config) private pure returns (uint256) {
+        return
+            uint256(config.aWad) |
+            (uint256(config.lambdaWad) << 64) |
+            (config.repegThresholdToken1DownWad << 128);
+    }
+
+    /**
+     * @dev Packs the word the pool stores at `_lastEmaTs.slot`, in the pool's declaration order:
+     * `_lastEmaTs` (64 bits at 0) and `_lastRepegTs` (64 at 64), both seeded with the current
+     * block timestamp, `_repegStepWad` (64 at 128) and `_repegThresholdToken1UpWad` (64 at 192);
+     * the last two are bounded at or below `WAD < 2^64`.
+     * @param config Validated pool configuration.
+     * @return Packed repeg word.
+     */
+    function _packInitialRepegConfig(PoolConfig calldata config) private view returns (uint256) {
+        uint256 timestamp = uint64(block.timestamp);
+        return
+            timestamp |
+            (timestamp << 64) |
+            (config.repegStepWad << 128) |
+            (config.repegThresholdToken1UpWad << 192);
+    }
+
+    /**
+     * @dev Reads `decimals()` and lifts it to the pool's scale `10**(18 − decimals)`. Reverts
+     * `TokenDecimalsTooLarge` above `MAX_TOKEN_DECIMALS = 18`. No `try/catch`: a `decimals()`
+     * revert bubbles up so a non-conformant token fails at creation instead of on the first
+     * swap.
+     * @param token ERC-20 token to inspect.
+     * @return scale Decimal-lift scale in `[1, 1e18]`.
+     */
     function _resolveTokenScale(address token) internal view returns (uint64 scale) {
         uint8 decimals = IERC20Metadata(token).decimals();
         if (decimals > Constants.MAX_TOKEN_DECIMALS) revert Errors.TokenDecimalsTooLarge();
-        // `MAX_TOKEN_DECIMALS = 18`, so the exponent is in `[0, 18]`
-        // and `10 ** 18` fits in `uint64`.
+        // Exponent in `[0, 18]`, so `10 ** 18` fits `uint64`.
         scale = uint64(10 ** (18 - decimals));
     }
 
+    /**
+     * @dev Order-independent pair key `keccak256(abi.encode(min(tokenA, tokenB), max(tokenA,
+     * tokenB)))`.
+     */
     function _getPairKey(address tokenA, address tokenB) internal pure returns (bytes32) {
         (address left, address right) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
         return keccak256(abi.encode(left, right));
     }
 
-    /// @dev Validates every `PoolConfig` field against the bounds in
-    ///      `Constants.sol`. Each check reverts with its dedicated
-    ///      `Invalid*` / `FeeRamp*` error so off-chain consumers can
-    ///      surface a precise reason. `feeRampBps == 0` is a
-    ///      legitimate opt-out (every swap then pays the flat
-    ///      `baseFee`); `feeRampBps != 0 && baseFee == feeFloorBps`
-    ///      is rejected — the smoothstep ramp would have no headroom
-    ///      to interpolate, so the misconfig must fail fast at deploy
-    ///      time.
-    function _validatePoolConfig(PoolConfig calldata config) internal pure {
-        // Two-knob concentration parameters
+    /**
+     * @dev Validates every {PoolConfig} field against `Constants`; each violated bound reverts
+     * with its own error: `InvalidA`, `InvalidLambda`, `InvalidFee`, `InvalidEmaPeriod` (floor
+     * `MIN_PUBLIC_EMA_PERIOD` for public and `MIN_EMA_PERIOD` for private pools, and
+     * `tau = ceil(emaPeriod · 1000 / 694) ≤ MAX_EMA_PERIOD`), `InvalidRepegStep`,
+     * `InvalidRepegThreshold` (both bands in [1, WAD)), `InvalidRepegShare`, and for a
+     * live ramp `InvalidFeeRamp` above `MAX_FEE_RAMP_BPS`, `InvalidFeeFloor` outside
+     * `1 ≤ feeFloorBps < baseFee` and `FeeRampTooNarrow` when
+     * `feeRampBps · (BPS − baseFee)² < FEE_RAMP_GUARD_MULT · BPS · (baseFee − feeFloorBps)²`.
+     * `feeRampBps == 0` selects flat `baseFee` and skips the floor and guard checks. The
+     * share-versus-protocol-fee budget is checked in {_initializePool}.
+     * @param config Configuration to validate.
+     * @param isPrivate Selects the private-pool EMA floor.
+     */
+    function _validatePoolConfig(PoolConfig calldata config, bool isPrivate) internal pure {
         if (config.aWad < Constants.A_MIN_WAD || config.aWad > Constants.A_MAX_WAD)
             revert Errors.InvalidA();
         if (
@@ -762,53 +873,35 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
             config.lambdaWad > Constants.LAMBDA_MAX_WAD
         ) revert Errors.InvalidLambda();
 
-        // Fees
         if (config.baseFee < Constants.MIN_BASE_FEE || config.baseFee > Constants.MAX_BASE_FEE)
             revert Errors.InvalidFee();
 
-        // EMA period. The configured value is the oracle HALF-LIFE in
-        // seconds; the pool stores the internal relaxation time
-        // `tau = ceil(period * 1000 / 694)` — the exact integer inverse
-        // of that view's `tau * 694 / 1000`.
+        // `emaPeriod` is the half-life; the pool stores `tau = ceil(emaPeriod · 1000 / 694)`, the
+        // exact integer inverse of the view's `tau · 694 / 1000`.
         if (
-            config.emaPeriod < Constants.MIN_EMA_PERIOD ||
+            config.emaPeriod <
+                (isPrivate ? Constants.MIN_EMA_PERIOD : Constants.MIN_PUBLIC_EMA_PERIOD) ||
             (uint256(config.emaPeriod) * 1000 + 693) / 694 > Constants.MAX_EMA_PERIOD
         ) revert Errors.InvalidEmaPeriod();
 
-        // Repeg step (cap on the relative anchor move per repeg commit)
         if (
             config.repegStepWad < Constants.MIN_REPEG_STEP ||
             config.repegStepWad > Constants.MAX_REPEG_STEP
         ) revert Errors.InvalidRepegStep();
 
-        // Direction-split repeg dead-bands; each shares the step range.
+        // Dead-bands stay below the EMA cap's 100% deviation.
         if (
             config.repegThresholdToken1UpWad < Constants.MIN_REPEG_STEP ||
-            config.repegThresholdToken1UpWad > Constants.MAX_REPEG_STEP ||
+            config.repegThresholdToken1UpWad >= Constants.WAD ||
             config.repegThresholdToken1DownWad < Constants.MIN_REPEG_STEP ||
-            config.repegThresholdToken1DownWad > Constants.MAX_REPEG_STEP
+            config.repegThresholdToken1DownWad >= Constants.WAD
         ) revert Errors.InvalidRepegThreshold();
 
-        // Smoothstep dynamic-fee warm-up width
-        if (config.feeRampBps > Constants.MAX_FEE_RAMP_BPS) revert Errors.InvalidFeeRamp();
-
-        // Floor must not exceed the ceiling (`baseFee`)
-        if (config.feeFloorBps > config.baseFee) revert Errors.InvalidFeeFloor();
-
-        // Smoothstep ramp requires strict headroom — `baseFee` must be
-        // *above* `feeFloorBps` for the ramp to interpolate. Catch the
-        // misconfig "I want a ramp but ceiling == floor" here so it
-        // never silently collapses to the flat-fee path inside the pool.
-        if (config.feeRampBps != 0 && config.baseFee == config.feeFloorBps)
-            revert Errors.FeeRampNoHeadroom();
-
-        // Monotonicity guard: on a too-narrow live ramp the terminal
-        // rate climbs faster than the gross input grows
-        // (`d(g·f(g))/dg > 1`), making a larger exact-in trade return
-        // less output over whole input intervals. The `(BPS − baseFee)²`
-        // factor scales the bound by the shrinking `1 − f` headroom at
-        // high fee ceilings. See `Constants.FEE_RAMP_GUARD_MULT`.
         if (config.feeRampBps != 0) {
+            if (config.feeRampBps > Constants.MAX_FEE_RAMP_BPS) revert Errors.InvalidFeeRamp();
+            if (config.feeFloorBps == 0 || config.feeFloorBps >= config.baseFee)
+                revert Errors.InvalidFeeFloor();
+            // Monotonicity guard, live ramps only.
             uint256 span = uint256(config.baseFee) - uint256(config.feeFloorBps);
             uint256 inv = Constants.BPS - uint256(config.baseFee);
             if (
@@ -817,49 +910,18 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
             ) revert Errors.FeeRampTooNarrow();
         }
 
-        // Repeg/LP profit split — implicit `≥ 0` via `uint16`,
-        // explicit upper bound `MAX_REPEG_SHARE_BPS == BPS`.
+        // `uint16` makes the lower bound implicit; `MAX_REPEG_SHARE_BPS == BPS`.
         if (config.repegShareBps > Constants.MAX_REPEG_SHARE_BPS) revert Errors.InvalidRepegShare();
-
-        // Stall guard — only meaningful when auto-repeg is live
-        // (`repegShareBps == 0` short-circuits `_tryAutoRepeg` before
-        // the thresholds are ever read, so they are inert and any value
-        // is acceptable). Each dead-band pins the first permitted repeg
-        // attempt on its side at `deviation == threshold`, where the move's
-        // LP-unit-value cost grows ~quadratically in the deviation
-        // while the fee-funded growth budget accrued by the very flow
-        // that created the deviation grows only ~linearly. A threshold
-        // far above the fee scale therefore yields a pool whose repeg
-        // can never afford to fire from its own flow — at any
-        // deviation — and pool parameters are immutable, so the
-        // misconfig would strand the anchor until a timelocked
-        // threshold or fee change lifts it. Keep each band at or below
-        // the fee scale: the floor when the smoothstep ramp is live,
-        // the flat `baseFee` otherwise (all read as relative
-        // fractions; `1 bps == 1e14` WAD). The step cap needs no such
-        // guard: a large cap only widens the per-commit ceiling, the
-        // damping `deviation/5` keeps individual moves proportional.
-        // See CLAUDE.md "Sizing the repeg knobs".
-        if (config.repegShareBps != 0) {
-            uint256 feeScaleBps = config.feeRampBps == 0
-                ? uint256(config.baseFee)
-                : uint256(config.feeFloorBps);
-            if (
-                config.repegThresholdToken1UpWad > feeScaleBps * 1e14 ||
-                config.repegThresholdToken1DownWad > feeScaleBps * 1e14
-            ) revert Errors.RepegThresholdExceedsFeeScale();
-        }
     }
 
-    /// @dev Cosmetic-metadata reader for the LP token's name / symbol.
-    ///      Delegates to Solady's {MetadataReaderLib.readSymbol}, which
-    ///      handles both standard EIP-20 Metadata `string symbol()` and
-    ///      legacy `bytes32 symbol()` (MKR-style) in a single assembly
-    ///      probe — Solidity's `try/catch` cannot trap ABI decode
-    ///      failures, so the hand-rolled dual-interface approach is not
-    ///      viable here. Returns `"???"` if the token has no `symbol()`
-    ///      selector at all, so a missing symbol never blocks pool
-    ///      creation.
+    /**
+     * @dev Cosmetic symbol reader for the LP token metadata. Solady's
+     * {MetadataReaderLib.readSymbol} handles both `string symbol()` and legacy `bytes32 symbol()`
+     * in one probe (Solidity `try/catch` cannot trap ABI-decoding failures). Returns `"???"` when
+     * the token has no usable symbol, so a missing symbol never blocks pool creation.
+     * @param token ERC-20 token to read.
+     * @return Symbol string, `"???"` when unavailable.
+     */
     function _safeSymbol(address token) internal view returns (string memory) {
         string memory sym = MetadataReaderLib.readSymbol(token);
         return bytes(sym).length == 0 ? "???" : sym;

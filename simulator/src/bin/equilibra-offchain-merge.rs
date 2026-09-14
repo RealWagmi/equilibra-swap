@@ -154,6 +154,7 @@ fn main() -> Result<()> {
         merged,
         &cli.report_output,
         &oracle_data_dir,
+        &provenance.material.oracle_snapshot,
         &result_digest,
     )
     .with_context(|| "generate compact report from merged shards")?;

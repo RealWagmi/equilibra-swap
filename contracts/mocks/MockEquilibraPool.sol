@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
+import { PoolOracle } from "../libraries/PoolOracle.sol";
 import { EquilibraPool } from "../EquilibraPool.sol";
 import { IEquilibraPool } from "../interfaces/IEquilibraPool.sol";
 import { EquilibraSwapMath } from "../libraries/EquilibraSwapMath.sol";
+import { SwapMathDiagnostics } from "./SwapMathDiagnostics.sol";
 
 /// @title MockEquilibraPool
 /// @notice Test-only subclass of {EquilibraPool} that re-exposes a small
@@ -19,6 +21,22 @@ import { EquilibraSwapMath } from "../libraries/EquilibraSwapMath.sol";
 ///         identically-named internal helper on `EquilibraPool`, so the
 ///         tests exercise the production code paths verbatim.
 contract MockEquilibraPool is EquilibraPool {
+    /// @notice Exact signed-cast boundary and error-selector regression probe.
+    function exposed_toSignedPositive(uint256 value) external pure returns (int256) {
+        return _toSignedPositive(value);
+    }
+
+    /// @notice State-constructed post-swap depth and LP-growth accrual probe.
+    function exposed_setReservesAndAccrueLpValueGrowth(
+        uint256 reserve0,
+        uint256 reserve1
+    ) external returns (uint256) {
+        _setReservesInternal(reserve0, reserve1);
+        CurveSnapshot memory cs = _loadCurveParams();
+        uint256 depth = _poolDepth(reserve0, reserve1, cs);
+        return _accrueLpValueGrowth(depth, cs.priceScaleWad);
+    }
+
     /// @notice Forwards to `_computeLpUnitValueWad` using a freshly
     ///         loaded curve snapshot (`_loadCurveParams`).
     function exposed_computeLpUnitValueWad(
@@ -75,7 +93,7 @@ contract MockEquilibraPool is EquilibraPool {
         return _toWadByScale(amountRaw, scale);
     }
 
-    /// @notice Forwards to `EquilibraSwapMath.computeK`. Pure helper
+    /// @notice Forwards to `SwapMathDiagnostics.computeK`. Pure helper
     ///         used by the regression tests to evaluate the
     ///         state-only invariant against counterfactual reserve
     ///         snapshots.
@@ -85,7 +103,7 @@ contract MockEquilibraPool is EquilibraPool {
         uint256 aWad,
         uint256 lambdaWad
     ) external pure returns (uint256) {
-        return EquilibraSwapMath.computeK(xMath, yMath, aWad, lambdaWad);
+        return SwapMathDiagnostics.computeK(xMath, yMath, aWad, lambdaWad);
     }
 
     /// @notice Forwards to `EquilibraSwapMath.solveLFromState`. Pure
@@ -123,7 +141,7 @@ contract MockEquilibraPool is EquilibraPool {
                 reserve1,
                 _loadCurveParams(),
                 emaWad,
-                emaBeforeWad,
+                PoolOracle.priceToEmaLog(emaBeforeWad),
                 stepCapWad,
                 deviationWad,
                 vpFloorWad

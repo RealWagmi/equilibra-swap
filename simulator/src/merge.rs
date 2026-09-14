@@ -201,7 +201,6 @@ fn validate_metadata_compatibility(expected: &RunMetadata, candidate: &RunMetada
         || expected.end_timestamp != candidate.end_timestamp
         || expected.duration_days != candidate.duration_days
         || expected.initial_liquidity_usd.to_bits() != candidate.initial_liquidity_usd.to_bits()
-        || expected.gas_price_gwei.to_bits() != candidate.gas_price_gwei.to_bits()
     {
         return Err(anyhow!(
             "cannot merge shards with different run-wide metadata"
@@ -384,7 +383,6 @@ mod tests {
             end_timestamp: 200,
             duration_days: 1,
             initial_liquidity_usd: 1_000_000.0,
-            gas_price_gwei: 0.05,
             amm_list: vec![amm.to_string()],
             pool_list: vec![base.to_string()],
             generated_at: "ignored".to_string(),
@@ -456,7 +454,6 @@ mod tests {
                 trades: Vec::new(),
                 trade_count: 0,
                 total_profit_usd: 0.0,
-                total_gas_cost_usd: 0.0,
                 net_profit_usd: 0.0,
             }],
             recentering_events: Vec::new(),

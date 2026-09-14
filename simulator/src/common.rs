@@ -7,12 +7,13 @@ use std::collections::BTreeMap;
 /// v2: per-context slot layouts may differ across AMMs on one base
 /// (Equilibra supports base-in-slot-0), so `metadata.poolTokens` is a
 /// canonical quote-first LABELING map while `poolTokensByAmm` carries the
-/// per-context slot truth.
-pub const RESULT_FORMAT_VERSION: &str = "equilibra-run-results/v3";
+/// per-context slot truth. v4 excludes transaction-cost metadata and results.
+pub const RESULT_FORMAT_VERSION: &str = "equilibra-run-results/v4";
 
 /// Actor-policy identifier.  Under v2 the configured iteration count is a
 /// pure cap; the live interval tolerance is the convergence criterion.
-pub const ACTOR_ALGORITHM_VERSION: &str = "arb-golden-search/v2";
+/// v3 uses sensitive probe thresholds and excludes transaction costs.
+pub const ACTOR_ALGORITHM_VERSION: &str = "arb-golden-search/v3";
 
 /// Versioned meaning of the report-only slippage sweep.  The sweep is
 /// independent of the stateful `actors.user` range and is expressed in BPS of
@@ -146,7 +147,6 @@ pub struct RunMetadata {
     pub end_timestamp: u64,
     pub duration_days: u64,
     pub initial_liquidity_usd: f64,
-    pub gas_price_gwei: f64,
     pub amm_list: Vec<String>,
     pub pool_list: Vec<String>,
     pub generated_at: String,
@@ -523,7 +523,6 @@ pub fn validate_run_results_contract(results: &RunResults) -> Result<()> {
                 ));
             }
             if !trade.gross_profit_usd.is_finite()
-                || !trade.gas_cost_usd.is_finite()
                 || !trade.net_profit_usd.is_finite()
                 || !trade.fee_paid_usd.is_finite()
             {
@@ -724,7 +723,6 @@ pub struct ArbState {
     pub trades: Vec<ArbTrade>,
     pub trade_count: u64,
     pub total_profit_usd: f64,
-    pub total_gas_cost_usd: f64,
     pub net_profit_usd: f64,
 }
 
@@ -737,7 +735,6 @@ pub struct ArbTrade {
     pub amount_in: String,
     pub amount_out: String,
     pub gross_profit_usd: f64,
-    pub gas_cost_usd: f64,
     pub net_profit_usd: f64,
     pub actual_fee_bps: u64,
     pub fee_paid_usd: f64,
@@ -882,7 +879,6 @@ mod tests {
             "contextName": "equilibra:WETH",
             "tradeCount": 0,
             "totalProfitUsd": 0.0,
-            "totalGasCostUsd": 0.0,
             "netProfitUsd": 0.0
         });
         assert!(serde_json::from_value::<ArbState>(missing_trades).is_err());

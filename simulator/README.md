@@ -126,3 +126,15 @@ TypeScript counterpart `test_helpers/config.ts::EquilibraPoolParams`
 sources them from this Rust config at test time via the
 `equilibra-offchain-config-defaults` binary.
 
+
+### Persistent EMA state and simulation bounds
+
+The kernel stores unbiased `ema_log_wad`, retaining sub-price-unit updates.
+Trace replay requires signed decimal `equilibraEmaLogWad`; optional
+`equilibraEmaPrice` must match its decoded WAD price. State continuation never
+reconstructs the logarithm from that rounded price.
+
+Simulation uses the private-pool numerical envelope: EMA half-life minimum
+60 seconds and no public-only initial-price interval. Solidity alone requires
+public pools to start with EMA >= 600 seconds and 1e6 < initialPriceScaleWad < 1e30.
+Preset values are unchanged.

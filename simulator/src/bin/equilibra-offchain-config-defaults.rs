@@ -74,10 +74,16 @@ mod tests {
 
         assert_eq!(exported["config"], expected);
         assert_eq!(exported["config"]["version"], BENCHMARK_RUN_CONFIG_VERSION);
-        assert_eq!(
-            exported["config"]["actors"]["arbitrageur"]["gasUsedEstimates"]["curve"],
-            "170329"
-        );
+        let arb = &exported["config"]["actors"]["arbitrageur"];
+        assert!(arb.get("gasUsedEstimates").is_none());
+        assert!(arb.get("gasPriceGwei").is_none());
+        assert_eq!(arb["probeTriggerBps"], 1.0);
+        for base in ["WETH", "WBTC"] {
+            assert_eq!(
+                exported["config"]["amms"]["equilibra"]["presets"][base]["repegShareBps"],
+                7_000
+            );
+        }
         assert_eq!(
             exported["config"]["amms"]["curve"]["presets"]["WETH"]["donationAprBps"],
             344

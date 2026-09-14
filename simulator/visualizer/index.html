@@ -1256,68 +1256,49 @@
             </div>
             <div class="solver-info-pop" id="solverInfoPop" hidden>
               <div class="solver-info-live" id="solverInfoLive"></div>
-              <h4>What this lamp means</h4>
+              <h4>How the solver works</h4>
               <p>
-                The kernel has no closed-form solution, so every swap solves its
-                invariant iteratively. On curves whose plateau stays wide far
-                from the anchor &mdash; <code>a</code> near its ceiling with
-                <code>&lambda;</code> near its floor &mdash; that solver can
-                miss the root once a trade is large enough, and then a bigger
-                trade can return <em>less</em> output than a smaller one. The
-                miss always favours the pool: takers are short-changed, LP funds
-                are never at risk.
+                Equal-K and unchanged-candidate exits apply at every iteration;
+                there is no approximate early exit. At the 40-iteration cap,
+                best is checked once at <strong>0.0001%</strong>, otherwise
+                <code>SolverDidNotConverge</code>. A nonpositive proposed reserve
+                takes a half-step. These rounded-K checks are not a universal
+                continuous-error guarantee.
               </p>
-              <h4>How much room there is</h4>
+              <h4>Common margin and LP-depth protection</h4>
               <p>
-                The boundary is a price, not a trade size: quotes stay exact
-                while a single swap leaves the pool price inside a corridor
-                around the anchor. Even on the worst deployable curve (<code
-                  >a = 0.99</code
-                >, <code>&lambda; = 1e15</code>) that corridor spans roughly
-                &minus;57% to +134% in one swap; for the shipped presets no
-                boundary exists at all &mdash; a swap twenty times the pool's
-                size still quotes exactly. The live corridor for the curve you
-                have selected is shown at the top of this panel and on the badge
-                itself.
-              </p>
-              <h4>Why the anchor matters</h4>
-              <p>
-                That corridor is measured from the anchor, so what counts is how
-                far the pool sits from it when a trade arrives. With auto-repeg
-                tracking spot the pool stays at ~0 lag, and breaking a quote
-                then takes a single trade worth about
-                <strong>52% of the whole pool</strong>. Every percent of anchor
-                lag shrinks that: 18% of the pool at 5% lag, 8% at 50%. Repeg
-                runs between swaps, so it cannot shrink one oversized trade
-                &mdash; what it prevents is a standing offset that would leave
-                every later trade closer to the edge.
+                Every positive quote receives one <strong>0.000001% margin</strong>,
+                rounded down with a one-math-unit minimum. Exact-in output is
+                reduced; exact-out solves for an enlarged trial output using the
+                inverse margin, with no input surcharge. The trial must stay below
+                the reserve; requested settlement output is unchanged. After native rounding,
+                the pool compares fresh Q128 depth including LP fees and excluding
+                the protocol cut, at the unchanged anchor before repeg. A decrease
+                rejects <code>LpValueDecreased</code>. No reserve-ratio quantum,
+                conditional repair or second guard is applied. Curve geometry
+                includes the margin but omits native settlement, fees and repegs.
               </p>
               <h4>Reading the badge</h4>
               <p>
-                <strong>Top line</strong> &mdash;
-                <code>worst &minus;X%</code> is how much <em>less</em> output
-                the taker would receive than the curve owes, at the single worst
-                size out of 40 probes (four pool imbalances &times; ten sizes,
-                up to three times the output-side reserve). It is the solver's
-                error <em>on top of</em>
-                ordinary slippage &mdash; not the slippage itself, and not what
-                a normal-sized trade pays, which is exact.
-                <code>exact</code> replaces it when nothing strays.
+                <code>worst &minus;X%</code> is the largest output shortfall
+                against the reference calculation in 40 probes: four pool
+                imbalances &times; ten trade sizes, up to three times the
+                output-side reserve. This includes the common margin, not ordinary
+                slippage. Green means sampled shortfalls stay within 0.01% and
+                sampled output does not decrease as input grows; it does not
+                mean every quote is mathematically exact.
               </p>
+              <h4>What the tested range means</h4>
               <p>
-                <strong>Bottom line</strong> &mdash;
-                <code>exact in [low, high]</code> is the price corridor, not a
-                trade size: quotes are exact as long as one swap leaves the pool
-                price inside it, measured against the anchor (1.0 = at the
-                anchor). It is walked outward from a balanced pool and stops at
-                the first mis-solved size, so it answers &ldquo;how far can a
-                single trade move the price before the quote stops being
-                trustworthy&rdquo;. The edges are reciprocal because the kernel
-                is symmetric, and a wider corridor is a safer curve.
+                <code>tested [low, high]</code> comes from a separate walk
+                outward from a balanced pool; 1.0 is the anchor. It stops at
+                the first failing sample or the end of the walk. No failure
+                found means only that the tested extent passed, not that every
+                price, reserve imbalance or trade size inside it will pass.
               </p>
               <p class="solver-info-foot">
-                Probed off-chain against the exact settlement; nothing here runs
-                on chain.
+                The badge is an off-chain diagnostic. Native quotes and swaps
+                apply the common margin, native bounds and one strict LP guard.
               </p>
             </div>
             <div class="overlay-row curve-row">
@@ -1475,7 +1456,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                 <div class="slider-group has-fine-input">
                   <label
                     style="color: #3fb950"
-                    title="a — depth-at-anchor knob. A(D=0) = a; larger a deepens the centre. Curve Lab uses the production range [0.1, 0.99] (Constants.A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16). Slider mapping is cubic with fine resolution near the upper bound."
+                    title="a — depth-at-anchor knob. A(D=0) = a; larger a deepens the centre. Curve Lab uses the production range [0.1, 0.999999999999999999] (Constants.A_MIN_WAD = 1e17 .. A_MAX_WAD = WAD-1). Slider mapping is cubic with fine resolution near the upper bound."
                     >a</label
                   >
                   <input
@@ -1503,7 +1484,7 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
                 <div class="slider-group has-fine-input">
                   <label
                     style="color: #f6c177"
-                    title="λ — plateau-width knob. A = a/2 at λ·D = W (half-amplification distance). Larger λ narrows the plateau; smaller λ widens it. Curve Lab uses the production range [0.001, 1.0] (Constants.LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18). Slider mapping is cubic with fine resolution near the lower bound."
+                    title="λ — plateau-width knob. A = a/2 at λ·D = W (half-amplification distance). Larger λ narrows the plateau; smaller λ widens it. Curve Lab uses the production range [0.000001, 1.0] (Constants.LAMBDA_MIN_WAD = 1e12 .. LAMBDA_MAX_WAD = 1e18). Slider mapping is cubic with fine resolution near the lower bound."
                     >&lambda;</label
                   >
                   <input
@@ -1944,13 +1925,13 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
 
       // ─── Production bounds — the SINGLE source in this file ───────
       // Mirrors contracts/libraries/Constants.sol:
-      //   A_MIN_WAD = 1e17 .. A_MAX_WAD = 99e16   (display 0.1 .. 0.99)
-      //   LAMBDA_MIN_WAD = 1e15 .. LAMBDA_MAX_WAD = 1e18 (0.001 .. 1.0)
+      //   A_MIN_WAD = 1e17 .. A_MAX_WAD = WAD-1   (display 0.1 <= a < 1)
+      //   LAMBDA_MIN_WAD = 1e12 .. LAMBDA_MAX_WAD = 1e18 (0.000001 .. 1.0)
       // These constants are pushed into the DOM min/max attributes at init.
       const PW_WAD = 1000000000000000000n;
       const PW_ALPHA_MIN_WAD = 100000000000000000n;
-      const PW_ALPHA_MAX_WAD = 990000000000000000n;
-      const PW_LAMBDA_MIN_WAD = 1000000000000000n;
+      const PW_ALPHA_MAX_WAD = PW_WAD - 1n;
+      const PW_LAMBDA_MIN_WAD = 1000000000000n;
       const PW_LAMBDA_MAX_WAD = 1000000000000000000n;
       const PW_ALPHA_MIN = Number(PW_ALPHA_MIN_WAD) / Number(PW_WAD);
       const PW_ALPHA_MAX = Number(PW_ALPHA_MAX_WAD) / Number(PW_WAD);
@@ -2247,27 +2228,61 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       // user's full typed precision); the slider is a positioner only.
       // `pw{Alpha,Lambda}DisplayValue()` falls back to the cubic
       // mapping of the slider position if the fine field is empty.
-      function pwDisplayValueToWad(value, min, max, minWad, maxWad) {
-        if (value <= min) return minWad;
-        if (value >= max) return maxWad;
-        return decimalStringToWad(value.toFixed(18));
+      function pwWadToDecimal(value) {
+        const whole = value / PW_WAD;
+        const frac = (value % PW_WAD)
+          .toString()
+          .padStart(18, "0")
+          .replace(/0+$/, "");
+        return frac ? whole + "." + frac : whole.toString();
+      }
+
+      function pwReadKnobWad(id, min, max) {
+        const input = document.getElementById(id);
+        const raw = String(input?.value ?? "").trim();
+        const match = /^(\d*)(?:\.(\d{0,18}))?$/.exec(raw);
+        let value = null;
+        if (match && (match[1] || match[2])) {
+          value =
+            BigInt(match[1] || "0") * PW_WAD +
+            BigInt((match[2] || "").padEnd(18, "0"));
+        }
+        const valid = value !== null && value >= min && value <= max;
+        const error = valid
+          ? ""
+          : "Enter a decimal within [" +
+            pwWadToDecimal(min) +
+            ", " +
+            pwWadToDecimal(max) +
+            "] (at most 18 fractional digits)";
+        input?.setCustomValidity(error);
+        input?.setAttribute("aria-invalid", valid ? "false" : "true");
+        if (!valid) throw new Error(error);
+        return value;
+      }
+
+      function pwSliderWad(t, min, max, nearUpper) {
+        const scale = 10000n;
+        const position = BigInt(Math.round(_pwClamp(t, 0, 1) * Number(scale)));
+        if (position === 0n) return min;
+        if (position === scale) return max;
+        const offset = nearUpper ? scale - position : position;
+        const distance = ((max - min) * offset ** 3n) / scale ** 3n;
+        const raw = nearUpper ? max - distance : min + distance;
+        const quantum = 10000000000000n; // Existing five-decimal slider precision.
+        const rounded = ((raw + quantum / 2n) / quantum) * quantum;
+        return rounded < min ? min : rounded > max ? max : rounded;
       }
 
       function getPwLegacySolidityParams() {
-        const aDisplay = pwAlphaDisplayValue();
-        const lambdaDisplay = pwLambdaDisplayValue();
         return {
-          aWad: pwDisplayValueToWad(
-            aDisplay,
-            PW_ALPHA_MIN,
-            PW_ALPHA_MAX,
+          aWad: pwReadKnobWad(
+            "pwAlphaFine",
             PW_ALPHA_MIN_WAD,
             PW_ALPHA_MAX_WAD,
           ),
-          lambdaWad: pwDisplayValueToWad(
-            lambdaDisplay,
-            PW_LAMBDA_MIN,
-            PW_LAMBDA_MAX,
+          lambdaWad: pwReadKnobWad(
+            "pwLambdaFine",
             PW_LAMBDA_MIN_WAD,
             PW_LAMBDA_MAX_WAD,
           ),
@@ -2672,9 +2687,8 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       // Paint the solver-health lamp from the backend probe. The backend
       // re-solves each probed settlement exactly (bisection on the depth
       // `L`) and reports how far the shipped secant strays, so the lamp
-      // reflects the same kernel a real swap would run — not a heuristic.
-      // The stray is always in the pool's favour, hence the wording:
-      // takers are short-changed, liquidity is never at risk.
+      // measures kernel quote geometry, before native settlement quanta.
+      // A capped fallback is not guaranteed to err in the pool's favour.
       function renderSolverHealth(health) {
         const box = document.getElementById("solverHealth");
         const text = document.getElementById("solverHealthText");
@@ -2697,12 +2711,15 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const worst = Number(health.worstErrorPct);
         const pct = Number.isFinite(worst) ? worst : 0;
         const breaks = Number(health.monotonicityBreaks) || 0;
+        const rejected = Number(health.rejectedSamples) || 0;
         // "worst" is load-bearing: the figure is the largest gap found
         // anywhere in the probe, not what an ordinary trade pays, and it is
         // measured against the output the curve owes — not slippage.
         text.textContent =
-          status === "ok"
-            ? "solver: exact"
+          rejected > 0
+            ? `solver: ${rejected} unavailable samples`
+            : status === "ok"
+            ? "solver: OK"
             : `solver: worst −${pct < 0.01 ? pct.toExponential(1) : pct.toFixed(2)}%`;
 
         // The corridor is the operator-facing form of the boundary: how far
@@ -2711,14 +2728,17 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const low = Number(health.safePriceLow);
         const hasRange = Number.isFinite(low) && low > 0;
         range.textContent = hasRange
-          ? `exact in [${low.toFixed(4)}, ${(1 / low).toFixed(4)}]`
+          ? `tested [${low.toFixed(4)}, ${(1 / low).toFixed(4)}]`
           : "";
 
         if (!live) return;
         const rows = [];
+        if (rejected > 0) {
+          rows.push(`<div><strong>Unavailable:</strong> ${rejected} trial(s) returned no usable quote. These are not zero-error samples.</div>`);
+        }
         if (hasRange) {
           rows.push(
-            `<div><strong>Exact price range:</strong> [${low.toFixed(4)}, ${(
+            `<div><strong>Tested from balance:</strong> [${low.toFixed(4)}, ${(
               1 / low
             ).toFixed(4)}] of the anchor — ${((low - 1) * 100).toFixed(
               1,
@@ -2727,9 +2747,9 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         }
         if (status === "ok") {
           rows.push(
-            "<div>Every probed trade settles on the curve for this (a, λ) — no boundary found.</div>",
+            "<div>Sampled quotes stay within tolerance; no failing sample found.</div>",
           );
-        } else {
+        } else if (pct > 0 || breaks > 0) {
           rows.push(
             `<div><strong>Worst probe:</strong> taker receives ${pct.toFixed(
               4,
@@ -3038,10 +3058,10 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const fine = document.getElementById("pwAlphaFine");
         if (!slider || !fine) return;
         const t = Number.parseFloat(String(slider.value));
-        const v = pwAlphaTToValue(t);
+        const v = pwSliderWad(t, PW_ALPHA_MIN_WAD, PW_ALPHA_MAX_WAD, true);
         // Only overwrite fine input if the user isn't actively typing
         // there — saves any in-progress keystrokes.
-        if (document.activeElement !== fine) fine.value = v.toFixed(5);
+        if (document.activeElement !== fine) fine.value = pwWadToDecimal(v);
         onSliderChange();
       }
       function onPwLambdaSliderInput() {
@@ -3049,8 +3069,8 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         const fine = document.getElementById("pwLambdaFine");
         if (!slider || !fine) return;
         const t = Number.parseFloat(String(slider.value));
-        const v = pwLambdaTToValue(t);
-        if (document.activeElement !== fine) fine.value = v.toFixed(5);
+        const v = pwSliderWad(t, PW_LAMBDA_MIN_WAD, PW_LAMBDA_MAX_WAD, false);
+        if (document.activeElement !== fine) fine.value = pwWadToDecimal(v);
         onSliderChange();
       }
 
@@ -3078,12 +3098,16 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       function onPwFineInputCommit(inputId, sliderId) {
         const input = document.getElementById(inputId);
         if (!input) return;
-        const raw = Number.parseFloat(String(input.value));
-        const lo = sliderId === "pwAlpha" ? PW_ALPHA_MIN : PW_LAMBDA_MIN;
-        const hi = sliderId === "pwAlpha" ? PW_ALPHA_MAX : PW_LAMBDA_MAX;
-        const clamped = _pwClamp(raw, lo, hi);
-        input.value = clamped.toFixed(5);
-        onPwFineInputType(inputId, sliderId);
+        try {
+          const value =
+            sliderId === "pwAlpha"
+              ? pwReadKnobWad(inputId, PW_ALPHA_MIN_WAD, PW_ALPHA_MAX_WAD)
+              : pwReadKnobWad(inputId, PW_LAMBDA_MIN_WAD, PW_LAMBDA_MAX_WAD);
+          input.value = pwWadToDecimal(value);
+          onPwFineInputType(inputId, sliderId);
+        } catch {
+          input.reportValidity();
+        }
       }
 
       function setLegacySliderFromScaled(id, scaledValue, rawDecimals) {
@@ -3094,25 +3118,18 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         // the real value). The fine input holds the authoritative
         // decimal — write to it first, then back-solve the slider t.
         if (id === "pwAlpha" || id === "pwLambda") {
-          const wad = 1000000000000000000n; // 1e18
-          const units = 10n ** BigInt(rawDecimals);
-          const rawUnits = (scaledValue * units) / wad;
-          const factor = Number(units);
-          // `scaledValue` may originate in the visualizer's wider
-          // research band; clamp to the on-chain envelope ONLY for the
-          // displayed decimal so the slider can still position it.
-          const numeric = Number(rawUnits) / factor;
-          const lo = id === "pwAlpha" ? PW_ALPHA_MIN : PW_LAMBDA_MIN;
-          const hi = id === "pwAlpha" ? PW_ALPHA_MAX : PW_LAMBDA_MAX;
-          const clamped = _pwClamp(numeric, lo, hi);
-          const fineId = id + "Fine";
-          const fineEl = document.getElementById(fineId);
-          if (fineEl) fineEl.value = clamped.toFixed(rawDecimals);
-          const t =
+          const min = id === "pwAlpha" ? PW_ALPHA_MIN_WAD : PW_LAMBDA_MIN_WAD;
+          const max = id === "pwAlpha" ? PW_ALPHA_MAX_WAD : PW_LAMBDA_MAX_WAD;
+          const exact =
+            scaledValue < min ? min : scaledValue > max ? max : scaledValue;
+          const fineEl = document.getElementById(id + "Fine");
+          if (fineEl) fineEl.value = pwWadToDecimal(exact);
+          const numeric = Number(pwWadToDecimal(exact)); // Slider position only, never an API value.
+          el.value = String(
             id === "pwAlpha"
-              ? pwAlphaValueToT(clamped)
-              : pwLambdaValueToT(clamped);
-          el.value = String(t);
+              ? pwAlphaValueToT(numeric)
+              : pwLambdaValueToT(numeric),
+          );
           return;
         }
 
@@ -3291,11 +3308,18 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
           };
         }
 
-        return {
-          ok: true,
-          aWad,
-          lambdaWad,
-        };
+        if (
+          aWad < PW_ALPHA_MIN_WAD ||
+          aWad > PW_ALPHA_MAX_WAD ||
+          lambdaWad < PW_LAMBDA_MIN_WAD ||
+          lambdaWad > PW_LAMBDA_MAX_WAD
+        ) {
+          return {
+            ok: false,
+            error: "aWad/lambdaWad outside the exact production bounds",
+          };
+        }
+        return { ok: true, aWad, lambdaWad };
       }
 
       function applyPwParamsFromPaste() {
@@ -3326,6 +3350,12 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
       }
 
       function onSliderChange() {
+        let knobs;
+        try {
+          knobs = getPwLegacySolidityParams();
+        } catch {
+          return;
+        }
         // Update displayed values
         const p = getParams();
         document.getElementById("x1Val").textContent = p.x1.toFixed(2);
@@ -3361,26 +3391,16 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         document.getElementById("rationalOffsetDisplay").textContent =
           rOff.toFixed(2);
 
-        // The DISPLAY value is read via the helper so we never re-do
-        // the cubic mapping inline. Re-projecting through the helper
-        // also lets a programmatic slider update (preset import,
-        // snapshot restore) refresh the fine field in lockstep without
-        // overwriting an in-progress edit.
-        const pwAlpha = pwAlphaDisplayValue();
-        document.getElementById("pwAlphaDisplay").textContent =
-          pwAlpha.toFixed(5);
-        const pwAlphaFineEl = document.getElementById("pwAlphaFine");
-        if (pwAlphaFineEl && document.activeElement !== pwAlphaFineEl) {
-          pwAlphaFineEl.value = pwAlpha.toFixed(5);
-        }
-
-        const pwLambda = pwLambdaDisplayValue();
-        const pwLambdaDisplayEl = document.getElementById("pwLambdaDisplay");
-        if (pwLambdaDisplayEl)
-          pwLambdaDisplayEl.textContent = pwLambda.toFixed(5);
-        const pwLambdaFineEl = document.getElementById("pwLambdaFine");
-        if (pwLambdaFineEl && document.activeElement !== pwLambdaFineEl) {
-          pwLambdaFineEl.value = pwLambda.toFixed(5);
+        // Preserve the exact canonical WAD through every redraw, including blur.
+        for (const [id, value] of [
+          ["pwAlpha", knobs.aWad],
+          ["pwLambda", knobs.lambdaWad],
+        ]) {
+          const text = pwWadToDecimal(value);
+          const display = document.getElementById(id + "Display");
+          if (display) display.textContent = text;
+          const fine = document.getElementById(id + "Fine");
+          if (fine && document.activeElement !== fine) fine.value = text;
         }
 
         updatePwSolidity();
@@ -5527,8 +5547,16 @@ Used only in crypto mode; ignored in stableswap. WBTC/WETH presets use γ=1e15."
         // Equilibra fine inputs carry the AUTHORITATIVE display values;
         // the paired range sliders stay in normalized t-space [0, 1]
         // (cubic mapping) and keep their own attributes.
-        setBounds("pwAlphaFine", PW_ALPHA_MIN, PW_ALPHA_MAX);
-        setBounds("pwLambdaFine", PW_LAMBDA_MIN, PW_LAMBDA_MAX);
+        setBounds(
+          "pwAlphaFine",
+          pwWadToDecimal(PW_ALPHA_MIN_WAD),
+          pwWadToDecimal(PW_ALPHA_MAX_WAD),
+        );
+        setBounds(
+          "pwLambdaFine",
+          pwWadToDecimal(PW_LAMBDA_MIN_WAD),
+          pwWadToDecimal(PW_LAMBDA_MAX_WAD),
+        );
         // YieldBasis reference-AMM kernel bounds (A is packed, γ is raw).
         setBounds("curveA", CURVE_MIN_A_PACKED, CURVE_MAX_A_PACKED);
         setBounds("curveGamma", CURVE_MIN_GAMMA, CURVE_MAX_GAMMA);

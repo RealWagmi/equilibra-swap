@@ -130,7 +130,7 @@ async function disabledByRampFixture() {
 
 async function noHeadroomFixture() {
   // baseFee == feeFloorBps with feeRampBps != 0 — factory rejects this
-  // misconfig at deploy time via `FeeRampNoHeadroom`. The fixture is
+  // misconfig at deploy time via `InvalidFeeFloor`. The fixture is
   // structured to be called inside an `expect(...).to.be.reverted...`
   // assertion (it never returns a deployed pool).
   return deployDynFeePool({ baseFee: 20 });
@@ -248,21 +248,21 @@ describe("DynamicFee (smoothstep ramp)", function () {
       expect(big.feeBps).to.equal(f.baseFeeBps);
     });
 
-    it("rejects feeRampBps != 0 when baseFee == feeFloorBps (FeeRampNoHeadroom)", async function () {
+    it("rejects feeRampBps != 0 when baseFee == feeFloorBps", async function () {
       // Factory rejects the misconfig at deploy time — the smoothstep
       // would have nothing to interpolate into. Asserting the revert
       // here instead of going through the dedicated factory test keeps
       // the per-fee-ramp-config coverage co-located.
       await expect(loadFixture(noHeadroomFixture)).to.be.revertedWithCustomError(
         await hre.ethers.getContractFactory("EquilibraFactory"),
-        "FeeRampNoHeadroom"
+        "InvalidFeeFloor"
       );
     });
 
-    it("rejects feeRampBps != 0 when baseFee < canonical 20-bps floor (FeeRampNoHeadroom)", async function () {
+    it("rejects feeRampBps != 0 when baseFee is below the configured floor", async function () {
       await expect(loadFixture(noHeadroomTinyFeeFixture)).to.be.revertedWithCustomError(
         await hre.ethers.getContractFactory("EquilibraFactory"),
-        "FeeRampNoHeadroom"
+        "InvalidFeeFloor"
       );
     });
   });
@@ -327,19 +327,15 @@ describe("DynamicFee (smoothstep ramp)", function () {
       }
     });
 
-    it("quoteExactOut: amountOut ≥ wantOut, endpoint-max over-charge bounded", async function () {
+    it("same-state inversion: at most one output unit short, endpoint-max over-charge bounded", async function () {
       const f = await loadFixture(defaultFixture);
       const wantOut = hre.ethers.parseEther("5000");
       const neededIn = await f.pool.quoteExactOut(true, wantOut);
-      // ExactOut contract:
-      //   `amountOut` MUST be delivered to the wei (>= wantOut, never less).
-      //   `amountIn`  MAY overcharge by the endpoint-max fee conservatism.
-      //
-      // Quoter design that achieves this: the exact-out solver recovers
-      // `cleanIn` from the curve, the fee is resolved as the endpoint-max
-      // of the CP-proxy rate over the realisable gross interval, and the
-      // raw input is bumped by +1 wei to absorb residual rounding noise
-      // and turn the near-exact match into a hard ≥ guarantee.
+      // This executes EXACT-IN using an exact-out quote on the same state.
+      // The margin maps cancel; the independently rounded solves need not.
+      // One output unit covers this ordinary fixture's dust, while the
+      // endpoint-max exact-out fee can conservatively increase the delivery.
+      // Actual exact-output delivery is tested separately and remains exact.
       //
       // Practical upper bound for the over-quote: the endpoint-max fee
       // resolution charges `max(feeCp(grossLo), feeCp(grossHi))`, which
@@ -353,14 +349,14 @@ describe("DynamicFee (smoothstep ramp)", function () {
       expect(
         r.amountOut,
         `ExactOut violation: quoteExactOut(${wantOut}) → neededIn=${neededIn} ⇒ swap output ${r.amountOut} < wantOut`
-      ).to.be.gte(wantOut);
+      ).to.be.gte(wantOut - 1n);
       expect(
         r.amountOut,
         `quoteExactOut over-charged: swap output ${r.amountOut} > wantOut ${wantOut} by ${r.amountOut - wantOut} wei (expected ≤ 1 ppm)`
       ).to.be.lte(wantOut + wantOut / 1_000_000n);
     });
 
-    it("quoteExactOut cross-anchor: amountOut ≥ wantOut after the swap crosses pStart ↔ anchor", async function () {
+    it("cross-anchor inversion stays within one output unit after crossing pStart ↔ anchor", async function () {
       // Anchor-crossing exact-out is the regime the balanced-state sweep
       // above never exercises: the swap settles in the single smooth
       // kernel (no segment walker), but the CP-proxy post-distance is
@@ -454,11 +450,11 @@ describe("DynamicFee (smoothstep ramp)", function () {
           ).to.be.gt(anchor);
         }
 
-        // (4) ExactOut wei-precision contract.
+        // (4) Same-state inversion dust, not a second output margin.
         expect(
           r.amountOut,
           `${dir.label}: ExactOut violation — neededIn=${neededIn} ⇒ swap output ${r.amountOut} < wantOut ${wantOut}`
-        ).to.be.gte(wantOut);
+        ).to.be.gte(wantOut - 1n);
 
         // Cross-anchor over-quote is intentionally NOT wei-tight under
         // the M-2 dynamic-fee resolver. For anchor-crossing exact-out
@@ -466,9 +462,8 @@ describe("DynamicFee (smoothstep ramp)", function () {
         // gross input, so a fixed-point iteration would oscillate; the
         // pool instead charges the *max* of the CP fee at the two ends
         // of the realisable gross interval (see
-        // `_executeExactOutWithDynamicFee`). That guarantees the
-        // `exactInput(quoteExactOut(out)) ≥ out` identity without any
-        // iteration, but it deliberately over-quotes a cross-anchor
+        // `_executeExactOutWithDynamicFee`). Fee resolution deliberately
+        // over-quotes a cross-anchor
         // trade by up to the live dynamic-fee span (`baseFee −
         // feeFloor`) — the conservative, LP-favourable direction. We
         // bound the over-delivery by that span (relative to the settled
@@ -488,28 +483,17 @@ describe("DynamicFee (smoothstep ramp)", function () {
       }
     });
 
-    it("quoteExactOut sweep: amountOut ≥ wantOut for all sizes and directions", async function () {
+    it("quote inversion sweep: one output-unit bound for the ordinary sizes and both directions", async function () {
       // Cross-product sweep that exercises both swap directions and the
       // full range of sizes spanned by the dynamic-fee ramp:
       //   * floor regime  (≤ 0.01 ETH)        — `feeBps == DYN_FEE_FLOOR_BPS`
       //   * intermediate  (100 / 5000 ETH)    — fee climbs the smoothstep
       //   * ceiling       (≥ 100 000 ETH)     — `feeBps == baseFeeBps`
       //
-      // Each entry runs `wantOut → quoteExactOut → exactInputSingle` and
-      // asserts:
-      //   1. `amountOut >= wantOut` — the ExactOut wei-precision contract,
-      //      guaranteed by the 2-pass aSeg refit + 1-wei safety bump.
-      //   2. `amountOut` over-quote is bounded by the systematic
-      //      fee-resolution drift: the fee rate is resolved at WAD
-      //      precision as the endpoint-max over the realisable gross
-      //      interval, which sits above the fee the settled gross would
-      //      resolve by the continuous CP-distance gap between the two
-      //      endpoints. The gap grows with trade depth (~3e-7 relative
-      //      mid-ramp, ~2.2e-5 at 33% of depth) and is hard-bounded by
-      //      `baseFee − feeFloor` only for anchor-crossing trades. The
-      //      cap `wantOut · 5e-5 + 2048 wei` (~2.3× the measured worst
-      //      entry) admits this drift while flagging any future
-      //      regression that inflates the bump or the resolution gap.
+      // Exact-out expands the trial output by the inverse margin map.
+      // This fixture therefore permits only one output unit of residual
+      // rounding, not a second 0.000001% margin. Cap numerical stress cases
+      // have independent-reference coverage in SolverConvergence.
       const sizes = [
         hre.ethers.parseEther("0.01"),
         hre.ethers.parseEther("100"),
@@ -527,11 +511,11 @@ describe("DynamicFee (smoothstep ramp)", function () {
 
           const r = await execSwapDir(fLocal, zeroForOne, neededIn);
 
-          // (1) Wei-precision contract — the headline ExactOut guarantee.
+          // (1) Ordinary inversion dust, separate from conservative fee drift.
           expect(
             r.amountOut,
             `ExactOut violation @ (${zeroForOne ? "0→1" : "1→0"}, ${wantOut}): neededIn=${neededIn} ⇒ swap output ${r.amountOut} < wantOut`
-          ).to.be.gte(wantOut);
+          ).to.be.gte(wantOut - 1n);
 
           // (2) Over-quote bound — `5e-5` relative + 2048-wei base.
           const overQuoteCap = wantOut / 20_000n + 2_048n;

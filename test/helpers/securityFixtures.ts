@@ -7,7 +7,7 @@
 // of truth that itself reads `simulator/src/app/config.rs`. Tests
 // override only the fee / repeg parameters to expose the **pure curve
 // math** to the trader:
-//   • `baseFee = 5`        (factory minimum, 5 bps)
+//   • `baseFee = 5`        (deliberately non-minimal 5 bps control)
 //   • `feeRampBps = 0`     (flat fee — no smoothstep)
 //   • `feeFloorBps = 0`    (no extra anchor floor)
 //   • `repegShareBps = 0`  (auto-repeg disabled — anchor frozen)

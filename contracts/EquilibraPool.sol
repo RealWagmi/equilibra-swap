@@ -27,31 +27,24 @@ import { Errors } from "./libraries/Errors.sol";
 import { EquilibraSwapMath } from "./libraries/EquilibraSwapMath.sol";
 import { PoolOracle } from "./libraries/PoolOracle.sol";
 
-/// @title EquilibraPool
-/// @notice Clone-friendly 2-token AMM with anchor-driven concentration.
-/// @dev Kernel:
-///   • Asymmetric (quote-side normalised) math-space coordinate change:
-///     `xMath = xWad` (base, identity), `yMath = yWad · WAD / priceScale`
-///     (quote → base units). At the anchor `yMath == xMath` and the
-///     kernel evaluates on the math-space diagonal; a repeg at fixed
-///     reserves shifts `yMath` only.
-///   • Two-knob cubic invariant:
-///         K(x, y; L) = A · L · (x+y)/2 + (W − A) · xy,
-///         A = a · W / (W + λ · D),
-///         D = (y − x)² / (xy)
-///     with `a` (depth at anchor) and `λ` (plateau width) as independent
-///     concentration knobs. Polynomial degree in `y` (after clearing
-///     denominators) is **3**, giving a well-conditioned cubic envelope
-///     for the secant solver.
-///   • Depth scale `L` is recovered per-leg from the pre-state via the
-///     closed-form quadratic `solveLFromState` (positive root of
-///     `W·L² − A·L·S − (W−A)·N = 0`) and frozen for the secant solver.
-///   • LP unit value `vp = 2·L_eq · √(priceScale·WAD) / totalSupply` is
-///     anchor-invariant under proportional mint/burn and re-anchor of
-///     fixed reserves.
-///   • Two-gate auto-repeg backed by the `vpGenesis / vpLast /
-///     lpValueGrowth` accounting trio. `_repegShareBps` is stored
-///     pre-scaled for protocol-fee compensation (see {initialize}).
+/**
+ * @title EquilibraPool
+ * @notice Clone-friendly two-token AMM with anchor-driven concentration, a geometric price EMA
+ * and an auto-repeg of the anchor funded from LP-value growth.
+ * @dev Reserves are lifted into math space by the asymmetric coordinate change `xMath = xWad`
+ * (base, identity) and `yMath = yWad · WAD / priceScale` (quote expressed in base units). At the
+ * anchor `yMath == xMath`; a repeg at fixed reserves moves `yMath` only.
+ * The two-knob cubic invariant is `K(x, y; L) = A · L · (x + y) / 2 + (W − A) · xy` with
+ * `A = a · W / (W + λ · D)` and `D = (y − x)² / (xy)`; `a` sets the depth at the anchor and
+ * `λ` the plateau width, independently. Clearing denominators leaves degree 3 in `y`, so the
+ * secant solver works on a cubic envelope. The depth `L` (Q128) is recovered once per swap from
+ * the pre-state as the positive root of `W·L² − A·L·S − (W−A)·N = 0` (`solveLFromState`) and
+ * held fixed for the leg.
+ * The LP unit value `vp = 2·L_eq · √(priceScale · WAD) / totalSupply` is comparable across
+ * anchors and invariant under proportional mint/burn; it drives the two-gate auto-repeg through
+ * the `genesis / live / growth` accounting trio. `_repegShareBps` is stored pre-scaled by the
+ * factory for protocol-fee compensation.
+ */
 contract EquilibraPool is
     IEquilibraPool,
     ReentrancyGuardTransient,
@@ -60,131 +53,175 @@ contract EquilibraPool is
 {
     using FixedPointMathLib for uint256;
 
-    /// @dev Force the pure-TSTORE reentrancy guard on every chain —
-    ///      the pool only deploys on Cancun-ready EVM targets, so the
-    ///      Solady fallback to SSTORE-based locking is unnecessary
-    ///      and would add a redundant warm/cold slot per swap.
+    /**
+     * @dev Forces Solady's pure-TSTORE reentrancy guard on every chain. The pool deploys only on
+     * Cancun-ready targets, so the SSTORE fallback would only add a redundant storage slot per
+     * swap.
+     */
     function _useTransientReentrancyGuardOnlyOnMainnet() internal pure override returns (bool) {
         return false;
     }
 
     // ============ Core pool state ============
-    /// @dev Private-pool flag, packed ahead of `_token0` (8 + 160 bits
-    ///      in one slot): the mint gate's flag check is that slot's
-    ///      first touch and the settlement block re-reads `_token0`
-    ///      from the then-warm slot, so a PUBLIC mint pays nothing
-    ///      beyond its pre-existing token read; a PRIVATE mint's one
-    ///      extra cold slot is `_factory`, which its allowlist
-    ///      staticcall needs anyway. Set once at {initialize} and
-    ///      immutable for the pool's lifetime: LPs must be able to
-    ///      rely on a public pool never becoming gated.
+    /**
+     * @dev Private-pool flag, packed with `_paused`, `_token0` and `_stopped` in one slot: the
+     * mint gate's check warms the slot that settlement reads `_token0` from, so a public mint
+     * pays nothing extra. Set once in {initialize} and immutable afterwards, so a public pool can
+     * never become gated.
+     */
     bool private _isPrivate;
     address private _token0;
+    /**
+     * @dev Permanent-stop latch, packed in the byte after `_token0`. Never cleared once set;
+     * {setPaused} then becomes a no-op.
+     */
+    bool private _stopped;
     address private _token1;
     address private _factory;
 
-    // Packed config slot (256 bits used / 256):
-    //   _baseFee (16) + _protocolFeePercent (8) + _emaPeriod (32)
-    //   + _feeFloorBps (16) + _repegShareBps (16) + _token0Scale (64)
-    //   + _token1Scale (64) + _pairPoolIndex (32) + _parachuteBandMult (8).
+    /**
+     * @dev Fee ceiling in bps. This and the next four fields occupy the high 88 bits of the
+     * `_factory` slot (16 + 8 + 32 + 16 + 16), written by {initialize} as one factory-packed
+     * word.
+     */
     uint16 private _baseFee;
+    /**
+     * @dev Protocol slice of every fee in percent, `[0, 25]`; immutable after {initialize}.
+     */
     uint8 private _protocolFeePercent;
+    /**
+     * @dev Internal EMA relaxation time `tau = ceil(halfLife · 1000 / 694)` in seconds;
+     * immutable. {getFeeConfig} maps it back to the half-life.
+     */
     uint32 private _emaPeriod;
+    /**
+     * @dev Dynamic-fee floor in bps; ignored while the ramp is disabled.
+     */
     uint16 private _feeFloorBps;
+    /**
+     * @dev Repeg share pre-scaled by the factory as
+     * `⌊share · BPS / (BPS − protocolFeePercent · 100)⌋`, so the gate spends the user share of
+     * gross growth and the protocol cut comes out of the LP residual. Zero iff the user share is
+     * zero, which disables auto-repeg.
+     */
     uint16 private _repegShareBps;
+    /**
+     * @dev Power-of-ten raw-to-WAD scales of token0 and token1. Their slot also holds the pair
+     * index (32), the parachute multiplier (8) and the fee ramp (64), leaving 24 bits spare.
+     */
     uint64 private _token0Scale;
     uint64 private _token1Scale;
+    /**
+     * @dev Pair-local index of this pool on the factory; metadata only.
+     */
     uint32 private _pairPoolIndex;
-    /// @dev Donation-parachute activation multiplier K: the parachute
-    ///      opens only at geometric deviation ≥ K × the active
-    ///      dead-band. NOT a creation parameter — every pool starts at
-    ///      `Constants.REPEG_PARACHUTE_BAND_MULT`; runtime-adjustable
-    ///      through the param timelock ({setParachuteBandMult}, range
-    ///      `[1, 255]`). Occupies the last free byte of this slot, so
-    ///      the parachute's read is a warm SLOAD of a slot the repeg
-    ///      path already touched.
+    /**
+     * @dev Donation-parachute multiplier K: the parachute opens only at a geometric deviation of
+     * at least `K × active dead-band`. Not a creation parameter; every pool starts at
+     * `Constants.REPEG_PARACHUTE_BAND_MULT` and {setParachuteBandMult} adjusts it within
+     * `[1, 255]`. Shares the scales/index/ramp slot the repeg path has already warmed.
+     */
     uint8 private _parachuteBandMult;
 
-    /// @dev Smoothstep dynamic-fee warm-up width pre-scaled to WAD
-    ///      (`feeRampBps × 1e14`). `0` ⇒ dynamic ramp disabled.
+    /**
+     * @dev Smoothstep warm-up width pre-scaled to WAD (`feeRampBps · 1e14`). Zero disables the
+     * ramp: every swap then pays `_baseFee`.
+     */
     uint64 private _feeRampDistWad;
 
-    /// @dev Two-knob curve parameters, sharing one slot with
-    ///      `_feeRampDistWad` above and the downward repeg dead-band
-    ///      below (64 × 4 = 256 bits). Bounded by
-    ///      `[A_MIN_WAD..A_MAX_WAD]` and
-    ///      `[LAMBDA_MIN_WAD..LAMBDA_MAX_WAD]`, both `< WAD = 1e18`
-    ///      `< 2^60`, so `uint64` fits with headroom.
+    /**
+     * @dev Two-knob curve parameters, sharing a slot with the downward repeg dead-band
+     * (3 × 64 bits). Bounded by the factory to `[A_MIN_WAD, A_MAX_WAD]` and
+     * `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD]`, both `<= WAD < 2^60`, so `uint64` holds them with
+     * headroom. Immutable after {initialize}.
+     */
     uint64 private _aWad;
     uint64 private _lambdaWad;
 
-    /// @dev Downward auto-repeg dead-band (`ema < priceScale`), the
-    ///      direction pair of `_repegThresholdToken1UpWad` below. Lives
-    ///      in this slot because the timestamps slot is full and every
-    ///      swap already warms this slot for `_aWad`/`_lambdaWad`/
-    ///      `_feeRampDistWad` — the direction split costs zero extra
-    ///      SLOADs on the hot path.
+    /**
+     * @dev Downward auto-repeg dead-band (`ema < priceScale`), WAD; the direction pair of
+     * `_repegThresholdToken1UpWad`. Lives in the curve-knob slot because the timestamps slot is
+     * full and every swap already warms this slot for `_aWad` / `_lambdaWad`.
+     */
     uint64 private _repegThresholdToken1DownWad;
 
-    /// @dev Pool price scale `yWad / xWad` at the anchor (WAD-scaled,
-    ///      quote-per-base in the lifted form). Used by the
-    ///      asymmetric coord change `yMath = yWad · WAD / priceScale`
-    ///      that gives the auto-repeg gate an IL signal: a repeg
-    ///      moves only `yMath`, so off-balance reserves register a
-    ///      genuine math-space displacement after each anchor shift.
+    /**
+     * @dev Anchor price scale `yWad / xWad` (token0 per token1, WAD). The coordinate change
+     * `yMath = yWad · WAD / priceScale` depends on it, so a repeg at fixed reserves moves `yMath`
+     * only and off-balance reserves register a math-space displacement the repeg gate prices.
+     */
     uint256 private _priceScaleWad;
 
-    /// @dev Live EMA of the (capped) raw spot price. Updated lazily
-    ///      on every swap via `PoolOracle.updateEma`.
-    uint256 private _emaPriceWad;
+    /**
+     * @dev Natural logarithm of the geometric price EMA, WAD-scaled, stored without an offset.
+     * Updated by {_updateEma} at most once per timestamp on the swap path.
+     */
+    int256 private _emaLogWad;
 
-    /// @dev Epoch base of the auto-repeg gate threshold. Seeded at
-    ///      genesis with `vp = 2·L_eq · √(priceScale · WAD) /
-    ///      totalSupply` (constrained to `2·WAD ±
-    ///      MAX_GENESIS_VP_ERROR_WAD` at pool creation) and
-    ///      ratcheted forward by {setRepegShareBps}: each share change
-    ///      seals the closing epoch's protected slice into the base.
-    ///      Monotone non-decreasing, always ≤ the live unit value.
+    /**
+     * @dev Epoch base of the auto-repeg gate, WAD. Seeded at genesis with
+     * `vp = 2·L_eq · √(priceScale · WAD) / totalSupply`, which {addLiquidity} requires to lie
+     * within `2·WAD ± MAX_GENESIS_VP_ERROR_WAD`, and ratcheted forward by {setRepegShareBps},
+     * which seals the closing epoch's protected growth slice into it. Monotone non-decreasing
+     * and never above the live unit value.
+     */
     uint256 private _lpUnitValueGenesisWad;
 
-    /// @dev Live high-water mark of `vp`. Monotone-up between swaps;
-    ///      drops to the post-repeg value on a successful auto-repeg.
+    /**
+     * @dev Live high-water mark of `vp`, WAD. Rises on swaps that book growth, is re-anchored on
+     * proportional mint/burn and drops to the post-move value on a committed repeg.
+     */
     uint256 private _lpUnitValueWad;
 
-    /// @dev Cumulative monotone-up accumulator of all positive `vp`
-    ///      deltas ever booked. Drives the auto-repeg gate via
-    ///        threshold = genesis + growth · (BPS − repegShareBps) / BPS.
-    ///      Never decremented (not even by a successful repeg).
+    /**
+     * @dev Cumulative sum of every positive `vp` delta booked by swaps, WAD. Sets the gate floor
+     * `genesis + growth · (BPS − repegShareBps) / BPS`. Never reduced by swaps, liquidity
+     * events or repegs; only {setRepegShareBps} restarts it after sealing the epoch.
+     */
     uint256 private _lpValueGrowthWad;
 
-    /// @dev Packed into one slot with the timestamps (64+64+64+64 =
-    ///      256 bits): `_repegStepWad` and the upward dead-band are
-    ///      bounded by the factory to `[MIN_REPEG_STEP, MAX_REPEG_STEP]
-    ///      = [1, 1e18]`, which fits `uint64` (max ≈ 1.8e19) with
-    ///      headroom. Packing turns the per-swap reads in
-    ///      `_tryAutoRepeg` from cold SLOADs of dedicated slots into
-    ///      warm reads of the slot `_updateEma` already touched
-    ///      (−~2000 gas/swap on repeg-enabled pools; audit O-2).
-    ///      `_pairPoolIndex` lives in the fee-config slot: it is
-    ///      metadata-only and freed the 64 bits the threshold needs.
-    ///      The DOWNWARD dead-band pair lives in the curve-knob slot
-    ///      (`_repegThresholdToken1DownWad` above) — this slot is full.
+    /**
+     * @dev Timestamp of the last EMA update. One slot holds it with `_lastRepegTs`,
+     * `_repegStepWad` and the upward dead-band (4 × 64 bits); the step is in `[1, WAD]` and
+     * both dead-bands in `[1, WAD)`, which `uint64` holds with headroom. {_updateEma}
+     * warms the slot, so {_tryAutoRepeg} reads its fields warm. The downward dead-band lives in
+     * the curve-knob slot because this one is full.
+     */
     uint64 private _lastEmaTs;
+    /**
+     * @dev Timestamp of the last committed repeg; enforces one commit per timestamp.
+     */
     uint64 private _lastRepegTs;
+    /**
+     * @dev Per-repeg log-domain step cap, WAD.
+     */
     uint64 private _repegStepWad;
+    /**
+     * @dev Upward auto-repeg dead-band (`ema > priceScale`), WAD.
+     */
     uint64 private _repegThresholdToken1UpWad;
 
-    // Clean reserves (low 128 = token0, high 128 = token1).
+    /**
+     * @dev Clean reserves in raw token units: low 128 bits token0, high 128 bits token1. Excludes
+     * the protocol-fee buckets.
+     */
     uint256 private _reservesPacked;
 
-    // Protocol-fee buckets (low 128 = token0, high 128 = token1).
+    /**
+     * @dev Accrued protocol fees in raw token units: low 128 bits token0, high 128 bits token1.
+     */
     uint256 private _protocolFeesPacked;
 
+    /**
+     * @dev Mask of the low 128 bits; also the raw-amount ceiling of every packed pair.
+     */
     uint256 private constant _LOWER_128_MASK = type(uint128).max;
 
-    /// @dev Internal hot-path SLOAD batching struct. Loaded once per
-    ///      swap / repeg / EMA update via `_loadCurveParams`; passed
-    ///      by memory to all math-kernel helpers.
+    /**
+     * @notice Memory snapshot of the curve knobs, the anchor and the decimal scales.
+     * @dev Loaded once per swap, quote, liquidity event or view by {_loadCurveParams} and passed
+     * by reference to the math helpers; the repeg probes overwrite `priceScaleWad` in place.
+     */
     struct CurveSnapshot {
         uint256 aWad;
         uint256 lambdaWad;
@@ -193,50 +230,63 @@ contract EquilibraPool is
         uint256 token1Scale;
     }
 
-    struct SwapMathResult {
-        uint256 amountOutWad;
-        uint256 amountInCleanWad;
-        uint256 finalXMath;
-        uint256 finalYMath;
-    }
-
-    /// @dev Pre-state snapshot in math-space, lifted and L-solved
-    ///      exactly ONCE per swap/quote and threaded through the EMA
-    ///      sample, the fee resolver and the swap kernel (audit O-3 —
-    ///      previously each stage re-lifted the same reserves and the
-    ///      quote helpers re-solved the same quadratic). `lPreWad` is
-    ///      `solveLFromState(xMath, yMath)`; the kernel is symmetric in
-    ///      `(x, y)`, so the one value serves both trade directions
-    ///      bit-for-bit.
+    /**
+     * @notice Pre-swap math-space snapshot, lifted and depth-solved once per swap or quote.
+     * @dev Reused by the EMA sample, the fee resolver and the kernel. `lPreQ128` is
+     * `solveLFromState(xMath, yMath)` in Q128; the kernel is symmetric in `(x, y)`, so one value
+     * serves both directions.
+     */
     struct MathState {
         uint256 xMath;
         uint256 yMath;
-        uint256 lPreWad;
+        uint256 lPreQ128;
+        /// Raw reserves, low 128 bits token0 and high 128 bits token1; settlement bounds read it.
+        uint256 reservesPacked;
     }
 
+    /**
+     * @notice Resolved amounts of one swap leg, raw token units.
+     */
     struct SwapAmounts {
+        /// Gross input, fee included.
         uint256 amountInRaw;
+        /// Output paid to the recipient.
         uint256 amountOutRaw;
-        uint256 amountInCleanRaw;
+        /// Total fee taken from the input.
         uint256 feeAmount;
+        /// Protocol slice of the fee, kept out of the reserves.
         uint256 protocolCut;
+        /// LP slice of the fee, folded into the input-side reserve.
         uint256 lpFeeCut;
+        /// Post-swap depth `L` (Q128) of the settled reserves.
+        uint256 lAfterQ128;
     }
 
-    /// @dev `addLiquidity` working set held in memory (one stack slot
-    ///      for the pointer): the pre-callback snapshot — reserves and
-    ///      the parked-buffer split — survives the mint callback, and
-    ///      the frame stays within the 16-slot legacy-codegen stack
-    ///      limit (coverage builds compile without viaIR).
+    /**
+     * @notice Working set of {addLiquidity}, held in memory so the frame fits the 16-slot stack
+     * limit of the legacy (non-viaIR) codegen.
+     * @dev The reserve and parked-buffer snapshot is taken before the mint callback and
+     * survives it, pinning the active/parked split against a self-donation made inside the
+     * callback.
+     */
     struct AddState {
+        /// Total supply before the mint, parked shares included.
         uint256 supplyBefore;
         uint256 reserve0;
         uint256 reserve1;
+        /// Pool-owned (parked donation) shares before the mint; zero at genesis.
         uint256 parkedBefore;
+        /// Raw token0 the callback must deliver.
         uint256 amount0Used;
+        /// Raw token1 the callback must deliver.
         uint256 amount1Used;
     }
 
+    /**
+     * @dev Binds the factory on the first call and reverts `AlreadyInitialized` on every later
+     * one.
+     * @param factoryAddress Caller of {initialize}, stored as `_factory` before the body runs.
+     */
     modifier onlyOnce(address factoryAddress) {
         if (_factory != address(0)) revert Errors.AlreadyInitialized();
         _factory = factoryAddress;
@@ -245,73 +295,58 @@ contract EquilibraPool is
 
     // ============ Implementation lock ============
 
-    /// @notice Lock the implementation contract so it can never be
-    ///         initialised directly.
-    /// @dev    EIP-1167 clones have their own storage. The implementation
-    ///         deploys with `_factory = address(this) != 0`, so any
-    ///         external `initialize()` reverts with `AlreadyInitialized`.
+    /**
+     * @notice Locks the implementation so it can never be initialised directly.
+     * @dev EIP-1167 clones have their own storage. The implementation deploys with
+     * `_factory = address(this)`, so `initialize` on it reverts `AlreadyInitialized`.
+     */
     constructor() {
         _factory = address(this);
     }
 
     // ============ Initialization ============
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev All parameter bounds are validated by `EquilibraFactory`
-    ///      before the clone is initialised.
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Callable once, by the factory. Every bound and the packing of the four config words
+     * are validated by `EquilibraFactory`; the pool stores them verbatim. `feeConfigBits` lands
+     * above the factory address in the `_factory` slot while the low 160 bits keep the address
+     * bound by {onlyOnce}. The anchor starts at WAD and the EMA log at zero until genesis.
+     */
     function initialize(InitParams calldata params) external override onlyOnce(msg.sender) {
         _token0 = params.token0;
         _token1 = params.token1;
-        _token0Scale = params.token0Scale;
-        _token1Scale = params.token1Scale;
-
-        _baseFee = params.baseFee;
-        _protocolFeePercent = params.protocolFeePercent;
-        _emaPeriod = params.emaPeriod;
-
-        _feeFloorBps = params.feeFloorBps;
-        // Pre-scale `repegShareBps` to encode protocol-fee
-        // compensation so the hot-path repeg gate consumes the
-        // user-set share of growth regardless of `protocolFeePercent`:
-        //   stored = ⌊ user · BPS / (BPS − p·100) ⌋
-        _repegShareBps = uint16(
-            FixedPointMathLib.mulDiv(
-                uint256(params.repegShareBps),
-                Constants.BPS,
-                Constants.BPS - uint256(params.protocolFeePercent) * 100
-            )
-        );
-        _feeRampDistWad = params.feeRampBps == 0 ? 0 : uint64(uint256(params.feeRampBps) * 1e14);
-
-        _aWad = params.aWad;
-        _lambdaWad = params.lambdaWad;
-
-        // Seed `priceScale` at WAD (1.0). The genesis liquidity mint
-        // replaces this with the seeded reserve ratio
-        // `yWad / xWad` (see `addLiquidity` genesis branch).
-        _priceScaleWad = Constants.WAD;
-        _emaPriceWad = Constants.WAD;
-
-        _lastEmaTs = uint64(block.timestamp);
-        _lastRepegTs = uint64(block.timestamp);
-        _pairPoolIndex = params.pairPoolIndex;
         _isPrivate = params.isPrivate;
-        // Deliberately NOT an `InitParams` field: every pool starts at
-        // the canonical default and the knob stays timelock-adjustable
-        // afterwards ({setParachuteBandMult}).
-        _parachuteBandMult = uint8(Constants.REPEG_PARACHUTE_BAND_MULT);
-        // Safe narrowing: factory enforces every repeg knob ∈ [1, WAD]
-        // and WAD = 1e18 < 2^64 (see `EquilibraFactory` bounds check).
-        _repegStepWad = uint64(params.repegStepWad);
-        _repegThresholdToken1UpWad = uint64(params.repegThresholdToken1UpWad);
-        _repegThresholdToken1DownWad = uint64(params.repegThresholdToken1DownWad);
-
+        uint256 feeConfigBits = params.feeConfigBits;
+        uint256 scaleRampConfig = params.scaleRampConfig;
+        uint256 curveConfig = params.curveConfig;
+        uint256 repegConfig = params.repegConfig;
+        // Keep the factory address bound by `onlyOnce` in the low 160 bits.
+        assembly ("memory-safe") {
+            sstore(
+                _factory.slot,
+                or(and(sload(_factory.slot), sub(shl(160, 1), 1)), shl(160, feeConfigBits))
+            )
+            sstore(_token0Scale.slot, scaleRampConfig)
+            sstore(_aWad.slot, curveConfig)
+            sstore(_lastEmaTs.slot, repegConfig)
+        }
+        _priceScaleWad = Constants.WAD;
+        _emaLogWad = 0;
         _setLpTokenMetadata(params.lpName, params.lpSymbol);
     }
 
     // ============ Swaps ============
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Pipeline: EMA update from the pre-swap state, fee and kernel resolution, reserve
+     * update (the protocol cut stays out of the reserves), LP-growth accrual, auto-repeg
+     * attempt, then settlement. The output is paid before the callback, and
+     * `equilibraSwapCallback` must deliver exactly `amountInRaw` of the input token
+     * (`UnsupportedTokenBehavior` otherwise). Reverts `ZeroAddress` for a zero recipient and
+     * `InsufficientLiquidity` on an unseeded pool.
+     */
     function swap(
         address recipient,
         bool zeroForOne,
@@ -329,24 +364,21 @@ contract EquilibraPool is
             (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
             if (reserve0 == 0 || reserve1 == 0) revert Errors.InsufficientLiquidity();
 
-            // Lift the pre-state into math-space and solve its depth L
-            // exactly once — the EMA sample, the fee resolver and the
-            // kernel below all reuse this snapshot (audit O-3).
+            // Lift the pre-state and solve L once; the EMA sample, the fee resolver and the
+            // kernel reuse it.
             MathState memory ms = _liftMathState(reserve0, reserve1, cs);
 
-            uint256 emaBefore = _updateEma(ms, cs);
+            int256 emaBefore = _updateEma(ms, cs);
 
             amounts = _computeSwapAmounts(zeroForOne, amountSpecified, ms, cs);
 
             if (zeroForOne) {
-                if (amounts.amountOutRaw >= reserve1) revert Errors.InsufficientLiquidity();
                 amount0 = _toSignedPositive(amounts.amountInRaw);
                 amount1 = -_toSignedPositive(amounts.amountOutRaw);
                 reserve0 += amounts.amountInRaw - amounts.protocolCut;
                 reserve1 -= amounts.amountOutRaw;
                 _accrueProtocolFees(amounts.protocolCut, 0);
             } else {
-                if (amounts.amountOutRaw >= reserve0) revert Errors.InsufficientLiquidity();
                 amount0 = -_toSignedPositive(amounts.amountOutRaw);
                 amount1 = _toSignedPositive(amounts.amountInRaw);
                 reserve1 += amounts.amountInRaw - amounts.protocolCut;
@@ -356,7 +388,7 @@ contract EquilibraPool is
 
             _setReservesInternal(reserve0, reserve1);
 
-            uint256 vpNow = _accrueLpValueGrowth(reserve0, reserve1, cs);
+            uint256 vpNow = _accrueLpValueGrowth(amounts.lAfterQ128, cs.priceScaleWad);
 
             priceScaleForEvent = _tryAutoRepeg(reserve0, reserve1, cs, vpNow, emaBefore);
         }
@@ -388,7 +420,17 @@ contract EquilibraPool is
 
     // ============ Liquidity ============
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Genesis seeds `priceScale = yWad / xWad`, the EMA log and both LP unit-value marks,
+     * burns `MIN_INITIAL_LIQUIDITY` shares to `0xdEaD` and requires the genesis unit value to
+     * lie within `2·WAD ± MAX_GENESIS_VP_ERROR_WAD` (`GenesisVpImprecise` otherwise). Later
+     * deposits are priced against the active float `totalSupply − balanceOf(pool)` and mint a
+     * proportional top-up of the parked donation buffer, so `parked / active` and `vp` are
+     * unchanged. Private pools require `recipient` to be on the factory's LP allowlist
+     * (`LpNotAllowed`). Shares are minted only after `equilibraMintCallback` has delivered
+     * exactly the used amounts (`UnsupportedTokenBehavior` otherwise).
+     */
     function addLiquidity(
         uint256 amount0,
         uint256 amount1,
@@ -398,27 +440,19 @@ contract EquilibraPool is
     ) external override nonReentrant whenNotPaused returns (uint256 sharesOut) {
         if (recipient == address(0)) revert Errors.ZeroAddress();
         if (amount0 == 0 || amount1 == 0) revert Errors.ZeroAmount();
-        // Private pools gate the RECIPIENT, not the caller: minting is
-        // routed (router, zaps, factory genesis), so the payer is rarely
-        // the LP. Gating the party that ends up holding the shares is
-        // what actually bounds who can join, and it covers every mint
-        // path at one site. Note the scope: LP shares stay transferable,
-        // so the allowlist bounds entry through minting, not secondary
-        // custody.
+        // Private pools gate the recipient (the eventual holder): one check covers every mint
+        // path. LP shares stay transferable, so the allowlist bounds entry by minting only.
         if (_isPrivate) _enforceLpAllowed(recipient);
 
-        // Working set in memory (one stack slot); see `AddState`.
         AddState memory p;
         p.supplyBefore = totalSupply();
         (p.reserve0, p.reserve1) = _getReservesInternal();
-        // Snapshot the donation buffer ONCE, before the mint callback,
-        // pinning the active/parked split against a self-donation
-        // slipped into `equilibraMintCallback`. Zero at genesis.
+        // Snapshot the parked buffer before the callback so a self-donation inside it cannot
+        // move the active/parked split. Zero at genesis.
         p.parkedBefore = balanceOf(address(this));
 
-        // Buffer top-up shares, COMPUTED before the callback from the
-        // snapshot but MINTED only after settlement (see below). Stays 0
-        // at genesis and on donation-free pools.
+        // Buffer top-up: computed from the snapshot, minted after settlement; zero without a
+        // buffer.
         uint256 bufferTopUp;
 
         if (p.supplyBefore == 0) {
@@ -433,14 +467,16 @@ contract EquilibraPool is
             uint256 xWad = _toWadByScale(p.reserve1, uint256(_token1Scale));
             if (xWad == 0 || yWad == 0) revert Errors.InsufficientLiquidity();
 
-            // Initial priceScale = yWad / xWad (quote-per-base in WAD
-            // form). At the anchor `yMath = yWad · WAD / priceScale =
-            // xWad = xMath`, placing the seeded reserves on the
-            // math-space diagonal.
+            // `priceScale = yWad / xWad` puts the seeded reserves on the math-space diagonal.
             uint256 initialPriceScale = FixedPointMathLib.divWad(yWad, xWad);
-            if (initialPriceScale == 0) revert Errors.InvalidPriceScale();
+            if (
+                initialPriceScale == 0 ||
+                (!_isPrivate &&
+                    (initialPriceScale <= Constants.MIN_PUBLIC_INITIAL_PRICE_SCALE_WAD ||
+                        initialPriceScale >= Constants.MAX_PUBLIC_INITIAL_PRICE_SCALE_WAD))
+            ) revert Errors.InvalidPriceScale();
             _priceScaleWad = initialPriceScale;
-            _emaPriceWad = initialPriceScale;
+            _emaLogWad = PoolOracle.priceToEmaLog(initialPriceScale);
             _lastEmaTs = uint64(block.timestamp);
 
             uint256 geoMeanWad = FixedPointMathLib.sqrt(xWad * yWad);
@@ -449,24 +485,17 @@ contract EquilibraPool is
             _mint(address(0xdEaD), Constants.MIN_INITIAL_LIQUIDITY);
             sharesOut = geoMeanWad - Constants.MIN_INITIAL_LIQUIDITY;
 
-            // Snapshot the genesis LP unit value under the freshly
-            // seeded priceScale; the high-water mark and the gate
-            // threshold-floor both reference it.
+            // Genesis unit value under the seeded anchor: the base of every gate threshold.
             uint256 vpGenesisWad = _computeLpUnitValueWad(
                 p.reserve0,
                 p.reserve1,
                 _loadCurveParams(),
                 geoMeanWad
             );
-            // Enforce the genesis identity `vp == 2·WAD` (within rounding
-            // tolerance). Insufficient normalized depth can store an
-            // understated or zero genesis floor; an extreme reserve ratio
-            // can also quantize `priceScale` too coarsely. Either case would
-            // let auto-repeg spend LP principal the floor is meant to
-            // preserve. The geomean burn floor above cannot guarantee this
-            // — under the asymmetric coord change `nWad` depends on the
-            // base-side reserve, not the geometric mean — so the precision
-            // gate is separate and authoritative.
+            // Genesis identity `vp == 2·WAD` within tolerance. Insufficient normalised depth or
+            // a coarsely quantised anchor would understate the base and let auto-repeg spend LP
+            // principal; the geomean floor cannot bound this because `nWad` depends on the
+            // base-side reserve only.
             uint256 twoWad = 2 * Constants.WAD;
             uint256 vpErr = vpGenesisWad > twoWad ? vpGenesisWad - twoWad : twoWad - vpGenesisWad;
             if (vpErr > Constants.MAX_GENESIS_VP_ERROR_WAD)
@@ -475,7 +504,8 @@ contract EquilibraPool is
             _lpUnitValueWad = vpGenesisWad;
         } else {
             p.amount0Used = amount0;
-            p.amount1Used = FixedPointMathLib.mulDiv(amount0, p.reserve1, p.reserve0);
+            // Shares are priced on token0: round the matching token1 payment up.
+            p.amount1Used = FixedPointMathLib.fullMulDivUp(amount0, p.reserve1, p.reserve0);
             if (p.amount1Used > amount1) {
                 p.amount1Used = amount1;
                 p.amount0Used = FixedPointMathLib.mulDiv(amount1, p.reserve0, p.reserve1);
@@ -483,25 +513,15 @@ contract EquilibraPool is
             if (p.amount0Used == 0 || p.amount1Used == 0)
                 revert Errors.AmountTooSmallAfterNormalization();
 
-            // Active-share pricing: parked donation shares (the pool's
-            // own LP balance) carry no claim on reserves, so the mint is
-            // quoted against the ACTIVE share count — the joiner pays the
-            // active shares' going rate, no premium. The buffer top-up
-            // below keeps `parked/active` invariant, which makes the
-            // unit-value metric `vp = Λ/totalSupply` exactly invariant
-            // across every proportional mint: a deposit can neither
-            // manufacture spendable repeg budget nor destroy headroom.
+            // Parked shares carry no claim, so the mint is priced against the active float; with
+            // the buffer top-up below, `vp` is exactly invariant across a proportional mint.
             uint256 activeBefore = p.supplyBefore - p.parkedBefore;
-            sharesOut = FixedPointMathLib.mulDiv(p.amount0Used, activeBefore, p.reserve0);
+            sharesOut = FixedPointMathLib.fullMulDiv(p.amount0Used, activeBefore, p.reserve0);
 
-            // Buffer scaling (mint leg): grow the parked buffer in the
-            // same proportion as the active float. Computed now from the
-            // pre-callback snapshot; minted after settlement. The top-up
-            // is fresh supply whose claim is zero (active-share
-            // redemption excludes the pool's balance), mirrored by the
-            // proportional buffer burn on the exit leg.
+            // Grow the parked buffer in proportion to the active float; mirrored by the burn on
+            // exit.
             if (p.parkedBefore != 0)
-                bufferTopUp = FixedPointMathLib.mulDiv(sharesOut, p.parkedBefore, activeBefore);
+                bufferTopUp = FixedPointMathLib.fullMulDiv(sharesOut, p.parkedBefore, activeBefore);
 
             p.reserve0 += p.amount0Used;
             p.reserve1 += p.amount1Used;
@@ -528,9 +548,8 @@ contract EquilibraPool is
                 revert Errors.UnsupportedTokenBehavior();
         }
 
-        // Settlement verified — value-giving mints happen strictly AFTER
-        // the callback has paid: first the (claimless, pool-owned) buffer
-        // top-up, then the recipient's shares.
+        // Mint only after the callback has paid: the claimless buffer top-up first, then the
+        // recipient's shares.
         if (bufferTopUp != 0) _mint(address(this), bufferTopUp);
         _mint(recipient, sharesOut);
 
@@ -541,8 +560,14 @@ contract EquilibraPool is
         emit LiquidityAdded(msg.sender, recipient, p.amount0Used, p.amount1Used, sharesOut);
     }
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev LP withdrawals remain callable while paused so LPs can exit.
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Payouts are `reserve · shares / activeFloat`, rounded down, and the exiting holder's
+     * proportional slice of the parked buffer is burned so `parked / active` and `vp` stay
+     * unchanged. Both payouts flooring to zero reverts `AmountTooSmallAfterNormalization`
+     * rather than burning shares for nothing. Never gated by the pause; a permanently stopped
+     * pool skips the LP re-anchor and the solvency check.
+     */
     function removeLiquidity(
         uint256 shares,
         uint256 minAmount0,
@@ -553,31 +578,21 @@ contract EquilibraPool is
         if (shares == 0) revert Errors.ZeroAmount();
 
         (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
-        // Active-share redemption: parked donation shares hold no claim
-        // on reserves, so payouts divide by the ACTIVE float. The
-        // proportional buffer burn below keeps `parked/active` — and
-        // therefore `vp` and the parachute's feasibility — invariant
-        // across the exit, the mirror of the mint-side buffer top-up.
+        // Parked shares hold no claim: payouts divide by the active float.
         uint256 parked = balanceOf(address(this));
         uint256 activeBefore = totalSupply() - parked;
-        amount0 = FixedPointMathLib.mulDiv(reserve0, shares, activeBefore);
-        amount1 = FixedPointMathLib.mulDiv(reserve1, shares, activeBefore);
-        // Dust guard: on low-decimals pools (raw reserves ≪ LP supply)
-        // a tiny share amount can floor BOTH payouts to zero — burning
-        // the shares for nothing. Refuse loudly instead of silently
-        // donating the dust to remaining LPs (audit I-8).
+        amount0 = FixedPointMathLib.fullMulDiv(reserve0, shares, activeBefore);
+        amount1 = FixedPointMathLib.fullMulDiv(reserve1, shares, activeBefore);
+        // Dust guard: on low-decimal pools a tiny share amount can floor both payouts to zero.
         if (amount0 == 0 && amount1 == 0) revert Errors.AmountTooSmallAfterNormalization();
 
         if (amount0 < minAmount0 || amount1 < minAmount1) revert Errors.SlippageExceeded();
 
         _burn(msg.sender, shares);
-        // Burn the exiting holder's proportional slice of the buffer so
-        // `parked/active` is unchanged. Without this the exit would
-        // dilute the buffer's backing and drop `vp` below the gate
-        // floor on any pool holding a donation. Genesis and
-        // donation-free pools skip it (`parked == 0`).
+        // Burn the holder's proportional buffer slice; otherwise the exit would dilute the
+        // buffer's backing and drop `vp` below the gate floor.
         if (parked != 0) {
-            uint256 bufferBurn = FixedPointMathLib.mulDiv(parked, shares, activeBefore);
+            uint256 bufferBurn = FixedPointMathLib.fullMulDiv(parked, shares, activeBefore);
             if (bufferBurn != 0) _burn(address(this), bufferBurn);
         }
 
@@ -586,30 +601,32 @@ contract EquilibraPool is
             uint256 reserve1After = reserve1 - amount1;
             _setReservesInternal(reserve0After, reserve1After);
 
-            _reanchorLpUnitValue(reserve0After, reserve1After, _loadCurveParams());
+            if (!_stopped) {
+                _reanchorLpUnitValue(reserve0After, reserve1After, _loadCurveParams());
+            }
 
             address t0 = _token0;
             address t1 = _token1;
             SafeTransferLib.safeTransfer(t0, recipient, amount0);
             SafeTransferLib.safeTransfer(t1, recipient, amount1);
-            _assertSolvency(t0, t1);
+            if (!_stopped) _assertSolvency(t0, t1);
         }
 
         emit LiquidityRemoved(msg.sender, recipient, amount0, amount1, shares);
     }
 
-    // NOTE: donations are plain LP `transfer`s to the pool's own
-    // address — the pool needs no entrypoint for them. The guarded
-    // variant (maxSupply pin + deadline) lives in the ROUTER
-    // (`EquilibraRouter.donate`), freeing this contract's scarce
-    // EIP-170 budget; the parked shares' semantics (no claim on
-    // reserves, spendable only by {_tryDonationParachute}'s emergency
-    // burn, proportionally rescaled by the liquidity legs) are
-    // documented at {_tryDonationParachute}.
+    // Donations are plain LP transfers to the pool's own address; the pool has no donation
+    // entrypoint. The guarded variant (supply pin + deadline) is `EquilibraRouter.donate`. Parked
+    // shares carry no claim on reserves, scale with the liquidity legs and are spent only by
+    // {_tryDonationParachute}.
 
     // ============ Protocol fees ============
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Fee collector only (`Unauthorized`). Zeroes both buckets before transferring and then
+     * checks that each balance still covers its reserve.
+     */
     function collectProtocolFees(
         address recipient
     ) external override nonReentrant returns (uint256 amount0, uint256 amount1) {
@@ -628,22 +645,33 @@ contract EquilibraPool is
         emit ProtocolFeesCollected(recipient, amount0, amount1);
     }
 
-    /// @inheritdoc IEquilibraPool
-    function setPaused(bool paused_) external override {
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Factory owner only. Writes both flags into their shared slot with one SSTORE. A set
+     * stop latch turns every later call into a silent no-op.
+     */
+    function setPaused(bool paused_, bool stopped_) external override {
         _enforceFactoryOwner();
-        _setPaused(paused_);
-        emit PauseStateChanged(paused_, msg.sender);
+        if (stopped_ && !paused_) revert Errors.InvalidPauseState();
+        if (_stopped) return;
+        // Both flags share a slot; the latch check above guarantees a zero stopped byte.
+        assembly ("memory-safe") {
+            let word := sload(_paused.slot)
+            word := and(word, not(shl(mul(_paused.offset, 8), 0xff)))
+            word := or(word, shl(mul(_paused.offset, 8), paused_))
+            sstore(_paused.slot, or(word, shl(mul(_stopped.offset, 8), stopped_)))
+        }
+        emit PauseStateChanged(paused_, stopped_, msg.sender);
     }
 
     // ============ Runtime parameters (param timelock only) ============
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev Bare store gated to the param timelock — the same trust
-    ///      split as {initialize}. Every fee invariant (bounds, ramp
-    ///      headroom, and the stall guard against the immutable stored
-    ///      threshold) is validated by `EquilibraParamTimelock`, both at
-    ///      queue time and again at execution against the live config,
-    ///      so the pool keeps no revalidation logic in its bytecode.
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Bare store gated to the param timelock, the same trust split as {initialize}: bounds,
+     * ramp headroom and ramp monotonicity are validated by `EquilibraParamTimelock` at queue and
+     * execution time. The ramp is stored pre-scaled as `feeRampBps · 1e14`.
+     */
     function setFeeParams(
         uint16 baseFee_,
         uint16 feeRampBps_,
@@ -652,18 +680,26 @@ contract EquilibraPool is
         _enforceParamTimelock();
         _baseFee = baseFee_;
         _feeFloorBps = feeFloorBps_;
-        _feeRampDistWad = feeRampBps_ == 0 ? 0 : uint64(uint256(feeRampBps_) * 1e14);
+        _feeRampDistWad = uint64(uint256(feeRampBps_) * 1e14);
         emit FeeParamsUpdated(baseFee_, feeRampBps_, feeFloorBps_);
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Bare store gated to the param timelock; range and change-size policy are validated
+     * there.
+     */
     function setRepegStepWad(uint64 repegStepWad_) external override {
         _enforceParamTimelock();
         _repegStepWad = repegStepWad_;
         emit RepegStepUpdated(repegStepWad_);
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Bare store gated to the param timelock; ranges and the band-to-step relation are
+     * validated there.
+     */
     function setRepegThresholds(
         uint64 repegThresholdToken1UpWad_,
         uint64 repegThresholdToken1DownWad_
@@ -674,20 +710,17 @@ contract EquilibraPool is
         emit RepegThresholdsUpdated(repegThresholdToken1UpWad_, repegThresholdToken1DownWad_);
     }
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev Stores the share pre-scaled for protocol-fee compensation
-    ///      with the same map as {initialize}, so `getFeeConfig`
-    ///      round-trips the user-facing value bit-for-bit.
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Seals the closing epoch under the outgoing share before storing the new one: the
+     * protected slice `⌈growth · (BPS − oldShare) / BPS⌉` ratchets into the gate base, the
+     * accumulator restarts and the live spendable gap carries over untouched, so the incoming
+     * share splits only future earnings. Ceil rounding favours LPs. The share is stored with the
+     * factory's pre-scaling `⌊share · BPS / (BPS − protocolFeePercent · 100)⌋`, so
+     * {getFeeConfig} round-trips the user-facing value.
+     */
     function setRepegShareBps(uint16 repegShareBps_) external override {
         _enforceParamTimelock();
-        // Seal the closing epoch under the OUTGOING share: the slice
-        // of accumulated growth it protected ratchets into the base
-        // forever, the accumulator restarts, and the live spendable
-        // gap (vp − floor) carries over untouched — the incoming
-        // share splits only future earnings. History is split exactly
-        // once, by the share in force while it was earned; the jump
-        // size therefore depends on the outgoing share only. Ceil
-        // rounding favours the LPs.
         uint256 sealedBaseWad = _lpUnitValueGenesisWad +
             FixedPointMathLib.mulDivUp(
                 _lpValueGrowthWad,
@@ -706,12 +739,11 @@ contract EquilibraPool is
         emit RepegShareUpdated(repegShareBps_, sealedBaseWad);
     }
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev Bare store gated to the param timelock, same trust split as
-    ///      the other runtime setters: the `[1, 255]` range (zero would
-    ///      erase the lag qualifier and turn the parachute into a
-    ///      continuous top-up) is enforced by `EquilibraParamTimelock`
-    ///      at queue AND execution time.
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Bare store gated to the param timelock; the `[1, 255]` range is validated there (zero
+     * would remove the lag qualifier and turn the parachute into a continuous top-up).
+     */
     function setParachuteBandMult(uint8 parachuteBandMult_) external override {
         _enforceParamTimelock();
         _parachuteBandMult = parachuteBandMult_;
@@ -719,51 +751,103 @@ contract EquilibraPool is
     }
 
     // ============ Views ============
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Returns zero for a zero amount, an amount above `uint128.max` or an unseeded pool;
+     * otherwise runs the live swap resolver, so quote and swap agree on the same state.
+     */
     function quoteExactIn(
         bool zeroForOne,
         uint256 amountIn
     ) external view override returns (uint256 amountOut) {
         if (amountIn == 0 || amountIn > _LOWER_128_MASK) return 0;
-        (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
-        if (reserve0 == 0 || reserve1 == 0) return 0;
-
-        CurveSnapshot memory cs = _loadCurveParams();
-        uint256 outScale = zeroForOne ? cs.token1Scale : cs.token0Scale;
-
-        MathState memory ms = _liftMathState(reserve0, reserve1, cs);
-        (SwapMathResult memory result, , ) = _executeExactInWithDynamicFee(
-            zeroForOne,
-            amountIn,
-            ms,
-            cs
-        );
-
-        amountOut = _fromWadDownByScale(result.amountOutWad, outScale);
+        return _quoteSwapAmountsChecked(zeroForOne, int256(amountIn)).amountOutRaw;
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Returns zero for a zero amount, an amount above `uint128.max` or an unseeded pool;
+     * otherwise runs the live swap resolver, so quote and swap agree on the same state.
+     */
     function quoteExactOut(
         bool zeroForOne,
         uint256 amountOut
     ) external view override returns (uint256 amountIn) {
         if (amountOut == 0 || amountOut > _LOWER_128_MASK) return 0;
-        (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
-        if (reserve0 == 0 || reserve1 == 0) return 0;
-
-        CurveSnapshot memory cs = _loadCurveParams();
-
-        MathState memory ms = _liftMathState(reserve0, reserve1, cs);
-        (, , , amountIn) = _executeExactOutWithDynamicFee(zeroForOne, amountOut, ms, cs);
+        return _quoteSwapAmountsChecked(zeroForOne, -int256(amountOut)).amountInRaw;
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @dev Runs the full swap resolver (fee, kernel, native bounds, LP-depth guard) on the
+     * current state without mutating it.
+     * @return amounts Resolved raw amounts; all zero on an unseeded pool.
+     */
+    function _quoteSwapAmountsChecked(
+        bool zeroForOne,
+        int256 amountSpecified
+    ) private view returns (SwapAmounts memory amounts) {
+        (uint256 r0, uint256 r1) = _getReservesInternal();
+        if (r0 == 0 || r1 == 0) return amounts;
+        CurveSnapshot memory cs = _loadCurveParams();
+        MathState memory ms = _liftMathState(r0, r1, cs);
+        amounts = _computeSwapAmounts(zeroForOne, amountSpecified, ms, cs);
+    }
+
+    /**
+     * @dev Applies the native settlement bounds and recomputes the post-swap depth. Reverts
+     * `InsufficientLiquidity` when the output reaches the output-side reserve and
+     * `MathInvariantViolation` when a settled reserve exceeds `uint128`. The settled reserves
+     * include the LP fee and exclude the protocol cut.
+     * @return lAfterQ128 Depth `L` (Q128) of the settled reserves; zero on a degenerate lift.
+     */
+    function _checkSwapAmounts(
+        bool zeroForOne,
+        SwapAmounts memory amounts,
+        MathState memory ms,
+        CurveSnapshot memory cs
+    ) private pure returns (uint256 lAfterQ128) {
+        (uint256 r0, uint256 r1) = _unpackPair128(ms.reservesPacked);
+        uint256 reserveOut = zeroForOne ? r1 : r0;
+        if (amounts.amountOutRaw >= reserveOut) revert Errors.InsufficientLiquidity();
+        if (zeroForOne) {
+            r0 += amounts.amountInRaw - amounts.protocolCut;
+            r1 -= amounts.amountOutRaw;
+        } else {
+            r1 += amounts.amountInRaw - amounts.protocolCut;
+            r0 -= amounts.amountOutRaw;
+        }
+        if (r0 > _LOWER_128_MASK || r1 > _LOWER_128_MASK) revert Errors.MathInvariantViolation();
+        lAfterQ128 = _poolDepth(r0, r1, cs);
+    }
+
+    /**
+     * @dev Depth `L` (Q128) of raw reserves under `cs`; zero when either math coordinate is
+     * zero.
+     */
+    function _poolDepth(
+        uint256 r0,
+        uint256 r1,
+        CurveSnapshot memory cs
+    ) internal pure returns (uint256 lAfterQ128) {
+        (uint256 x, uint256 y) = _toMathState(r0, r1, cs);
+        if (x != 0 && y != 0)
+            lAfterQ128 = EquilibraSwapMath.solveLFromState(x, y, cs.aWad, cs.lambdaWad);
+    }
+
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getCurveParams() external view override returns (CurveParams memory cp) {
         cp.aWad = uint256(_aWad);
         cp.lambdaWad = uint256(_lambdaWad);
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Reverses the storage encodings: `feeRampBps = _feeRampDistWad / 1e14`,
+     * `repegShareBps = ⌈stored · (BPS − protocolFeePercent · 100) / BPS⌉` and
+     * `emaPeriod = tau · 694 / 1000`, each an exact round trip of the factory's conversion.
+     */
     function getFeeConfig() external view override returns (FeeConfig memory cfg) {
         cfg.baseFee = _baseFee;
         cfg.feeRampBps = uint16(uint256(_feeRampDistWad) / 1e14);
@@ -777,9 +861,7 @@ contract EquilibraPool is
             )
         );
         cfg.protocolFeePercent = _protocolFeePercent;
-        // Stored value is the internal relaxation time tau; the view
-        // reports the human-facing HALF-LIFE `tau * 694 / 1000`.
-        // Exact round-trip with the factory's ceil conversion.
+        // Stored value is the relaxation time tau; report the half-life `tau · 694 / 1000`.
         cfg.emaPeriod = uint32((uint256(_emaPeriod) * 694) / 1000);
         cfg.repegStepWad = _repegStepWad;
         cfg.repegThresholdToken1UpWad = _repegThresholdToken1UpWad;
@@ -787,7 +869,9 @@ contract EquilibraPool is
         cfg.parachuteBandMult = _parachuteBandMult;
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getPoolMetadata() external view override returns (PoolMetadata memory meta) {
         meta.token0 = _token0;
         meta.token1 = _token1;
@@ -795,10 +879,20 @@ contract EquilibraPool is
         meta.pairPoolIndex = _pairPoolIndex;
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
+    function getPriceScale() external view override returns (uint256) {
+        return _priceScaleWad;
+    }
+
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev `pMargWad` and `sqrtPriceX96` stay zero on an unseeded or degenerate pool.
+     */
     function getOracleState() external view override returns (OracleState memory state) {
         state.priceScaleWad = _priceScaleWad;
-        state.emaPriceWad = _emaPriceWad;
+        state.emaPriceWad = PoolOracle.emaLogToPrice(_emaLogWad);
 
         if (state.priceScaleWad == 0) return state;
         (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
@@ -822,7 +916,9 @@ contract EquilibraPool is
         );
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getOracleTimestamps()
         external
         view
@@ -832,28 +928,30 @@ contract EquilibraPool is
         return (_lastEmaTs, _lastRepegTs);
     }
 
-    /// @inheritdoc IEquilibraPool
-    /// @dev Reads Solady's `ReentrancyGuardTransient` slot directly. The
-    ///      pool forces the pure-`TSTORE` path
-    ///      (`_useTransientReentrancyGuardOnlyOnMainnet() == false`), so
-    ///      the guard stores this contract's own address on entry and
-    ///      zero on exit — a non-zero load means a guarded frame is live.
-    ///      The slot constant is Solady's
-    ///      `uint32(bytes4(keccak256("Reentrancy()"))) | (1 << 71)`
-    ///      (`ReentrancyGuardTransient._REENTRANCY_GUARD_SLOT`), pinned by
-    ///      a reentrancy-triggering test so a dependency bump that moves
-    ///      it fails loudly rather than silently reporting "not entered".
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Reads Solady's transient guard slot directly. With the pure-TSTORE path forced, the
+     * guard stores this contract's address on entry and zero on exit, so a non-zero load means a
+     * guarded frame is live. The literal is `ReentrancyGuardTransient._REENTRANCY_GUARD_SLOT`,
+     * `uint32(bytes4(keccak256("Reentrancy()"))) | (1 << 71)`; a dependency bump that moves it
+     * must be mirrored here.
+     */
     function reentrancyGuardEntered() external view override returns (bool entered) {
         assembly ("memory-safe") {
             entered := iszero(iszero(tload(0x8000000000ab143c06)))
         }
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev View twin of {_updateEma}: the EMA a swap in this block would store, computed from the
+     * live marginal price with the same spot lift, cap and log-domain step. Returns the stored
+     * EMA on an unseeded or degenerate pool.
+     */
     function getLiveEmaPrice() external view override returns (uint256 emaPriceWad) {
-        uint256 storedEma = _emaPriceWad;
+        uint256 storedEma = PoolOracle.emaLogToPrice(_emaLogWad);
         uint256 priceScale = _priceScaleWad;
-        if (storedEma == 0 || priceScale == 0) return storedEma;
+        if (priceScale == 0) return storedEma;
 
         (uint256 r0, uint256 r1) = _getReservesInternal();
         if (r0 == 0 || r1 == 0) return storedEma;
@@ -868,41 +966,52 @@ contract EquilibraPool is
             cs.aWad,
             cs.lambdaWad
         );
-        uint256 spotRaw = FixedPointMathLib.mulWad(pMargMath, priceScale);
+        uint256 spotRaw = FixedPointMathLib.fullMulDiv(pMargMath, priceScale, Constants.WAD);
 
         PoolOracle.EmaState memory next = PoolOracle.updateEma(
-            PoolOracle.EmaState({ emaPriceWad: storedEma, lastUpdateTs: _lastEmaTs }),
+            PoolOracle.EmaState({ emaLogWad: _emaLogWad, lastUpdateTs: _lastEmaTs }),
             spotRaw,
             priceScale,
             _emaPeriod,
             uint64(block.timestamp)
         );
-        emaPriceWad = next.emaPriceWad;
+        emaPriceWad = PoolOracle.emaLogToPrice(next.emaLogWad);
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getLpValueState() external view override returns (LpValueState memory state) {
         state.unitValueWad = _lpUnitValueWad;
         state.genesisWad = _lpUnitValueGenesisWad;
         state.growthWad = _lpValueGrowthWad;
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getReserves() external view override returns (uint256 reserve0, uint256 reserve1) {
         return _getReservesInternal();
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     */
     function getProtocolFees() external view override returns (uint256 fee0, uint256 fee1) {
         return _getProtocolFeesInternal();
     }
 
-    /// @inheritdoc IEquilibraPool
-    function paused() external view override returns (bool) {
-        return _paused;
+    /**
+     * @inheritdoc IEquilibraPool
+     */
+    function paused() external view override returns (bool paused_, bool stopped_) {
+        return (_paused, _stopped);
     }
 
-    /// @inheritdoc IEquilibraPool
+    /**
+     * @inheritdoc IEquilibraPool
+     * @dev Raw `sload` of each requested slot; no layout guarantee is implied.
+     */
     function getStorageSlots(
         uint256[] calldata slots
     ) external view override returns (bytes32[] memory data) {
@@ -921,164 +1030,86 @@ contract EquilibraPool is
         }
     }
 
-    // ============ V3-style price target quoter ============
-
-    struct QuoteBisectCtx {
-        bool zeroForOne;
-        uint256 pTargetMath;
-        MathState ms;
-        CurveSnapshot cs;
-        uint256 inScale;
-        uint256 outScale;
-        uint256 inputReserve;
-        uint256 protocolFeePercent;
-    }
-
-    /// @inheritdoc IEquilibraPool
-    function quoteSwapToPrice(
-        bool zeroForOne,
-        uint160 sqrtPriceTargetX96
-    ) external view override returns (uint256 amountIn, uint256 amountOut, bool crossesAnchor) {
-        if (sqrtPriceTargetX96 == 0) return (0, 0, false);
-
-        (uint256 reserve0, uint256 reserve1) = _getReservesInternal();
-        if (reserve0 == 0 || reserve1 == 0) return (0, 0, false);
-
-        CurveSnapshot memory cs = _loadCurveParams();
-        if (cs.priceScaleWad == 0) return (0, 0, false);
-
-        uint256 pTargetMath = EquilibraSwapMath.sqrtPriceX96ToMathPriceWad(
-            sqrtPriceTargetX96,
-            cs.priceScaleWad,
-            cs.token0Scale,
-            cs.token1Scale
-        );
-        if (pTargetMath == 0) return (0, 0, false);
-
-        // One lift + one L-solve serves the start-price sample AND every
-        // bracket/bisection probe below (audit O-3).
-        MathState memory ms = _liftMathState(reserve0, reserve1, cs);
-        uint256 pStartMath = EquilibraSwapMath.marginalPrice(
-            ms.xMath,
-            ms.yMath,
-            ms.lPreWad,
-            cs.aWad,
-            cs.lambdaWad
-        );
-
-        if (zeroForOne) {
-            if (pTargetMath <= pStartMath) return (0, 0, false);
-        } else {
-            if (pTargetMath >= pStartMath) return (0, 0, false);
-        }
-
-        crossesAnchor =
-            (pStartMath != Constants.WAD) &&
-            (pTargetMath != Constants.WAD) &&
-            ((pStartMath < Constants.WAD) != (pTargetMath < Constants.WAD));
-
-        QuoteBisectCtx memory ctx = QuoteBisectCtx({
-            zeroForOne: zeroForOne,
-            pTargetMath: pTargetMath,
-            ms: ms,
-            cs: cs,
-            inScale: zeroForOne ? cs.token0Scale : cs.token1Scale,
-            outScale: zeroForOne ? cs.token1Scale : cs.token0Scale,
-            inputReserve: zeroForOne ? reserve0 : reserve1,
-            protocolFeePercent: uint256(_protocolFeePercent)
-        });
-
-        (amountIn, amountOut) = _bisectAmountInForTarget(ctx);
-        // An unexecutable best iterate must not leak as a positive
-        // quote: the kernel's dust soft-fail can report a zero output
-        // for a nonzero probe (the executable trade would revert in the
-        // typed dust guards), so fold it into the documented
-        // "(0, 0, false)" no-admissible-amount shape — the
-        // already-computed `crossesAnchor` resets with it. Checking the
-        // output alone covers both sides: the bisection assigns
-        // `(bestAmountIn, bestResult)` atomically, so a zero `amountIn`
-        // only ever returns with the default (zero-output) result.
-        if (amountOut == 0) return (0, 0, false);
-    }
-
     // ============ Anchor / EMA ============
 
-    /// @dev Sample the math-space marginal price, lift it to raw spot,
-    ///      and fold into the EMA. Caller guarantees `reserve{0,1} > 0`
-    ///      and supplies the pre-lifted math state (audit O-3).
-    /// @return preEmaWad The EMA value BEFORE this update — threaded to
-    ///         `_tryAutoRepeg` so `PriceScaleUpdated` can report a real
-    ///         (old, new) EMA pair instead of twice the post-update
-    ///         value (audit I-6). Equals the current EMA unchanged on
-    ///         every early-return path.
+    /**
+     * @dev Samples the math-space marginal price of the pre-swap state, lifts it to the raw spot
+     * `pMargMath · priceScale` and folds it into the geometric EMA through
+     * `PoolOracle.updateEma`. No-op when the timestamp has not advanced, on a zero anchor or on
+     * a degenerate lift. The caller guarantees non-zero reserves and supplies the lifted state.
+     * @return preEmaLogWad Stored EMA logarithm before this update, unchanged on every early
+     * return; {_tryAutoRepeg} reports it as the old EMA in `PriceScaleUpdated`.
+     */
     function _updateEma(
         MathState memory ms,
         CurveSnapshot memory cs
-    ) internal returns (uint256 preEmaWad) {
-        preEmaWad = _emaPriceWad;
+    ) internal returns (int256 preEmaLogWad) {
+        preEmaLogWad = _emaLogWad;
         uint64 nowTs = uint64(block.timestamp);
-        if (nowTs <= _lastEmaTs) return preEmaWad;
-        if (cs.priceScaleWad == 0) return preEmaWad;
-        if (ms.xMath == 0 || ms.yMath == 0) return preEmaWad;
+        if (nowTs <= _lastEmaTs) return preEmaLogWad;
+        if (cs.priceScaleWad == 0) return preEmaLogWad;
+        if (ms.xMath == 0 || ms.yMath == 0) return preEmaLogWad;
 
-        // Math-space marginal price (L-supplied — solved once in the
-        // caller); lift to raw spot (token1/token0 ratio in user-facing
-        // frame): spotRaw = pMargMath · priceScale.
+        // Raw spot in the user-facing frame (token0 per token1):
+        // `spotRaw = pMargMath · priceScale`.
         uint256 pMargMath = EquilibraSwapMath.marginalPrice(
             ms.xMath,
             ms.yMath,
-            ms.lPreWad,
+            ms.lPreQ128,
             cs.aWad,
             cs.lambdaWad
         );
-        uint256 spotRaw = FixedPointMathLib.mulWad(pMargMath, cs.priceScaleWad);
+        uint256 spotRaw = FixedPointMathLib.fullMulDiv(pMargMath, cs.priceScaleWad, Constants.WAD);
 
         PoolOracle.EmaState memory next = PoolOracle.updateEma(
-            PoolOracle.EmaState({ emaPriceWad: preEmaWad, lastUpdateTs: _lastEmaTs }),
+            PoolOracle.EmaState({ emaLogWad: preEmaLogWad, lastUpdateTs: _lastEmaTs }),
             spotRaw,
             cs.priceScaleWad,
             _emaPeriod,
             nowTs
         );
-        _emaPriceWad = next.emaPriceWad;
+        _emaLogWad = next.emaLogWad;
         _lastEmaTs = next.lastUpdateTs;
     }
 
-    /// @dev Two-gate auto-repeg. Operates on post-swap reserves and
-    ///      reuses `vpBefore` from `_accrueLpValueGrowth` so the gate
-    ///      pays for exactly one extra `_computeLpUnitValueWad`
-    ///      (the `vpAfter` probe) per attempt.
-    /// @param emaBeforeWad EMA value before this swap's `_updateEma`
-    ///        commit — used only for `PriceScaleUpdated` telemetry so
-    ///        the event reports a real (old, new) EMA pair (audit I-6).
-    /// @return priceScaleAfter The committed price scale — the new value
-    ///         on a successful repeg, the unchanged `cs.priceScaleWad`
-    ///         on every skip path.
+    /**
+     * @dev Auto-repeg attempt on the post-swap reserves. Skips when `_repegShareBps == 0`
+     * (explicit opt-out: the stored share is zero iff the user share is zero, and the threshold
+     * alone is not exact because mint/burn re-anchoring can creep `_lpUnitValueWad` above the
+     * budgeted floor by rounding dust), when `vpBefore == 0`, when a commit already happened at
+     * this timestamp, or when the geometric deviation `|max(ema, ps) / min(ema, ps) − 1|` is
+     * below the active dead-band (`Up` while `ema > priceScale`, else `Down`). The dead-band is
+     * the only filter against value-neutral churn near the anchor and keeps the quiet-market exit
+     * cheap. The gate floor is `vpFloor = genesis + growth · (BPS − share) / BPS`; without
+     * headroom above `vpFloor + REPEG_GAS_GUARD_WAD` the attempt is handed to
+     * {_tryDonationParachute}. Otherwise the damped step
+     * `min(stepCap, deviation / REPEG_DAMPING_DIVISOR)` is probed through the halving ladder
+     * `step >> k`, `k <= MAX_REPEG_STEP_HALVINGS`, and the first rung whose post-move unit value
+     * is at least `vpFloor` commits; a rung that shrinks to zero or to a dust move ends the
+     * ladder, and if no rung commits the parachute is consulted. Ladder rungs spend LP-value
+     * growth only, never the donation buffer. Costs one `_computeLpUnitValueWad` per probed
+     * rung. `cs.priceScaleWad` is overwritten by the probes and may be left dirty; `swap` reads
+     * nothing from `cs` afterwards.
+     * @param reserve0 Settled token0 reserve, raw.
+     * @param reserve1 Settled token1 reserve, raw.
+     * @param cs Curve snapshot; `priceScaleWad` is mutated in place by the probes.
+     * @param vpBefore Live LP unit value under the current anchor, from {_accrueLpValueGrowth}.
+     * @param emaBeforeLogWad Stored EMA logarithm before this swap's oracle update; used only for
+     * the `PriceScaleUpdated` event.
+     * @return priceScaleAfter Committed anchor: the new value on a commit, the unchanged
+     * `cs.priceScaleWad` on every skip.
+     */
     function _tryAutoRepeg(
         uint256 reserve0,
         uint256 reserve1,
         CurveSnapshot memory cs,
         uint256 vpBefore,
-        uint256 emaBeforeWad
+        int256 emaBeforeLogWad
     ) internal returns (uint256 priceScaleAfter) {
         priceScaleAfter = cs.priceScaleWad;
 
-        // Explicit disable: `repegShareBps == 0` opts the pool out of
-        // auto-repeg entirely. The stored share is pre-scaled at
-        // `initialize` as `⌊user · BPS / (BPS − p·100)⌋`, which is `0`
-        // iff the user share is `0` (any `user ≥ 1` bps yields `≥ 1`),
-        // so this comparison faithfully detects the opt-out. The
-        // threshold mechanism below would *almost* hold the gate shut on
-        // its own, but `_reanchorLpUnitValue` can creep the live
-        // `_lpUnitValueWad` above `vpGenesis + growth` by un-booked
-        // mint/burn rounding dust, eventually clearing the gas-guard and
-        // firing a (dust-funded) repeg on a pool configured as disabled.
-        // This short-circuit makes the documented "disabled by
-        // construction" guarantee exact (and skips the EMA / threshold
-        // SLOADs on opt-out pools). See audit finding L-4.
-        // Hoisted once: re-read again by the threshold math below (the
-        // packed config slot is warm, but the duplicate SLOAD + shift
-        // is still ~110 gas on every threshold-reaching swap).
+        // Explicit opt-out; the threshold alone is not exact (re-anchor rounding dust can creep
+        // the mark above the floor). `shareBps` is reused by the threshold math below.
         uint256 shareBps = uint256(_repegShareBps);
         if (shareBps == 0) return priceScaleAfter;
 
@@ -1086,93 +1117,37 @@ contract EquilibraPool is
 
         if (uint64(block.timestamp) <= _lastRepegTs) return priceScaleAfter;
 
-        uint256 emaWad = _emaPriceWad;
-        if (emaWad == 0) return priceScaleAfter;
+        uint256 emaWad = PoolOracle.emaLogToPrice(_emaLogWad);
 
         uint256 deviationWad;
         {
-            // Activation dead-band: skip while the EMA/priceScale deviation
-            // is below the active direction's dead-band
-            // (`_repegThresholdToken1UpWad` while `ema > priceScale`,
-            // else `_repegThresholdToken1DownWad`). Decoupled from the
-            // per-repeg step cap `repegStepWad`: the threshold decides WHEN the
-            // anchor wakes, the damped step decides HOW FAR it moves.
-            // This gate is load-bearing, not a gas nicety:
-            //
-            //   1. It is the ONLY filter able to stop vp-neutral churn.
-            //      Near the anchor a small `priceScale` move is value-
-            //      neutral for the LP-unit metric (second-order in the
-            //      step), so BOTH vp gates below pass and no growth budget
-            //      is consumed — without this check any pool holding a
-            //      growth cushion would commit a dust repeg nearly every
-            //      block in a jittery sideways market (3 SSTOREs + event
-            //      billed to the block's first swapper, plus permanent
-            //      anchor/oracle churn).
-            //   2. It keeps the hot path flat. `_lastRepegTs` advances only
-            //      on a successful commit, so a non-committing attempt
-            //      would re-run the threshold SLOADs, the shift candidate
-            //      and the `vpAfter` probe on EVERY swap of the block; this
-            //      early return prices the common case at one SLOAD + one
-            //      mulDiv.
-            //
-            // Calibration: keep both dead-bands at or below the fee
-            // floor (all read as relative fractions; see CLAUDE.md
-            // "Sizing the repeg knobs"). The vp cost of a move fired at
-            // deviation `dev`
-            // grows ~quadratically in `dev` (move size `dev/5` × reserve
-            // imbalance ∝ `dev`), while the fee-funded growth budget
-            // accrued by the very flow that created the deviation grows
-            // only ~linearly — a quantum set far above the fee scale pins
-            // the pool where its first permitted move is already
-            // unaffordable, and the anchor can stall until unrelated
-            // volume replenishes the budget.
-            //
-            // Geometric (multiplicative) deviation `|max/min − 1|`. A ±2×
-            // move of the EMA vs priceScale yields `1.0` WAD in BOTH
-            // directions, consistent with the symmetric `[ps/2, 2ps]` EMA
-            // clamp. The previous linear `|ema/ps − 1|` capped the
-            // downward deviation at `0.5` (since `ema ≥ ps/2`), so any
-            // threshold above `0.5·WAD` permanently blocked downward
-            // repegs while upward still fired — a one-directional ratchet.
-            // Upward (`ema ≥ ps`) is bit-identical to the old metric, so
-            // only downward behaviour changes (see audit finding L-6).
-            deviationWad = emaWad >= cs.priceScaleWad
-                ? FixedPointMathLib.mulDiv(emaWad, Constants.WAD, cs.priceScaleWad) - Constants.WAD
-                : FixedPointMathLib.mulDiv(cs.priceScaleWad, Constants.WAD, emaWad) - Constants.WAD;
-            // Direction-split dead-band: `ema > priceScale` is an
-            // internal token1-UP move (token1's price expressed in
-            // token0 above the anchor). Under the mainnet address-sort
-            // layout with the base asset in slot 0, a RISING base
-            // market registers as token1-DOWN — the two knobs let the
-            // deployer calibrate catch-up eagerness per direction
-            // explicitly instead of inheriting it from averaging
-            // artifacts.
+            // Activation dead-band on the geometric deviation `|max/min − 1|` (a ±2× move reads
+            // 1.0 WAD in both directions, matching the `[ps/2, 2ps]` EMA clamp). Independent of
+            // the step cap and of fees: it decides when the anchor may wake, the budget gates
+            // whether a move is affordable. It is the only filter against value-neutral dust
+            // repegs near the anchor, and it keeps every non-committing swap of a block at one
+            // SLOAD plus one division.
+            deviationWad = _priceDeviation(emaWad, cs.priceScaleWad);
+            // `ema > priceScale` is a token1-UP move; with the base asset in slot 0 a rising base
+            // market reads as token1-DOWN, so each direction is calibrated explicitly.
             uint256 activeThresholdWad = emaWad > cs.priceScaleWad
                 ? _repegThresholdToken1UpWad
                 : _repegThresholdToken1DownWad;
             if (deviationWad < activeThresholdWad) return priceScaleAfter;
         }
 
-        // Read the step cap only once the dead-band passed: the common
-        // quiet-market exit above now skips this (warm) SLOAD entirely.
-        // No reader exists before this point — the pre-gate parachute
-        // handover and the ladder both sit below.
+        // Step cap read only after the dead-band passed; the quiet-market exit skips the SLOAD.
         uint256 stepWad = _repegStepWad;
         uint256 vpFloorWad;
         {
-            // Scoped: keeps the frame within the 16-slot legacy-codegen
-            // stack limit (coverage builds compile without viaIR).
+            // Scoped for the legacy-codegen 16-slot stack limit.
             uint256 vpGenesis = _lpUnitValueGenesisWad;
             uint256 growth = _lpValueGrowthWad;
             vpFloorWad =
                 vpGenesis +
                 FixedPointMathLib.mulDiv(growth, Constants.BPS - shareBps, Constants.BPS);
-            // No own budget ⇒ hand over to the donation parachute (the
-            // ONLY path that may spend the donation buffer). The same
-            // handover happens after the ladder exhausts every rung —
-            // the parachute is consulted exactly when NO repeg
-            // committed, and its own qualifiers (K × dead-band lag,
-            // usable buffer, full-step shortfall covered) decide.
+            // No spendable growth: hand over to the parachute, the only spender of the donation
+            // buffer.
             if (vpBefore <= vpFloorWad + Constants.REPEG_GAS_GUARD_WAD)
                 return
                     _tryDonationParachute(
@@ -1180,33 +1155,18 @@ contract EquilibraPool is
                         reserve1,
                         cs,
                         emaWad,
-                        emaBeforeWad,
+                        emaBeforeLogWad,
                         stepWad,
                         deviationWad,
                         vpFloorWad
                     );
         }
 
-        // Halving ladder: start from the damped applied step and, when
-        // the post-move solvency probe refuses the candidate, retry with
-        // the step halved (effective divisor D, 2D, 4D, 8D) instead of
-        // freezing the anchor entirely. Every committed move passed the
-        // REAL gate; no cross-block memory — the next attempt starts
-        // fresh. `cs` is aliased by `csAfter` (memory struct assignment
-        // copies the pointer), so the pre-repeg priceScale stays
-        // available only in `priceScaleAfter`. Bit-for-bit with the
-        // Rust reference ladder in `try_auto_repeg`. Strictly LP-budget-
-        // funded: the donation buffer is spendable only by the parachute
-        // branch above, never by a ladder rung.
-        // Reuse `stepWad` as the base applied step — the raw cap has no
-        // further reader and the legacy (non-viaIR) coverage pipeline
-        // sits at the 16-slot stack limit here. (`appliedRepegStep` is
-        // idempotent — `min(applied, dev/5) == applied` — so the
-        // parachute handover below can pass the damped value where its
-        // signature expects the raw cap.) Supply is invariant for the
-        // whole attempt (no mint/burn can interleave a `nonReentrant`
-        // swap), so it is read ONCE into `shareBps` — dead since the
-        // threshold math — instead of once per rung probe.
+        // Halving ladder: the damped applied step, then halved up to MAX_REPEG_STEP_HALVINGS
+        // times; no cross-block memory. `stepWad` is reused for the applied step
+        // (`appliedRepegStep` is idempotent, so the parachute may receive it as the cap) and
+        // `shareBps` for the supply (invariant during a `nonReentrant` swap) to stay within the
+        // legacy 16-slot stack limit.
         stepWad = PoolOracle.appliedRepegStep(stepWad, deviationWad);
         shareBps = totalSupply();
         for (uint256 halving; halving <= Constants.MAX_REPEG_STEP_HALVINGS; ++halving) {
@@ -1220,120 +1180,81 @@ contract EquilibraPool is
                 // Dust move — smaller halvings can only stay dust.
                 break;
             }
-            // Reuse `deviationWad` as the vpAfter probe slot (its last
-            // read was the base-applied-step computation above) — same
-            // 16-slot budget reasoning. `cs` is mutated in place for
-            // the probe; the pre-repeg priceScale lives only in
-            // `priceScaleAfter` from here on.
+            // `deviationWad` is reused as the vpAfter probe slot; `cs` is mutated in place, so
+            // the pre-repeg anchor lives only in `priceScaleAfter` from here on.
             {
                 cs.priceScaleWad = priceScaleNew;
                 deviationWad = _computeLpUnitValueWad(reserve0, reserve1, cs, shareBps);
             }
-            // A degenerate zero probe needs no dedicated arm:
-            // `vpFloorWad ≥ vpGenesis > 0` whenever a swap is executable
-            // (genesis precedes the first swap), so `0 < vpFloorWad`
-            // already refuses it.
+            // A zero probe is refused here: `vpFloorWad >= vpGenesis > 0` once a swap is
+            // executable.
             if (deviationWad < vpFloorWad) continue;
 
-            _priceScaleWad = priceScaleNew;
-            _lpUnitValueWad = deviationWad;
-            _lastRepegTs = uint64(block.timestamp);
-            // (old, new) EMA pair: pre-update value threaded from
-            // swap()'s `_updateEma`, post-update value already in
-            // `emaWad` — no redundant `_emaPriceWad` re-read.
-            emit PriceScaleUpdated(priceScaleAfter, priceScaleNew, emaBeforeWad, emaWad);
+            _commitRepeg(priceScaleAfter, priceScaleNew, deviationWad, emaBeforeLogWad, emaWad);
             return priceScaleNew;
         }
 
-        // Every rung refused ⇒ consult the parachute. Restore the
-        // pre-repeg priceScale the probes overwrote and recompute the
-        // geometric deviation (`deviationWad` was reused as the probe
-        // slot; `emaWad` and `priceScaleAfter` are untouched, so the
-        // recomputed value is bit-identical to the dead-band gate's).
+        // Every rung refused: restore the anchor and recompute the deviation (bit-identical to
+        // the gate's) for the parachute.
         cs.priceScaleWad = priceScaleAfter;
-        deviationWad = emaWad >= priceScaleAfter
-            ? FixedPointMathLib.mulDiv(emaWad, Constants.WAD, priceScaleAfter) - Constants.WAD
-            : FixedPointMathLib.mulDiv(priceScaleAfter, Constants.WAD, emaWad) - Constants.WAD;
+        deviationWad = _priceDeviation(emaWad, priceScaleAfter);
         return
             _tryDonationParachute(
                 reserve0,
                 reserve1,
                 cs,
                 emaWad,
-                emaBeforeWad,
+                emaBeforeLogWad,
                 stepWad,
                 deviationWad,
                 vpFloorWad
             );
     }
 
-    /// @dev Donation parachute — the ONLY spender of the donation
-    ///      buffer (LP shares parked on the pool's own address; anyone
-    ///      can top the buffer up with a plain LP `transfer`, which is
-    ///      vp-neutral while parked — supply unchanged — and
-    ///      irrevocable). Reached from `_tryAutoRepeg` whenever NO
-    ///      repeg committed: from the pre-gate (no spendable growth
-    ///      budget at all) and after the halving ladder exhausted every
-    ///      rung. It opens only when the anchor additionally lags by at
-    ///      least `parachuteBandMult × the active dead-band` — K stored
-    ///      per pool, seeded at `Constants.REPEG_PARACHUTE_BAND_MULT`
-    ///      and timelock-adjustable via {setParachuteBandMult} — so
-    ///      ordinary regimes never consume donated funds and the
-    ///      buffer survives as a genuine emergency reserve.
-    ///
-    ///      Commits the FULL damped step in one shot — no halving
-    ///      ladder: halved rungs exist to fit a move into the pool's
-    ///      own budget, and here they are pointless on both routes (the
-    ///      pre-gate one has no budget at all; the post-ladder one just
-    ///      had every rung, halves included, refused). The burn is
-    ///      EXACTLY the shortfall
-    ///        δ = ⌈S · (T − vpAfter) / T⌉
-    ///      so the post-burn unit value lands ON `vpFloorWad` up to
-    ///      rounding: `≥ T` is guaranteed (δ ≥ S·(T − vp)/T ⇒
-    ///      T·(S − δ) ≤ S·vp ⇒ the floored latch `⌊vp · S / (S − δ)⌋ ≥
-    ///      T`, no post-burn gate needed), and the overshoot above `T`
-    ///      is the ceil's at-most-one-share over-burn expressed in unit
-    ///      value — bounded by `~T / (S − δ)`, i.e. wei-scale whenever
-    ///      the post-burn supply dwarfs `T` and growing only as the
-    ///      supply shrinks toward the dead-share floor. That sub-share
-    ///      remainder is the ONLY surplus a commit can hand to LP
-    ///      holders, which makes sandwiching a parachute commit
-    ///      value-free up to that rounding dust: the donation's entire
-    ///      uplift is otherwise consumed by the anchor move within this
-    ///      same transaction. A candidate that needs no subsidy
-    ///      (`vpAfter ≥ threshold`, possible on the pre-gate route
-    ///      where the ladder never probed) commits with δ = 0. The spend
-    ///      rate stays bounded by the untouched cadence guard (one commit
-    ///      per block, at least a second apart)
-    ///      and step cap: donations make a move affordable, never
-    ///      faster or larger.
-    ///
-    ///      `cs.priceScaleWad` is mutated for the probe and left dirty
-    ///      on non-commit exits, mirroring the ladder's behaviour —
-    ///      `swap()` reads nothing from `cs` afterwards. Pools with
-    ///      `repegShareBps == 0` never reach this code (step-0
-    ///      short-circuit), so donations sent to opted-out pools are
-    ///      unspendable by design — documented, do not donate there.
-    /// @return priceScaleAfter The committed price scale, or the
-    ///         unchanged pre-call `cs.priceScaleWad` on every skip.
+    /**
+     * @dev Donation parachute: the only spender of the donation buffer (LP shares parked on the
+     * pool's own address, added by plain LP transfers, vp-neutral while parked and irrevocable).
+     * Reached from {_tryAutoRepeg} exactly when no rung committed. Opens only when the anchor
+     * lags by at least `parachuteBandMult × active dead-band` and the buffer exceeds
+     * `REPEG_DONATION_DUST_SHARES`, so ordinary regimes never consume donations. Commits the
+     * full damped step in one shot (halved rungs exist to fit the pool's own budget, which is
+     * absent here) and burns exactly the shortfall
+     * `δ = ⌈S · (T − vpAfter) / T⌉ = S − ⌊S · vpAfter / T⌋` (`T = vpFloorWad`, `S = supply`),
+     * which lands the post-burn unit value on `T` up to the ceil's at-most-one-share over-burn:
+     * `T · (S − δ) <= S · vpAfter` implies the latched `⌊vpAfter · S / (S − δ)⌋ >= T`, so no
+     * post-burn gate is needed, and the overshoot is at most about `T / (S − δ)` in unit value,
+     * wei-scale while the post-burn supply dwarfs `T`. That sub-share remainder is the only
+     * surplus a commit can hand to LP holders, which makes sandwiching a parachute commit
+     * value-free up to rounding dust. A candidate that needs no subsidy commits with `δ = 0`; a
+     * shortfall above the buffer declines. The cadence guard and step cap are unchanged:
+     * donations make a move affordable, never faster or larger. Pools with
+     * `repegShareBps == 0` never reach this code, so donations to them are unspendable.
+     * `cs.priceScaleWad` is mutated for the probe and left dirty on non-commit exits.
+     * @param reserve0 Settled token0 reserve, raw.
+     * @param reserve1 Settled token1 reserve, raw.
+     * @param cs Curve snapshot; `priceScaleWad` is overwritten by the probe.
+     * @param emaWad Current EMA price, WAD.
+     * @param emaBeforeLogWad Stored EMA logarithm before this swap's oracle update; used only for
+     * the `PriceScaleUpdated` event.
+     * @param stepCapWad Per-repeg step cap, WAD; the damped applied step is accepted too.
+     * @param deviationWad Geometric EMA/anchor deviation, WAD.
+     * @param vpFloorWad Gate floor `genesis + growth · (BPS − share) / BPS`, WAD.
+     * @return priceScaleAfter Committed anchor, or the unchanged `cs.priceScaleWad` on every skip.
+     */
     function _tryDonationParachute(
         uint256 reserve0,
         uint256 reserve1,
         CurveSnapshot memory cs,
         uint256 emaWad,
-        uint256 emaBeforeWad,
+        int256 emaBeforeLogWad,
         uint256 stepCapWad,
         uint256 deviationWad,
         uint256 vpFloorWad
     ) internal returns (uint256 priceScaleAfter) {
         priceScaleAfter = cs.priceScaleWad;
 
-        // Activation qualifier: anchor must lag by K × the active
-        // direction's dead-band (all three slots are warm — the
-        // dead-band gate read the band slots, the share opt-out read
-        // the config slot holding `_parachuteBandMult`). K is the
-        // timelock-adjustable per-pool multiplier; `band ≤ WAD` and
-        // `K ≤ 255`, so the checked mul cannot overflow.
+        // Lag qualifier: K × the active dead-band; `band <= WAD` and `K <= 255`, so the checked
+        // mul cannot overflow.
         {
             uint256 activeBandWad = emaWad > priceScaleAfter
                 ? _repegThresholdToken1UpWad
@@ -1344,31 +1265,21 @@ contract EquilibraPool is
         uint256 donationShares = balanceOf(address(this));
         if (donationShares <= Constants.REPEG_DONATION_DUST_SHARES) return priceScaleAfter;
 
-        // Full damped step; reuse `stepCapWad` for the applied step and
-        // then the candidate — its raw-cap value has no further reader.
+        // Full damped step; `stepCapWad` is reused for the applied step and then the candidate.
         stepCapWad = PoolOracle.appliedRepegStep(stepCapWad, deviationWad);
         stepCapWad = PoolOracle.applyLogStep(priceScaleAfter, emaWad, stepCapWad);
         if (stepCapWad == priceScaleAfter) return priceScaleAfter;
 
         cs.priceScaleWad = stepCapWad;
         uint256 supply = totalSupply();
-        // Reuse `deviationWad` as the vpAfter probe slot (last read was
-        // the applied-step computation above).
+        // `deviationWad` is reused as the vpAfter probe slot.
         deviationWad = _computeLpUnitValueWad(reserve0, reserve1, cs, supply);
 
-        // Post-burn supply via the exact integer identity
-        //   δ = ⌈S·(T − vp)/T⌉ = S − ⌊S·vp/T⌋      (T = vpFloorWad)
-        // — one fullMulDiv replaces the sub + mulDivUp, and
-        // `supplyAfter` doubles as the latch denominator below (δ and
-        // the latch stay bit-identical to the subtractive form).
-        // `fullMulDiv` (512-bit) over `mulDiv`: measured same bytecode
-        // (the routine is already inlined for the vp probes) but no
-        // 256-bit cliff on `S·vp` — an overflow revert here would abort
-        // the whole swap on the rescue path. A degenerate `vp == 0`
-        // probe needs no dedicated exit: `supplyAfter == 0 ⇒ burnShares
-        // == supply`, declined by the buffer check below because
-        // `donationShares < supply` always holds (the genesis dead
-        // shares at 0xdEaD stay in the active float forever).
+        // Post-burn supply via the integer identity `δ = ⌈S·(T − vp)/T⌉ = S − ⌊S·vp/T⌋` with
+        // `T = vpFloorWad`; the 512-bit `fullMulDiv` cannot overflow on `S·vp` and abort the
+        // rescue. A zero probe gives `supplyAfter == 0`, i.e. `burnShares == supply`, which the
+        // buffer check declines because `donationShares < supply` always holds (the dead shares
+        // at 0xdEaD never leave the active float).
         uint256 supplyAfter = deviationWad >= vpFloorWad
             ? supply
             : FixedPointMathLib.fullMulDiv(supply, deviationWad, vpFloorWad);
@@ -1380,18 +1291,62 @@ contract EquilibraPool is
         if (burnShares > donationShares) return priceScaleAfter;
         if (burnShares != 0) _burn(address(this), burnShares);
 
-        _priceScaleWad = stepCapWad;
-        // Exact post-burn latch (degenerates to `deviationWad` itself
-        // when δ = 0): `supplyAfter ≤ S·vp/T ⇒ ⌊vp·S/supplyAfter⌋ ≥ T`
-        // — the floored latch cannot land below the gate floor.
-        _lpUnitValueWad = FixedPointMathLib.fullMulDiv(deviationWad, supply, supplyAfter);
-        _lastRepegTs = uint64(block.timestamp);
-        emit PriceScaleUpdated(priceScaleAfter, stepCapWad, emaBeforeWad, emaWad);
+        // Exact post-burn latch: supplyAfter <= supply * vpAfter / floor implies latch >= floor.
+        _commitRepeg(
+            priceScaleAfter,
+            stepCapWad,
+            FixedPointMathLib.fullMulDiv(deviationWad, supply, supplyAfter),
+            emaBeforeLogWad,
+            emaWad
+        );
         return stepCapWad;
+    }
+
+    /**
+     * @dev Commit shared by ladder rungs and parachute moves: stores the anchor, latches the LP
+     * unit value, stamps `_lastRepegTs` and emits `PriceScaleUpdated`.
+     * @param previous Anchor before the move, WAD.
+     * @param next Anchor after the move, WAD.
+     * @param lpValue Post-move LP unit value to latch, WAD.
+     * @param emaBefore EMA logarithm before this swap's oracle update, WAD.
+     * @param emaAfter Current EMA price, WAD.
+     */
+    function _commitRepeg(
+        uint256 previous,
+        uint256 next,
+        uint256 lpValue,
+        int256 emaBefore,
+        uint256 emaAfter
+    ) private {
+        _priceScaleWad = next;
+        _lpUnitValueWad = lpValue;
+        _lastRepegTs = uint64(block.timestamp);
+        emit PriceScaleUpdated(previous, next, PoolOracle.emaLogToPrice(emaBefore), emaAfter);
+    }
+
+    /**
+     * @dev Geometric deviation `max(a, b) · WAD / min(a, b) − WAD` of two positive prices;
+     * symmetric in its arguments.
+     * @param a First price, WAD.
+     * @param b Second price, WAD.
+     * @return Deviation, WAD.
+     */
+    function _priceDeviation(uint256 a, uint256 b) private pure returns (uint256) {
+        if (a < b) (a, b) = (b, a);
+        return FixedPointMathLib.fullMulDiv(a, Constants.WAD, b) - Constants.WAD;
     }
 
     // ============ Swap orchestration ============
 
+    /**
+     * @dev Resolves one swap leg on the pre-swap snapshot: `amountSpecified > 0` is exact input
+     * (gross raw input, output floored to raw units), `< 0` exact output (raw output, gross input
+     * ceiled). Reverts `InvalidAmountSpecified` for zero or above `uint128.max`,
+     * `AmountTooSmallAfterNormalization` for an output that floors to zero and
+     * `LpValueDecreased` when the settled post-fee depth falls below the pre-swap depth. Splits
+     * the fee into the protocol cut and the LP cut.
+     * @return amounts Resolved raw amounts, fee split and post-swap depth (Q128).
+     */
     function _computeSwapAmounts(
         bool zeroForOne,
         int256 amountSpecified,
@@ -1410,50 +1365,52 @@ contract EquilibraPool is
         if (amountSpecified > 0) {
             amounts.amountInRaw = amountAbs;
 
-            (
-                SwapMathResult memory result,
-                uint256 feeAmount,
-                uint256 cleanRaw
-            ) = _executeExactInWithDynamicFee(zeroForOne, amounts.amountInRaw, ms, cs);
+            (uint256 amountOutWad, uint256 feeAmount) = _executeExactInWithDynamicFee(
+                zeroForOne,
+                amounts.amountInRaw,
+                ms,
+                cs
+            );
 
             amounts.feeAmount = feeAmount;
-            amounts.amountInCleanRaw = cleanRaw;
-            (amounts.protocolCut, amounts.lpFeeCut) = _splitFee(amounts.feeAmount);
 
-            amounts.amountOutRaw = _fromWadDownByScale(result.amountOutWad, outScale);
+            amounts.amountOutRaw = _fromWadDownByScale(amountOutWad, outScale);
             if (amounts.amountOutRaw == 0) revert Errors.AmountTooSmallAfterNormalization();
         } else {
             amounts.amountOutRaw = amountAbs;
-            if (amounts.amountOutRaw == 0) revert Errors.ZeroAmount();
 
-            SwapMathResult memory result;
-            (
-                result,
-                amounts.feeAmount,
-                amounts.amountInCleanRaw,
-                amounts.amountInRaw
-            ) = _executeExactOutWithDynamicFee(zeroForOne, amounts.amountOutRaw, ms, cs);
-            (amounts.protocolCut, amounts.lpFeeCut) = _splitFee(amounts.feeAmount);
+            (amounts.feeAmount, amounts.amountInRaw) = _executeExactOutWithDynamicFee(
+                zeroForOne,
+                amounts.amountOutRaw,
+                ms,
+                cs
+            );
         }
+        (amounts.protocolCut, amounts.lpFeeCut) = _splitFee(amounts.feeAmount);
+        amounts.lAfterQ128 = _checkSwapAmounts(zeroForOne, amounts, ms, cs);
+        if (amounts.lAfterQ128 < ms.lPreQ128) revert Errors.LpValueDecreased();
     }
 
-    /// @dev Single-pass exact-in resolver with smoothstep dynamic fee.
-    ///      The rate is resolved and applied at WAD precision
-    ///      (`1 bps == 1e14`): a one-ulp rate step moves the fee by at
-    ///      most `amountInRaw / 1e18` wei, which keeps the
-    ///      gross → clean-input map monotone up to a dust residual on
-    ///      that order (the CP distance and `r` are WAD-quantized too,
-    ///      so a single input wei can cross several rate ulps at once).
+    /**
+     * @dev Exact-in resolver. Resolves the smoothstep rate once from the CP-proxy distance of
+     * the gross input at WAD precision (`1 bps == 1e14`), charges
+     * `max(1, ⌊amountIn · feeWad / WAD⌋)` for a positive rate (zero for a zero rate), lifts the
+     * clean input to WAD and runs the kernel. A one-ulp rate step moves the fee by at most
+     * `amountInRaw / 1e18` wei, so the gross-to-clean map is monotone up to a dust residual of
+     * that order (the CP distance and the ramp position are WAD-quantised, so one input wei can
+     * cross several rate ulps).
+     * @return amountOutWad Output in WAD of the output token.
+     * @return feeAmount Fee in raw input units.
+     */
     function _executeExactInWithDynamicFee(
         bool zeroForOne,
         uint256 amountInRaw,
         MathState memory ms,
         CurveSnapshot memory cs
-    ) internal view returns (SwapMathResult memory result, uint256 feeAmount, uint256 cleanRaw) {
+    ) internal view returns (uint256 amountOutWad, uint256 feeAmount) {
         uint256 feeWad;
         unchecked {
-            // uint16 · 1e14 ≤ 6.55e18 and `amountInRaw ≤ uint128.max`
-            // times a rate < WAD stays far below 2²⁵⁶ — both muls are
+            // `uint16 · 1e14 <= 6.55e18` and `uint128.max · rate < 2^256`: both muls are
             // overflow-free.
             feeWad = _resolveDynamicFeeWadFromCp(
                 zeroForOne,
@@ -1464,93 +1421,80 @@ contract EquilibraPool is
             );
             feeAmount = (amountInRaw * feeWad) / Constants.WAD;
         }
-        cleanRaw = amountInRaw - feeAmount;
+        if (feeAmount == 0 && feeWad != 0) feeAmount = 1;
+        uint256 cleanRaw = amountInRaw - feeAmount;
         uint256 inScale = zeroForOne ? cs.token0Scale : cs.token1Scale;
         uint256 cleanWad = _toWadByScale(cleanRaw, inScale);
         if (cleanWad == 0) revert Errors.AmountTooSmallAfterNormalization();
 
-        result = _computeExactInSwapMath(zeroForOne, cleanWad, ms, cs);
+        amountOutWad = _computeExactInSwapMath(zeroForOne, cleanWad, ms, cs);
     }
 
-    /// @dev Exact-out resolver. Shares the CP-proxy rate surface with
-    ///      the exact-in resolver, but charges the endpoint-max fee over
-    ///      the realisable gross interval — ≥ the fee exact-in would
-    ///      resolve at the settled gross (LP-favourable conservatism,
-    ///      see the endpoint-max rationale below) — plus a +1 wei
-    ///      pool-favourable safety bump on the gross input.
+    /**
+     * @dev Exact-out resolver. Lifts the requested output to WAD, runs the kernel for the clean
+     * input (ceiled to raw units) and delegates the fee gross-up to {_resolveExactOutFee}. A
+     * clean input of zero (reachable for one-wei outputs on strongly skewed pools) reverts
+     * `AmountTooSmallAfterNormalization` instead of underflowing inside the gross-up.
+     * @return feeAmount Fee in raw input units, including the +1 raw gross-input bump.
+     * @return amountInRaw Gross raw input the caller must deliver.
+     */
     function _executeExactOutWithDynamicFee(
         bool zeroForOne,
         uint256 amountOutRaw,
         MathState memory ms,
         CurveSnapshot memory cs
-    )
-        internal
-        view
-        returns (
-            SwapMathResult memory result,
-            uint256 feeAmount,
-            uint256 cleanInRaw,
-            uint256 amountInRaw
-        )
-    {
+    ) internal view returns (uint256 feeAmount, uint256 amountInRaw) {
         uint256 outScale = zeroForOne ? cs.token1Scale : cs.token0Scale;
         uint256 inScale = zeroForOne ? cs.token0Scale : cs.token1Scale;
+        uint256 amountInCleanWad;
         {
             uint256 amountOutWad = _toWadByScale(amountOutRaw, outScale);
             if (amountOutWad == 0) revert Errors.AmountTooSmallAfterNormalization();
 
-            result = _computeExactOutSwapMath(zeroForOne, amountOutWad, ms, cs);
+            amountInCleanWad = _computeExactOutSwapMath(zeroForOne, amountOutWad, ms, cs);
         }
-        cleanInRaw = _fromWadUpByScale(result.amountInCleanWad, inScale);
-        // Guard the closed-form gross-up against a zero clean input
-        // (reachable for ~1-wei exact-out on strongly skewed pools where
-        // the secant's best iterate lands at `xPost == xMath` exactly):
-        // `_grossUpExactOut` computes `cleanInRaw - 1`, which would
-        // otherwise underflow into an opaque Panic(0x11). The Rust
-        // reference already errors on this input (audit I-4).
+        uint256 cleanInRaw = _fromWadUpByScale(amountInCleanWad, inScale);
+        // A zero clean input (one-wei exact-out on a strongly skewed pool) would underflow the
+        // gross-up's `cleanInRaw - 1`; reject it as dust instead.
         if (cleanInRaw == 0) revert Errors.AmountTooSmallAfterNormalization();
+        (feeAmount, amountInRaw) = _resolveExactOutFee(zeroForOne, cleanInRaw, ms, cs);
+    }
 
+    /**
+     * @dev Fee gross-up for exact output. Flat-fee pools (`_feeRampDistWad == 0`) gross up at
+     * `baseFee` directly. With a live ramp the settled gross lies in
+     * `[grossUp(clean, feeFloor), grossUp(clean, baseFee)]` and the CP-proxy distance is
+     * quasi-convex (V-shaped, minimum at the constant-product anchor) in the gross, so a
+     * fixed-point iteration could oscillate on anchor-crossing trades; the rate is instead
+     * resolved non-iteratively as `max(feeCp(grossLo), feeCp(grossHi))`, which is at or above
+     * the rate exact-in resolves at the settled gross. This bounds the rate, not the inverse
+     * identity between independent exact-in and exact-out solves. On the descending branch of
+     * the V the rate falls as the requested output grows, so the required input can tick down
+     * per extra output wei by a dust residual of order `gross / 1e18`, in the taker's favour.
+     * Both branches add the +1 raw fee-rounding bump. `quoteExactOut` runs the same path, so
+     * quote and swap agree.
+     * @return feeAmount Fee in raw input units.
+     * @return amountInRaw Gross raw input.
+     */
+    function _resolveExactOutFee(
+        bool zeroForOne,
+        uint256 cleanInRaw,
+        MathState memory ms,
+        CurveSnapshot memory cs
+    ) private view returns (uint256 feeAmount, uint256 amountInRaw) {
         uint256 baseFeeWad;
         unchecked {
             // uint16 · 1e14 ≤ 6.55e18 — overflow-free.
             baseFeeWad = uint256(_baseFee) * 1e14;
         }
-        // Flat-fee short-circuit: with the ramp disabled the CP resolver
-        // returns `baseFee` for ANY gross, so `feeLo == feeHi == baseFee`
-        // and the endpoint-max below is a tautology — the final gross-up
-        // would recompute `grossHi` verbatim. One SLOAD + one gross-up
-        // replaces two resolver dispatches + three mulDivs (~400 gas per
-        // flat-fee exactOutput/quoteExactOut; audit O-5). Bit-identical
-        // outputs; mirrored in the Rust quoter.
+        // Flat fee: the resolver returns `baseFee` for any gross, so the endpoint max is a
+        // tautology.
         if (_feeRampDistWad == 0) {
             amountInRaw = _grossUpExactOut(cleanInRaw, baseFeeWad) + 1;
             feeAmount = amountInRaw - cleanInRaw;
-            return (result, feeAmount, cleanInRaw, amountInRaw);
+            return (feeAmount, amountInRaw);
         }
-        // Dynamic fee for exact-out via a non-iterative, identity-safe
-        // resolution. The CP-proxy post-distance is quasi-convex
-        // (V-shaped) in the gross input — its single minimum sits at the
-        // constant-product anchor `xPost = √(xy)` — so a fixed-point
-        // iteration on it can oscillate forever for anchor-crossing
-        // trades (never converging within any fixed pass count).
-        //
-        // Instead, observe that the gross input the swap ultimately
-        // settles on always lies in
-        //   [grossUp(clean, feeFloor), grossUp(clean, baseFee)]
-        // because the resolved rate ∈ [feeFloor, baseFee], and that
-        // a quasi-convex function attains its maximum over an interval at
-        // one of the endpoints. Charging
-        //   feeWad = max(feeCp(grossLo), feeCp(grossHi))
-        // is therefore ≥ the fee `exactInput` independently resolves at
-        // the settled gross, which guarantees the user-facing identity
-        //   exactInputSingle(quoteExactOut(out)) ≥ out
-        // with two CP evaluations and no iteration. `quoteExactOut` runs
-        // the same path, so quote == swap by construction. On the
-        // descending branch of the V the resolved rate falls as the
-        // requested output grows, so `amountIn` can tick DOWN per extra
-        // output wei — the same dust residual on the order of
-        // `gross / 1e18` as exact-in, in the taker-favourable
-        // direction.
+        // Endpoint max of the quasi-convex CP-proxy rate over `[grossLo, grossHi]`.
         uint256 grossLo;
         unchecked {
             // uint16 · 1e14 ≤ 6.55e18 — overflow-free.
@@ -1560,30 +1504,42 @@ contract EquilibraPool is
         uint256 feeLo = _resolveDynamicFeeWadFromCp(zeroForOne, grossLo, ms, cs, baseFeeWad);
         uint256 feeHi = _resolveDynamicFeeWadFromCp(zeroForOne, grossHi, ms, cs, baseFeeWad);
         uint256 feeWad = feeLo > feeHi ? feeLo : feeHi;
-        // +1 wei safety bump: covers the secant's K-residual so the
-        // settled `cleanIn` is never understated (see audit finding I-1).
+        // +1 raw fee-rounding bump.
         amountInRaw = _grossUpExactOut(cleanInRaw, feeWad) + 1;
         feeAmount = amountInRaw - cleanInRaw;
     }
 
-    /// @dev Smallest gross `amountIn` whose post-fee `cleanIn`
-    ///      (= `amountIn − floor(amountIn · feeWad / WAD)`) satisfies
-    ///      `cleanIn ≥ cleanInRaw`. Closed form: `floor((cleanInRaw − 1)
-    ///      · WAD / (WAD − feeWad)) + 1`.
+    /**
+     * @dev Smallest gross input whose post-fee clean input is at least `cleanInRaw`: the
+     * floor-fee inverse `⌊(cleanInRaw − 1) · WAD / (WAD − feeWad)⌋ + 1`, plus one raw unit when
+     * that gross would carry a zero fee at a positive rate. The caller's separate +1 safety bump
+     * is not included.
+     * @param cleanInRaw Required clean (post-fee) input, raw.
+     * @param feeWad Fee rate, WAD.
+     * @return amountInRaw Gross raw input.
+     */
     function _grossUpExactOut(
         uint256 cleanInRaw,
         uint256 feeWad
     ) internal pure returns (uint256 amountInRaw) {
         uint256 denom = Constants.WAD - feeWad;
         amountInRaw = FixedPointMathLib.mulDiv(cleanInRaw - 1, Constants.WAD, denom) + 1;
+        if (amountInRaw == cleanInRaw && feeWad != 0) ++amountInRaw;
     }
 
-    /// @dev CP-proxy dynamic-fee resolver for exact-in. Predicts the
-    ///      post-swap state distance via
-    ///      `EquilibraSwapMath.predictPostDistanceCp`, then feeds the
-    ///      smoothstep ramp. Rates are WAD fractions (`1 bps == 1e14`).
-    ///      Disabled pools (`_feeRampDistWad == 0`) short-circuit to
-    ///      `baseFeeWad`.
+    /**
+     * @dev CP-proxy dynamic-fee resolver. Lifts the gross input into math space (`divWad` by the
+     * anchor for token0, identity for token1; floor, pool-favourable), predicts the post-swap
+     * state distance with `EquilibraSwapMath.predictPostDistanceCp` on the deposit side and
+     * feeds it to the smoothstep ramp. Returns `baseFeeWad` when the ramp is disabled or the
+     * lift degenerates to zero. Rates are WAD fractions (`1 bps == 1e14`).
+     * @param zeroForOne True when token0 is the input token.
+     * @param amountInRaw Gross raw input.
+     * @param ms Pre-swap math-space snapshot.
+     * @param cs Curve snapshot.
+     * @param baseFeeWad Fee ceiling, WAD.
+     * @return feeWad Resolved fee rate, WAD.
+     */
     function _resolveDynamicFeeWadFromCp(
         bool zeroForOne,
         uint256 amountInRaw,
@@ -1600,21 +1556,14 @@ contract EquilibraPool is
         uint256 amountInWad = _toWadByScale(amountInRaw, inScale);
         if (amountInWad == 0) return baseFeeWad;
 
-        // Lift the input delta into math-space. With asymmetric coords
-        // (`xMath = xWad`, `yMath = yWad · WAD / priceScale`):
-        //   * zeroForOne — token0 (quote) goes onto y-axis →
-        //     `amountInMath = divWad(amountInWad, priceScale)`
-        //   * !zeroForOne — token1 (base) goes onto x-axis identity-lift.
-        // Floor rounding is pool-favourable for the predictor.
+        // Lift the input into math space: token0 lands on the y-axis (`divWad` by the anchor),
+        // token1 on the x-axis (identity). Floor is pool-favourable for the predictor.
         uint256 amountInMath = zeroForOne
             ? FixedPointMathLib.divWad(amountInWad, cs.priceScaleWad)
             : amountInWad;
         if (amountInMath == 0) return baseFeeWad;
 
-        // For zeroForOne the deposit hits yMath; for !zeroForOne it
-        // hits xMath. The math-space CP predictor only cares about
-        // which side gets the deposit, so swap argument order
-        // accordingly.
+        // The predictor takes the deposit side first.
         uint256 distPredictedWad = zeroForOne
             ? EquilibraSwapMath.predictPostDistanceCp(ms.yMath, ms.xMath, amountInMath)
             : EquilibraSwapMath.predictPostDistanceCp(ms.xMath, ms.yMath, amountInMath);
@@ -1632,34 +1581,30 @@ contract EquilibraPool is
 
     // ============ Internal swap math ============
     //
-    // Math-space orientation (asymmetric, one-sided quote normalisation):
-    //   xMath = r1 · t1Scale                               (base side, identity)
-    //   yMath = r0 · t0Scale · WAD / priceScale            (quote → base)
-    //
-    // zeroForOne (token0 in, token1 out):
-    //   deposit on yMath, withdraw from xMath.
-    //   Pass (yMath, xMath, ·) to library — kernel treats first arg
-    //   as input axis.
-    //   amountInMath  = divWad(amountInWad,  priceScale)   (quote → y)
-    //   amountOutWad = outDeltaMath                         (x → base, identity)
-    // !zeroForOne (token1 in, token0 out):
-    //   deposit on xMath, withdraw from yMath.
-    //   Pass (xMath, yMath, ·) to library.
-    //   amountInMath  = amountInWad                         (base → x, identity)
-    //   amountOutWad = mulWad(outDeltaMath, priceScale)     (y → quote)
+    // Math-space orientation (asymmetric, quote-side normalisation):
+    //   xMath = r1 · t1Scale                        (base, identity)
+    //   yMath = r0 · t0Scale · WAD / priceScale     (quote → base units)
+    // The kernel treats its first argument as the input axis.
+    // zeroForOne deposits on yMath and withdraws from xMath: called as (yMath, xMath, ·) with
+    //   amountInMath = divWad(amountInWad, priceScale) and amountOutWad = outDeltaMath.
+    // !zeroForOne deposits on xMath and withdraws from yMath: called as (xMath, yMath, ·) with
+    //   amountInMath = amountInWad and amountOutWad = mulWad(outDeltaMath, priceScale).
 
+    /**
+     * @dev Exact-in kernel call. Lifts the clean input into math space (floor, pool-favourable),
+     * runs `quoteExactInForward` with the pre-solved depth and lifts the output delta back to
+     * WAD of the output token (identity for token1, `mulWad` by the anchor for token0, floor).
+     * Reverts `AmountTooSmallAfterNormalization` when the lifted input is zero; the native
+     * output bound is checked at settlement.
+     * @return amountOutWad Output in WAD of the output token.
+     */
     function _computeExactInSwapMath(
         bool zeroForOne,
         uint256 amountInCleanWad,
         MathState memory ms,
         CurveSnapshot memory cs
-    ) internal pure returns (SwapMathResult memory result) {
-        if (amountInCleanWad == 0) revert Errors.ZeroAmount();
-
-        // Lift the input delta into math-space (floor for input,
-        // pool-favourable).
-        //   zeroForOne   quote-WAD → yMath = divWad(amountInWad, priceScale)
-        //   !zeroForOne  base-WAD  → xMath = amountInWad (identity)
+    ) internal pure returns (uint256 amountOutWad) {
+        // Lift the clean input into math space (floor, pool-favourable).
         uint256 amountInMath = zeroForOne
             ? FixedPointMathLib.divWad(amountInCleanWad, cs.priceScaleWad)
             : amountInCleanWad;
@@ -1667,21 +1612,17 @@ contract EquilibraPool is
 
         uint256 outDeltaMath;
         if (zeroForOne) {
-            // Deposit on yMath; output is xMath delta. `lPreWad` is
-            // direction-independent (kernel symmetric in (x, y)).
+            // Deposit on yMath; the output is the xMath delta.
             (outDeltaMath, ) = EquilibraSwapMath.quoteExactInForward(
                 ms.yMath,
                 ms.xMath,
                 amountInMath,
                 cs.aWad,
                 cs.lambdaWad,
-                ms.lPreWad
+                ms.lPreQ128
             );
-            if (outDeltaMath >= ms.xMath) revert Errors.InsufficientLiquidity();
-            result.finalYMath = ms.yMath + amountInMath;
-            result.finalXMath = ms.xMath - outDeltaMath;
-            // xMath output → token1 base wad: identity (x = base WAD).
-            result.amountOutWad = outDeltaMath;
+            // xMath output is token1 WAD (identity); native bounds are checked at settlement.
+            amountOutWad = outDeltaMath;
         } else {
             // Deposit on xMath; output is yMath delta.
             (outDeltaMath, ) = EquilibraSwapMath.quoteExactInForward(
@@ -1690,107 +1631,111 @@ contract EquilibraPool is
                 amountInMath,
                 cs.aWad,
                 cs.lambdaWad,
-                ms.lPreWad
+                ms.lPreQ128
             );
-            if (outDeltaMath >= ms.yMath) revert Errors.InsufficientLiquidity();
-            result.finalXMath = ms.xMath + amountInMath;
-            result.finalYMath = ms.yMath - outDeltaMath;
-            // yMath output → token0 quote wad: outQuoteWad =
-            // mulWad(outDeltaMath, priceScale) (floor, pool-favourable).
-            result.amountOutWad = FixedPointMathLib.mulWad(outDeltaMath, cs.priceScaleWad);
+            // yMath output to token0 WAD: `mulWad` by the anchor (floor, pool-favourable).
+            amountOutWad = FixedPointMathLib.mulWad(outDeltaMath, cs.priceScaleWad);
         }
     }
 
+    /**
+     * @dev Exact-out kernel call. Lifts the requested output into math space (identity for
+     * token1, `mulDivUp` by the inverse anchor for token0: ceil, pool-favourable), runs
+     * `quoteExactOutForward` with the pre-solved depth (which checks the math-output reserve
+     * bound) and lifts the input delta back to WAD of the input token (`mulDivUp` by the anchor
+     * for token0, identity for token1).
+     * @return amountInCleanWad Clean (pre-fee) input in WAD of the input token.
+     */
     function _computeExactOutSwapMath(
         bool zeroForOne,
         uint256 amountOutWad,
         MathState memory ms,
         CurveSnapshot memory cs
-    ) internal pure returns (SwapMathResult memory result) {
-        if (amountOutWad == 0) revert Errors.ZeroAmount();
-
-        // Lift the output delta into math-space.
-        //   zeroForOne (output = x-side base):
-        //     amountOutMath = amountOutWad (identity, x = base WAD).
-        //   !zeroForOne (output = y-side quote):
-        //     amountOutMath = mulDivUp(amountOutWad, WAD, priceScale)
-        //     (ceil — slightly larger math-output ⇒ input rounds up too,
-        //      pool-favourable for exact-out).
+    ) internal pure returns (uint256 amountInCleanWad) {
+        // Lift the output into math space: token1 identity, token0 `mulDivUp` by the inverse
+        // anchor (ceil, pool-favourable for exact-out).
         uint256 amountOutMath = zeroForOne
             ? amountOutWad
             : FixedPointMathLib.mulDivUp(amountOutWad, Constants.WAD, cs.priceScaleWad);
-        if (amountOutMath == 0) revert Errors.AmountTooSmallAfterNormalization();
 
         uint256 inDeltaMath;
         if (zeroForOne) {
-            // Output is xMath; input goes to yMath. `lPreWad` is
-            // direction-independent (kernel symmetric in (x, y)).
-            if (amountOutMath >= ms.xMath) revert Errors.InsufficientLiquidity();
+            // Output from xMath, input onto yMath; the kernel checks the math-output reserve
+            // bound.
             (inDeltaMath, ) = EquilibraSwapMath.quoteExactOutForward(
                 ms.yMath,
                 ms.xMath,
                 amountOutMath,
                 cs.aWad,
                 cs.lambdaWad,
-                ms.lPreWad
+                ms.lPreQ128
             );
-            result.finalYMath = ms.yMath + inDeltaMath;
-            result.finalXMath = ms.xMath - amountOutMath;
-            // Input lands on yMath; lift to token0 quote wad (ceil):
-            //   amountInCleanWad = mulDivUp(inDeltaMath, priceScale, WAD)
-            result.amountInCleanWad = FixedPointMathLib.mulDivUp(
+            // yMath input to token0 WAD: `mulDivUp` by the anchor (ceil).
+            amountInCleanWad = FixedPointMathLib.mulDivUp(
                 inDeltaMath,
                 cs.priceScaleWad,
                 Constants.WAD
             );
         } else {
-            // Output is yMath; input goes to xMath.
-            if (amountOutMath >= ms.yMath) revert Errors.InsufficientLiquidity();
+            // Output from yMath, input onto xMath; the kernel checks the math-output reserve
+            // bound.
             (inDeltaMath, ) = EquilibraSwapMath.quoteExactOutForward(
                 ms.xMath,
                 ms.yMath,
                 amountOutMath,
                 cs.aWad,
                 cs.lambdaWad,
-                ms.lPreWad
+                ms.lPreQ128
             );
-            result.finalXMath = ms.xMath + inDeltaMath;
-            result.finalYMath = ms.yMath - amountOutMath;
-            // Input lands on xMath; identity lift to token1 base wad
-            // (x = base WAD, no rounding needed).
-            result.amountInCleanWad = inDeltaMath;
+            // xMath input is token1 WAD (identity).
+            amountInCleanWad = inDeltaMath;
         }
-        result.amountOutWad = amountOutWad;
     }
 
     // ============ Utility ============
 
+    /**
+     * @dev Unpacks the clean reserves, raw units.
+     */
     function _getReservesInternal() internal view returns (uint256 reserve0, uint256 reserve1) {
         return _unpackPair128(_reservesPacked);
     }
 
+    /**
+     * @dev Packs and stores the clean reserves; reverts `MathInvariantViolation` above `uint128`.
+     */
     function _setReservesInternal(uint256 reserve0, uint256 reserve1) internal {
         _reservesPacked = _packPair128(reserve0, reserve1);
     }
 
+    /**
+     * @dev Guard hook: the factory bound at initialisation.
+     */
     function _factoryAddress() internal view override returns (address) {
         return _factory;
     }
 
+    /**
+     * @dev Unpacks the protocol-fee buckets, raw units.
+     */
     function _getProtocolFeesInternal() internal view returns (uint256 fee0, uint256 fee1) {
         return _unpackPair128(_protocolFeesPacked);
     }
 
+    /**
+     * @dev Adds a swap's protocol cut to the fee buckets; no-op when both amounts are zero.
+     */
     function _accrueProtocolFees(uint256 add0, uint256 add1) internal {
         if (add0 == 0 && add1 == 0) return;
         (uint256 fee0, uint256 fee1) = _unpackPair128(_protocolFeesPacked);
         _protocolFeesPacked = _packPair128(fee0 + add0, fee1 + add1);
     }
 
-    /// @dev Re-anchor `_lpUnitValueWad` to the live LP unit value of the
-    ///      supplied reserves. Used on proportional mint/burn so the
-    ///      per-share metric stays consistent with the new total supply
-    ///      without polluting the cumulative growth accumulator.
+    /**
+     * @dev Re-anchors `_lpUnitValueWad` to the live unit value of the supplied reserves after a
+     * proportional mint or burn, so later deltas are measured against the new supply without
+     * touching the growth accumulator. A zero (degenerate) value is skipped.
+     */
     function _reanchorLpUnitValue(
         uint256 reserve0,
         uint256 reserve1,
@@ -1801,15 +1746,20 @@ contract EquilibraPool is
         _lpUnitValueWad = vpNow;
     }
 
-    /// @dev Promote any growth in the LP unit value into
-    ///      `_lpValueGrowthWad`. Returns `vpNow` so the caller can pass
-    ///      it straight to `_tryAutoRepeg` as `vpBefore`.
+    /**
+     * @dev Books any rise of the LP unit value above `_lpUnitValueWad` into `_lpValueGrowthWad`
+     * and advances the mark. A non-increase is a no-op, so transient sub-wei rounding on the
+     * way back up is never double-counted.
+     * @param lAfterQ128 Post-swap depth `L`, Q128.
+     * @param priceScaleWad Anchor the depth was solved under, WAD.
+     * @return vpNow Live unit value, WAD, passed on to {_tryAutoRepeg} as `vpBefore`; zero when
+     * undefined.
+     */
     function _accrueLpValueGrowth(
-        uint256 reserve0,
-        uint256 reserve1,
-        CurveSnapshot memory cs
+        uint256 lAfterQ128,
+        uint256 priceScaleWad
     ) internal returns (uint256 vpNow) {
-        vpNow = _computeLpUnitValueWad(reserve0, reserve1, cs, totalSupply());
+        vpNow = EquilibraSwapMath.computeLpUnitValueWad(lAfterQ128, priceScaleWad, totalSupply());
         if (vpNow == 0) return 0;
         uint256 vpLast = _lpUnitValueWad;
         if (vpNow <= vpLast) return vpNow;
@@ -1822,29 +1772,34 @@ contract EquilibraPool is
         }
     }
 
-    /// @dev LP unit value `2·L_eq · √(priceScale · WAD) / totalSupply`
-    ///      evaluated against the supplied reserves and curve snapshot.
-    ///
-    ///      Recovers `L_eq` from current state via the closed-form
-    ///      quadratic (`solveLFromState`). Returns 0 on degenerate
-    ///      states so callers can treat that as "metric undefined".
+    /**
+     * @dev LP unit value `2·L_eq · √(priceScale · WAD) / totalSupply` (WAD) of the supplied
+     * reserves and curve snapshot, with `L_eq` recovered by `solveLFromState`. Returns zero on a
+     * degenerate state, which callers treat as "metric undefined".
+     * @param reserve0 Token0 reserve, raw.
+     * @param reserve1 Token1 reserve, raw.
+     * @param cs Curve snapshot supplying the knobs, anchor and scales.
+     * @param totalSupplyWad LP share supply to divide by.
+     * @return unitValueWad LP unit value, WAD; zero when undefined.
+     */
     function _computeLpUnitValueWad(
         uint256 reserve0,
         uint256 reserve1,
         CurveSnapshot memory cs,
         uint256 totalSupplyWad
     ) internal pure returns (uint256 unitValueWad) {
-        (uint256 xMath, uint256 yMath) = _toMathState(reserve0, reserve1, cs);
-        if (xMath == 0 || yMath == 0) return 0;
-        uint256 lEqWad = EquilibraSwapMath.solveLFromState(xMath, yMath, cs.aWad, cs.lambdaWad);
-        if (lEqWad == 0) return 0;
+        uint256 lEqQ128 = _poolDepth(reserve0, reserve1, cs);
+        if (lEqQ128 == 0) return 0;
         unitValueWad = EquilibraSwapMath.computeLpUnitValueWad(
-            lEqWad,
+            lEqQ128,
             cs.priceScaleWad,
             totalSupplyWad
         );
     }
 
+    /**
+     * @dev Loads the curve knobs, the anchor and both decimal scales (three slots) into memory.
+     */
     function _loadCurveParams() internal view returns (CurveSnapshot memory cs) {
         cs.aWad = uint256(_aWad);
         cs.lambdaWad = uint256(_lambdaWad);
@@ -1853,10 +1808,11 @@ contract EquilibraPool is
         cs.token1Scale = uint256(_token1Scale);
     }
 
-    /// @dev Lift raw reserves into math-space via the asymmetric coord
-    ///      transformation (`xMath = xWad`, `yMath = yWad · WAD /
-    ///      priceScale`). At the anchor `yWad / xWad = priceScale`, so
-    ///      `yMath = xWad = xMath` — diagonal.
+    /**
+     * @dev Lifts raw reserves into math space: `xMath = xWad`, `yMath = divWad(yWad, priceScale)`.
+     * At the anchor `yWad / xWad == priceScale`, so `yMath == xMath` (the diagonal). Returns
+     * `(0, 0)` when either lifted reserve is zero.
+     */
     function _toMathState(
         uint256 reserve0,
         uint256 reserve1,
@@ -1869,18 +1825,23 @@ contract EquilibraPool is
         yMath = FixedPointMathLib.divWad(yWad, cs.priceScaleWad);
     }
 
-    /// @dev Lift the raw pre-state into math-space AND solve its depth
-    ///      `L` — the once-per-swap snapshot every downstream stage
-    ///      reuses (audit O-3).
+    /**
+     * @dev Builds the once-per-swap {MathState}: packed raw reserves, math-space coordinates and
+     * the pre-swap depth `L` (Q128) from `solveLFromState`.
+     */
     function _liftMathState(
         uint256 reserve0,
         uint256 reserve1,
         CurveSnapshot memory cs
     ) internal pure returns (MathState memory ms) {
+        ms.reservesPacked = reserve0 | (reserve1 << 128);
         (ms.xMath, ms.yMath) = _toMathState(reserve0, reserve1, cs);
-        ms.lPreWad = EquilibraSwapMath.solveLFromState(ms.xMath, ms.yMath, cs.aWad, cs.lambdaWad);
+        ms.lPreQ128 = EquilibraSwapMath.solveLFromState(ms.xMath, ms.yMath, cs.aWad, cs.lambdaWad);
     }
 
+    /**
+     * @dev Raw to WAD by the token's power-of-ten scale; exact.
+     */
     function _toWadByScale(
         uint256 amountRaw,
         uint256 scale
@@ -1889,6 +1850,9 @@ contract EquilibraPool is
         amountWad = amountRaw * scale;
     }
 
+    /**
+     * @dev WAD to raw, rounding down (output side, pool-favourable).
+     */
     function _fromWadDownByScale(
         uint256 amountWad,
         uint256 scale
@@ -1897,6 +1861,9 @@ contract EquilibraPool is
         amountRaw = amountWad / scale;
     }
 
+    /**
+     * @dev WAD to raw, rounding up (input side, pool-favourable).
+     */
     function _fromWadUpByScale(
         uint256 amountWad,
         uint256 scale
@@ -1905,6 +1872,10 @@ contract EquilibraPool is
         amountRaw = FixedPointMathLib.mulDivUp(amountWad, 1, scale);
     }
 
+    /**
+     * @dev Splits a raw fee into the protocol cut `⌊fee · protocolFeePercent / 100⌋` and the LP
+     * remainder.
+     */
     function _splitFee(
         uint256 feeAmount
     ) private view returns (uint256 protocolCut, uint256 lpFeeCut) {
@@ -1912,6 +1883,10 @@ contract EquilibraPool is
         lpFeeCut = feeAmount - protocolCut;
     }
 
+    /**
+     * @dev Reverts `MathInvariantViolation` unless each token balance covers its reserve plus
+     * its protocol-fee bucket.
+     */
     function _assertSolvency(address t0, address t1) internal view {
         uint256 balance0 = SafeTransferLib.balanceOf(t0, address(this));
         uint256 balance1 = SafeTransferLib.balanceOf(t1, address(this));
@@ -1922,177 +1897,28 @@ contract EquilibraPool is
         if (balance0 < required0 || balance1 < required1) revert Errors.MathInvariantViolation();
     }
 
-    function _toSignedPositive(uint256 value) internal pure returns (int256 signedValue) {
-        if (value > uint256(type(int256).max)) revert Errors.InvalidAmountSpecified();
-        signedValue = int256(value);
+    /**
+     * @dev Casts to `int256`, reverting `InvalidAmountSpecified` above `int256.max`.
+     */
+    function _toSignedPositive(uint256 value) internal pure returns (int256) {
+        if (int256(value) >= 0) return int256(value);
+        revert Errors.InvalidAmountSpecified();
     }
 
-    function _bisectAmountInForTarget(
-        QuoteBisectCtx memory ctx
-    ) private view returns (uint256 amountIn, uint256 amountOut) {
-        uint256 lo = 0;
-        uint256 hi;
-        SwapMathResult memory bestResult;
-        uint256 bestAmountIn = 0;
-        {
-            // Scoped: keeps the frame within the 16-slot legacy-codegen
-            // stack limit (coverage builds compile without viaIR).
-            uint256 hiCap = ctx.inputReserve - ctx.inputReserve / 100;
-            if (hiCap == 0) return (0, 0);
-
-            hi = ctx.inputReserve / 1024;
-            if (hi == 0) hi = 1;
-            if (hi > hiCap) hi = hiCap;
-
-            bool bracketed = false;
-
-            for (uint256 i; i < 40; ) {
-                SwapMathResult memory r = _evalSwapAtAmountIn(ctx, hi);
-                uint256 pMargAfter = _kernelPMargAfter(r, ctx.cs);
-
-                bool crossed = ctx.zeroForOne
-                    ? pMargAfter >= ctx.pTargetMath
-                    : pMargAfter <= ctx.pTargetMath;
-                if (crossed) {
-                    bracketed = true;
-                    break;
-                }
-
-                bestResult = r;
-                bestAmountIn = hi;
-
-                if (hi >= hiCap) break;
-                lo = hi;
-                unchecked {
-                    hi = hi * 2;
-                    if (hi > hiCap) hi = hiCap;
-                    ++i;
-                }
-            }
-
-            if (!bracketed) {
-                amountIn = bestAmountIn;
-                amountOut = _fromWadDownByScale(bestResult.amountOutWad, ctx.outScale);
-                return (amountIn, amountOut);
-            }
-        }
-
-        uint256 tolerance = ctx.pTargetMath / 1e8;
-        {
-            // Fee-quantization noise floor (audit L-8): rate steps make
-            // the net curve input drop by the protocol slice of the fee
-            // jump as `amountIn` grows, stepping the post-price BACKWARD.
-            // The bound `~pTarget · protocolFeePercent / 1e6` is sized
-            // for the coarsest one-bps rate step — conservative under
-            // the WAD-precision rate, where real jumps are far smaller.
-            // Searching below that amplitude chases noise and can flip
-            // the crossed/not-crossed classification near the target.
-            // No-op when `protocolFeePercent == 0`. (Scoped: 16-slot
-            // legacy-codegen stack limit.)
-            uint256 qNoise = (ctx.pTargetMath * ctx.protocolFeePercent) / 1e6;
-            if (tolerance < qNoise) tolerance = qNoise;
-        }
-        if (tolerance == 0) tolerance = 1;
-
-        for (uint256 j; j < 50; ) {
-            if (hi - lo <= 1) break;
-            uint256 mid;
-            unchecked {
-                mid = (lo + hi) / 2;
-            }
-            SwapMathResult memory r = _evalSwapAtAmountIn(ctx, mid);
-            uint256 pMargAfter = _kernelPMargAfter(r, ctx.cs);
-
-            bool crossed = ctx.zeroForOne
-                ? pMargAfter >= ctx.pTargetMath
-                : pMargAfter <= ctx.pTargetMath;
-            if (crossed) {
-                hi = mid;
-            } else {
-                lo = mid;
-                bestResult = r;
-                bestAmountIn = mid;
-                // Tolerance exit ONLY from the not-crossed side (audit
-                // L-7): the just-recorded `mid` is itself the returned
-                // answer, so the caller always receives an amount whose
-                // evaluated post-price did NOT cross the target — the
-                // one-sided guarantee. A crossed-in-tolerance mid keeps
-                // narrowing instead of discarding the answer it just
-                // computed (the old code broke out of the loop there,
-                // returning a stale far undershoot or even (0,0) for a
-                // perfectly reachable target).
-                uint256 diff = pMargAfter > ctx.pTargetMath
-                    ? pMargAfter - ctx.pTargetMath
-                    : ctx.pTargetMath - pMargAfter;
-                if (diff <= tolerance) break;
-            }
-
-            unchecked {
-                ++j;
-            }
-        }
-
-        amountIn = bestAmountIn;
-        amountOut = _fromWadDownByScale(bestResult.amountOutWad, ctx.outScale);
-    }
-
-    function _evalSwapAtAmountIn(
-        QuoteBisectCtx memory ctx,
-        uint256 amountInRaw
-    ) private view returns (SwapMathResult memory result) {
-        uint256 feeAmount;
-        // The pre-state snapshot (`ctx.ms`) is constant across ALL
-        // bracket/bisection probes — one lift + one L-solve serves the
-        // whole search (audit O-3).
-        (result, feeAmount, ) = _executeExactInWithDynamicFee(
-            ctx.zeroForOne,
-            amountInRaw,
-            ctx.ms,
-            ctx.cs
-        );
-
-        if (feeAmount == 0) return result;
-
-        uint256 lpFeeCut = feeAmount;
-        if (ctx.protocolFeePercent != 0) {
-            unchecked {
-                uint256 protocolCut = (feeAmount * ctx.protocolFeePercent) / 100;
-                lpFeeCut = feeAmount - protocolCut;
-            }
-        }
-        if (lpFeeCut == 0) return result;
-
-        uint256 lpFeeWad = _toWadByScale(lpFeeCut, ctx.inScale);
-        // Fold the LP-fee residue into the kernel post-state in
-        // math-space (mirrors `_toMathState` lift of the input side):
-        //   zfo  — input is quote-WAD → yMath = divWad(lpFee, priceScale)
-        //   !zfo — input is base-WAD  → xMath = lpFee (identity)
-        if (ctx.zeroForOne) {
-            result.finalYMath += FixedPointMathLib.divWad(lpFeeWad, ctx.cs.priceScaleWad);
-        } else {
-            result.finalXMath += lpFeeWad;
-        }
-    }
-
+    /**
+     * @dev Packs two raw amounts (low = token0, high = token1); reverts `MathInvariantViolation`
+     * above `uint128`.
+     */
     function _packPair128(uint256 low, uint256 high) private pure returns (uint256 packed) {
         if (low > _LOWER_128_MASK || high > _LOWER_128_MASK) revert Errors.MathInvariantViolation();
         packed = low | (high << 128);
     }
 
+    /**
+     * @dev Unpacks a 128/128 pair (low = token0, high = token1).
+     */
     function _unpackPair128(uint256 packed) private pure returns (uint256 low, uint256 high) {
         low = packed & _LOWER_128_MASK;
         high = packed >> 128;
-    }
-
-    function _kernelPMargAfter(
-        SwapMathResult memory r,
-        CurveSnapshot memory cs
-    ) private pure returns (uint256 pMargMath) {
-        pMargMath = EquilibraSwapMath.marginalPriceFromState(
-            r.finalXMath,
-            r.finalYMath,
-            cs.aWad,
-            cs.lambdaWad
-        );
     }
 }

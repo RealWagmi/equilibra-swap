@@ -105,14 +105,50 @@
    *  decimal-string WAD values for `aWad` and `lambdaWad`. */
   const WAD = 10n ** 18n;
 
-  /** Slider domain × WAD precision: pick the number of decimals high
-   *  enough that the 3-decimal slider (`step=0.001`) survives the
-   *  Display → WAD conversion without losing the last digit. */
+  // Never round a knob through Number before constructing the API value.
+  // A range input uses doubles internally, so its top position is mapped
+  // explicitly to the exact, exclusive-one production endpoint.
   function toWadString(value) {
-    // value is a decimal-display unit like 0.842; convert to WAD
-    // (1e18) integer via bigint to dodge float drift.
-    const scaled = Math.round(value * 1e15); // ppt resolution
-    return (BigInt(scaled) * 10n ** 3n).toString();
+    const text = String(value).trim();
+    if (!/^\d+(?:\.\d{1,18})?$/.test(text)) {
+      throw new Error("invalid knob: expected at most 18 decimal places");
+    }
+    const [whole, fraction = ""] = text.split(".");
+    return (BigInt(whole) * WAD + BigInt(fraction.padEnd(18, "0"))).toString();
+  }
+
+  // Range elements normalize through double precision. Preserve a preset's
+  // exact decimal value until the user actually moves that knob.
+  const exactKnobValues = new WeakMap();
+
+  function setWadKnob(input, decimal) {
+    const wad = toWadString(decimal);
+    input.value = String(decimal);
+    exactKnobValues.set(input, { value: input.value, wad });
+  }
+
+  function onKnobInput(input) {
+    exactKnobValues.delete(input);
+    scheduleFetch();
+  }
+
+  function applyPreset(preset) {
+    setWadKnob(aInput, preset.a);
+    setWadKnob(lambdaInput, preset.lambda);
+    scheduleFetch();
+  }
+
+  function readWadKnob(input, min, max) {
+    const exact = exactKnobValues.get(input);
+    if (exact && exact.value === input.value) {
+      const wad = BigInt(exact.wad);
+      return (wad < min ? min : wad > max ? max : wad).toString();
+    }
+    const value = Number(input.value);
+    if (!Number.isFinite(value) || value <= Number(min) / Number(WAD)) return min.toString();
+    if (value >= Number(input.max)) return max.toString();
+    const wad = BigInt(toWadString(input.value));
+    return (wad < min ? min : wad > max ? max : wad).toString();
   }
 
   /** Parameters for the request's mandatory YieldBasis reference-AMM
@@ -178,15 +214,18 @@
   }
 
   function readParams() {
-    const a = clamp(Number.parseFloat(aInput.value) || 0, 0.1, 0.99);
-    const lambda = clamp(Number.parseFloat(lambdaInput.value) || 0, 0.001, 1);
+    const aWad = readWadKnob(aInput, WAD / 10n, WAD - 1n);
+    const lambdaWad = readWadKnob(lambdaInput, WAD / 1_000_000n, WAD);
+    // Numbers are only for the illustrative canvas, never the API payload.
+    const a = Math.min(Number(aWad) / Number(WAD), 1 - Number.EPSILON / 2);
+    const lambda = Number(lambdaWad) / Number(WAD);
     const market = clamp(Number.parseFloat(marketInput.value) || 1, 0.1, 10);
-    return { a, lambda, market };
+    return { a, lambda, market, aWad, lambdaWad };
   }
 
   function syncOutputs(p) {
-    aOut.textContent = p.a.toFixed(2);
-    lambdaOut.textContent = p.lambda.toFixed(3);
+    aOut.textContent = wadStringToDisplay(p.aWad, "aWad");
+    lambdaOut.textContent = wadStringToDisplay(p.lambdaWad, "lambdaWad");
     marketOut.textContent = p.market.toFixed(2) + "×";
   }
 
@@ -239,16 +278,15 @@
     }
   }
 
-  /** Strict decimal-string WAD → display number (e.g.
-   *  "843000000000000000" → 0.843). The BigInt path keeps the parse
-   *  exact down to 1e-6 display resolution — far finer than the
-   *  3-decimal sliders need. */
+  /** Exact decimal-string WAD → display string, including WAD − 1. */
   function wadStringToDisplay(value, fieldName) {
     const text = String(value ?? "").trim();
     if (!/^[0-9]+$/.test(text)) {
       throw new Error(`invalid ${fieldName}: expected uint decimal string`);
     }
-    return Number(BigInt(text) / (WAD / 1_000_000n)) / 1e6;
+    const wad = BigInt(text);
+    const fraction = (wad % WAD).toString().padStart(18, "0").replace(/0+$/, "");
+    return (wad / WAD).toString() + (fraction ? "." + fraction : "");
   }
 
   /**
@@ -333,7 +371,7 @@
    * ascending `d` ∈ [0, 1). One-sided — the chart mirrors it across
    * `d = 0` before plotting.
    */
-  async function fetchBellSeries(a, lambda) {
+  async function fetchBellSeries(aWad, lambdaWad) {
     if (!referenceAmmParams) {
       throw new Error(
         "default config not loaded — reference-AMM parameters unavailable"
@@ -344,8 +382,8 @@
       samples: VIZ_SAMPLES,
       maxDepletionBps: VIZ_MAX_DEPLETION_BPS,
       equilibra: {
-        aWad: toWadString(a),
-        lambdaWad: toWadString(lambda),
+        aWad,
+        lambdaWad,
       },
       curve: referenceAmmParams, // internal API field name
     };
@@ -369,10 +407,10 @@
     return series
       .map((pt) => ({
         d: Number(pt.d),
-        liquidity: Math.max(0, Number(pt.liquidity) || 0),
-        penalty: Number.isFinite(Number(pt?.penalty))
+        liquidity: pt?.penalty == null ? NaN : Math.max(0, Number(pt.liquidity) || 0),
+        penalty: pt?.penalty != null && Number.isFinite(Number(pt.penalty))
           ? Math.max(0, Number(pt.penalty))
-          : 0,
+          : null,
       }))
       .filter((p) => Number.isFinite(p.d) && p.d >= 0);
   }
@@ -396,6 +434,7 @@
     }
     const s0 = series[lo];
     const s1 = series[hi];
+    if (!Number.isFinite(s0.liquidity) || !Number.isFinite(s1.liquidity)) return NaN;
     const t = (dAbs - s0.d) / Math.max(1e-18, s1.d - s0.d);
     return s0.liquidity + t * (s1.liquidity - s0.liquidity);
   }
@@ -539,7 +578,16 @@
     let started = false;
     let lastPx = x0;
     points.forEach(([x, y]) => {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        if (started) {
+          ctx.lineTo(lastPx, y1);
+          ctx.closePath();
+          ctx.fill();
+          ctx.beginPath();
+          started = false;
+        }
+        return;
+      }
       const px =
         x0 + ((x - opts.xMin) / (opts.xMax - opts.xMin)) * (x1 - x0);
       const py =
@@ -585,7 +633,7 @@
       const labelX = Math.min(x1 - w - 4, Math.max(x0 + 4, px - w / 2));
       ctx.fillText(opts.label, labelX, y0 + (opts.labelOffset || 14));
     }
-    if (opts.dotAtY !== undefined) {
+    if (Number.isFinite(opts.dotAtY)) {
       const py =
         y1 -
         ((opts.dotAtY - opts.yMin) / (opts.yMax - opts.yMin)) * (y1 - y0);
@@ -658,7 +706,7 @@
     const series = cachedSeries;
 
     // Peak is at d=0 (the anchor) by construction; auto-scale Y.
-    const peakDensity = series && series.length > 0 ? series[0].liquidity : 0;
+    const peakDensity = series && Number.isFinite(series[0]?.liquidity) ? series[0].liquidity : 0;
     const yMax = niceCeiling(peakDensity);
 
     const yLabelFmt = (v) =>
@@ -799,15 +847,15 @@
   // slider drags only re-draw the existing cache (no new fetch).
   // ---------------------------------------------------------------------
 
-  function syncSnapKnobs(a, lambda) {
-    if (snapAWad) snapAWad.textContent = a.toFixed(3);
-    if (snapLambdaWad) snapLambdaWad.textContent = lambda.toFixed(4);
+  function syncSnapKnobs(aWad, lambdaWad) {
+    if (snapAWad) snapAWad.textContent = wadStringToDisplay(aWad, "aWad");
+    if (snapLambdaWad) snapLambdaWad.textContent = wadStringToDisplay(lambdaWad, "lambdaWad");
   }
 
   function refreshDraw() {
     const p = readParams();
     syncOutputs(p);
-    syncSnapKnobs(p.a, p.lambda);
+    syncSnapKnobs(p.aWad, p.lambdaWad);
     draw(p);
   }
 
@@ -815,7 +863,7 @@
   function scheduleFetch() {
     const p = readParams();
     syncOutputs(p);
-    syncSnapKnobs(p.a, p.lambda);
+    syncSnapKnobs(p.aWad, p.lambdaWad);
     refreshDraw(); // immediate re-render with stale cache so the
                    // market/anchor markers track the slider crisply
 
@@ -825,7 +873,7 @@
     // a visible unavailable state if it never does).
     if (!referenceAmmParams) return;
 
-    const key = `${p.a}|${p.lambda}`;
+    const key = `${p.aWad}|${p.lambdaWad}`;
     if (key === lastRequestKey) return;
     lastRequestKey = key;
 
@@ -834,7 +882,7 @@
       const myToken = {};
       pendingFetch = myToken;
       try {
-        const series = await fetchBellSeries(p.a, p.lambda);
+        const series = await fetchBellSeries(p.aWad, p.lambdaWad);
         if (pendingFetch !== myToken) return; // superseded
         cachedSeries = series;
         clearChartStatus();
@@ -860,7 +908,7 @@
   }
 
   [aInput, lambdaInput].forEach((el) => {
-    if (el) el.addEventListener("input", scheduleFetch);
+    if (el) el.addEventListener("input", () => onKnobInput(el));
   });
   if (marketInput) {
     marketInput.addEventListener("input", refreshDraw);
@@ -871,9 +919,7 @@
       const key = btn.getAttribute("data-preset");
       const preset = PRESETS[key];
       if (!preset) return;
-      aInput.value = String(preset.a);
-      lambdaInput.value = String(preset.lambda);
-      scheduleFetch();
+      applyPreset(preset);
     });
   });
 

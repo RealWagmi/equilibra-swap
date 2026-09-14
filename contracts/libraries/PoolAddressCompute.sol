@@ -3,19 +3,30 @@ pragma solidity ^0.8.20;
 
 import { LibClone } from "solady/src/utils/LibClone.sol";
 
-/// @title PoolAddressCompute
-/// @notice Derives deterministic pool addresses from factory parameters.
-///         Used by the router to verify callback senders without trusting encoded data.
-///         Delegates to Solady's battle-tested LibClone for init code hashing
-///         and CREATE2 address prediction.
+/**
+ * @title PoolAddressCompute
+ * @notice Deterministic pool-address derivation from factory parameters, used by the router to
+ * verify callback senders without trusting encoded data.
+ * @dev Delegates init-code hashing and CREATE2 prediction to Solady's `LibClone`.
+ */
 library PoolAddressCompute {
-    /// @dev Returns the init code hash for a minimal proxy clone of `implementation`.
+    /**
+     * @dev Init code hash of a minimal proxy clone of `implementation`.
+     */
     function initCodeHash(address implementation) internal pure returns (bytes32) {
         return LibClone.initCodeHash(implementation);
     }
 
-    /// @notice Compute pool address from pre-sorted tokens and cached init code hash.
-    ///         Tokens MUST already be sorted (token0 < token1).
+    /**
+     * @dev Predict the clone address of a pair and pair-local index. Tokens must already be
+     * sorted (`token0 < token1`).
+     * @param factory Deployer of the clone.
+     * @param cachedInitCodeHash Init code hash of the pool implementation clone.
+     * @param token0 Lower token address.
+     * @param token1 Higher token address.
+     * @param pairPoolIndex Pair-local pool index.
+     * @return The predicted pool address.
+     */
     function computeAddress(
         address factory,
         bytes32 cachedInitCodeHash,

@@ -172,10 +172,8 @@ async fn api_config_limits() -> Json<Value> {
             "aWad": { "min": A_MIN_WAD.to_string(), "max": A_MAX_WAD.to_string() },
             "lambdaWad": { "min": LAMBDA_MIN_WAD.to_string(), "max": LAMBDA_MAX_WAD.to_string() },
             "repegStepWad": { "min": REPEG_STEP_MIN_WAD.to_string(), "max": REPEG_STEP_MAX_WAD.to_string() },
-            // Shared absolute range for both direction dead-bands; the
-            // per-side stall guard vs the fee scale stays in
-            // `validate_run_config` (it needs the preset's fee fields).
-            "repegThresholdWad": { "min": REPEG_STEP_MIN_WAD.to_string(), "max": REPEG_STEP_MAX_WAD.to_string() },
+            // Shared absolute range for both fee-independent dead-bands.
+            "repegThresholdWad": { "min": REPEG_STEP_MIN_WAD.to_string(), "max": (REPEG_STEP_MAX_WAD - 1).to_string() },
             "maxWorkers": { "min": MIN_MAX_WORKERS, "max": MAX_MAX_WORKERS },
             "progressIntervalSec": { "min": MIN_PROGRESS_INTERVAL_SEC, "max": MAX_PROGRESS_INTERVAL_SEC },
         }

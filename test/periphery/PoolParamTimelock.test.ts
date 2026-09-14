@@ -1,6 +1,12 @@
 import { expect } from "chai";
 import hre from "hardhat";
-import { loadFixture, time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+import {
+  impersonateAccount,
+  loadFixture,
+  setBalance,
+  stopImpersonatingAccount,
+  time,
+} from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { anyValue } from "@nomicfoundation/hardhat-chai-matchers/withArgs";
 import { MaxUint256, Signer } from "ethers";
 
@@ -25,7 +31,10 @@ const POOL_CONFIG = {
   repegShareBps: 5000,
 };
 
-async function deployTimelockFixture() {
+async function deployTimelockFixture(
+  repegShareBps = POOL_CONFIG.repegShareBps,
+  overrides: Partial<typeof POOL_CONFIG> = {}
+) {
   const [owner, creator, stranger] = await hre.ethers.getSigners();
 
   const Token = await hre.ethers.getContractFactory("MockERC20");
@@ -42,8 +51,9 @@ async function deployTimelockFixture() {
   const factory: any = await Factory.deploy(
     await poolImpl.getAddress(),
     await owner.getAddress(),
-    await owner.getAddress()
-  , 0);
+    await owner.getAddress(),
+    0
+  );
   await factory.waitForDeployment();
   // Non-zero protocol fee so the repeg-share prescale round-trip and
   // the budget cap are exercised with a live gross-up.
@@ -83,7 +93,14 @@ async function deployTimelockFixture() {
 
   await factory
     .connect(creator)
-    .createPoolAndAddLiquidity(token0, token1, POOL_CONFIG, amount0, amount1, await creator.getAddress());
+    .createPoolAndAddLiquidity(
+      token0,
+      token1,
+      { ...POOL_CONFIG, ...overrides, repegShareBps },
+      amount0,
+      amount1,
+      await creator.getAddress()
+    );
   const poolAddr = await factory.allPools(0);
   const pool: any = await hre.ethers.getContractAt("EquilibraPool", poolAddr);
 
@@ -109,6 +126,28 @@ async function deployTimelockFixture() {
 }
 
 describe("EquilibraParamTimelock", function () {
+  for (const increaseStep of [true, false]) {
+    it(`repairs a factory-created band above the step by ${increaseStep ? "raising the step" : "lowering the bands"}`, async () => {
+      const step = POOL_CONFIG.repegStepWad;
+      const band = step * 2n;
+      const fx = await deployTimelockFixture(5000, {
+        repegThresholdToken1UpWad: band,
+        repegThresholdToken1DownWad: band,
+      });
+      const before = await fx.pool.getFeeConfig();
+      expect(before.repegThresholdToken1UpWad).to.be.gt(before.repegStepWad);
+      if (increaseStep) await fx.timelock.connect(fx.creator).queueRepegStep(fx.poolAddr, band);
+      else await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, step, step);
+      expect(await fx.pool.getFeeConfig()).to.deep.equal(before);
+      await time.increase(DAY + 1);
+      if (increaseStep) await fx.timelock.connect(fx.creator).executeRepegStep(fx.poolAddr);
+      else await fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr);
+      const after = await fx.pool.getFeeConfig();
+      expect(after.repegThresholdToken1UpWad).to.equal(after.repegStepWad);
+      expect(after.repegThresholdToken1DownWad).to.equal(after.repegStepWad);
+    });
+  }
+
   describe("wiring and access control", function () {
     it("factory deploys the timelock and registers the creator as pool admin", async function () {
       const fx = await loadFixture(deployTimelockFixture);
@@ -330,22 +369,19 @@ describe("EquilibraParamTimelock", function () {
       ).to.be.revertedWithCustomError(fx.timelock, "InvalidFeeFloor");
       await expect(
         fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 100, 1000, 100)
-      ).to.be.revertedWithCustomError(fx.timelock, "FeeRampNoHeadroom");
+      ).to.be.revertedWithCustomError(fx.timelock, "InvalidFeeFloor");
       await expect(fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 0, 0, 0)).to.be.revertedWithCustomError(
         fx.timelock,
         "InvalidFee"
       );
-      // MIN_BASE_FEE boundary: 4 fails the range gate; 5 passes it and
-      // proceeds to the stall guard (this pool's 3e15 dead-bands exceed
-      // the 5-bps flat-fee cap 5e14 — a later, distinct check).
-      await expect(fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 4, 0, 0)).to.be.revertedWithCustomError(
-        fx.timelock,
-        "InvalidFee"
-      );
-      await expect(fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 5, 0, 0)).to.be.revertedWithCustomError(
-        fx.timelock,
-        "RepegThresholdExceedsFeeScale"
-      );
+      await expect(
+        fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 1, 9_500, 0)
+      ).to.be.revertedWithCustomError(fx.timelock, "InvalidFeeFloor");
+      await expect(
+        fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 1, 9_500, 1)
+      ).to.be.revertedWithCustomError(fx.timelock, "InvalidFeeFloor");
+      // MIN_BASE_FEE boundary remains independent of the repeg bands.
+      await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 1, 0, 2);
     });
 
     it("rejects a live ramp below the monotonicity guard at queue time", async function () {
@@ -358,28 +394,25 @@ describe("EquilibraParamTimelock", function () {
       await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 120, 8, 40);
     });
 
-    it("stall guard: fee scale cannot fall below the stored threshold", async function () {
-      const fx = await loadFixture(deployTimelockFixture);
-      // Threshold is 3e15; a ramped floor of 20 bps caps the dead-band
-      // at 2e15 — the change would strand the repeg, so it is refused.
-      await expect(
-        fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 100, 1000, 20)
-      ).to.be.revertedWithCustomError(fx.timelock, "RepegThresholdExceedsFeeScale");
-      // Flat-fee variant: feeScale = baseFee = 25 bps -> 2.5e15 < 3e15.
-      await expect(fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 25, 0, 0)).to.be.revertedWithCustomError(
-        fx.timelock,
-        "RepegThresholdExceedsFeeScale"
-      );
-      // Flat 100 bps keeps the guard satisfied (1e16 >= 3e15).
-      await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 100, 0, 0);
-    });
+    for (const [ramp, floor] of [
+      [9500, 1],
+      [0, 0],
+    ]) {
+      it("can lower fees below both stored bands (ramp=" + ramp + ", floor=" + floor + ")", async function () {
+        const fx = await loadFixture(deployTimelockFixture);
+        await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 5, ramp, floor);
+        await time.increase(DAY + 1);
+        await fx.timelock.connect(fx.creator).executeFeeParams(fx.poolAddr);
+        const cfg = await fx.pool.getFeeConfig();
+        expect(cfg.baseFee).to.equal(5);
+        expect(cfg.feeFloorBps).to.equal(floor);
+        expect(cfg.repegThresholdToken1UpWad).to.equal(POOL_CONFIG.repegThresholdToken1UpWad);
+        expect(cfg.repegThresholdToken1DownWad).to.equal(POOL_CONFIG.repegThresholdToken1DownWad);
+      });
+    }
 
-    it("timelock re-validates at execution against the live config", async function () {
+    it("timelock applies the validated fee tuple at execution", async function () {
       const fx = await loadFixture(deployTimelockFixture);
-      // The pool's setters are bare stores; the timelock validates the
-      // queued payload once more at execution time (exercised via the
-      // happy path — the cross-parameter interplay with the runtime
-      // thresholds is pinned in the "repeg thresholds" suite below).
       await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 200, 0, 0);
       await time.increase(DAY + 1);
       await fx.timelock.connect(fx.creator).executeFeeParams(fx.poolAddr);
@@ -403,41 +436,119 @@ describe("EquilibraParamTimelock", function () {
       expect(cfg.repegThresholdToken1DownWad).to.equal(2n * 10n ** 15n);
     });
 
-    it("rejects out-of-range and stall-guard-violating bands at queue time", async function () {
+    it("rejects out-of-range bands and bands above the live step on either side", async function () {
       const fx = await loadFixture(deployTimelockFixture);
-      // Range: both sides share the [1, WAD] band.
-      await expect(
-        fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 0n, 3n * 10n ** 15n)
-      ).to.be.revertedWithCustomError(fx.timelock, "InvalidRepegThreshold");
-      await expect(
-        fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 3n * 10n ** 15n, 0n)
-      ).to.be.revertedWithCustomError(fx.timelock, "InvalidRepegThreshold");
-      // Stall guard vs the LIVE fee scale: ramped floor 60 bps caps the
-      // dead-band at 6e15 — either side above is refused.
-      await expect(
-        fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 6n * 10n ** 15n + 1n, 3n * 10n ** 15n)
-      ).to.be.revertedWithCustomError(fx.timelock, "RepegThresholdExceedsFeeScale");
-      await expect(
-        fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 3n * 10n ** 15n, 6n * 10n ** 15n + 1n)
-      ).to.be.revertedWithCustomError(fx.timelock, "RepegThresholdExceedsFeeScale");
-      // Boundary inclusive.
-      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 6n * 10n ** 15n, 6n * 10n ** 15n);
+      const step = POOL_CONFIG.repegStepWad;
+      for (const [up, down, error] of [
+        [0n, step, "InvalidRepegThreshold"],
+        [step, 0n, "InvalidRepegThreshold"],
+        [WAD, step, "InvalidRepegThreshold"],
+        [step, WAD, "InvalidRepegThreshold"],
+        [WAD + 1n, step, "InvalidRepegThreshold"],
+        [step, WAD + 1n, "InvalidRepegThreshold"],
+        [step + 1n, step, "RepegThresholdExceedsStep"],
+        [step, step + 1n, "RepegThresholdExceedsStep"],
+      ] as const) {
+        await expect(
+          fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, up, down)
+        ).to.be.revertedWithCustomError(fx.timelock, error);
+      }
+      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, step, step);
+      await time.increase(DAY + 1);
+      await fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr);
+      const cfg = await fx.pool.getFeeConfig();
+      expect(cfg.repegThresholdToken1UpWad).to.equal(step);
+      expect(cfg.repegThresholdToken1DownWad).to.equal(step);
     });
 
-    it("re-validates at execution: an interim fee change can strand a queued band", async function () {
-      const fx = await loadFixture(deployTimelockFixture);
-      // Queue bands at the current 6e15 cap, then shrink the fee scale
-      // (flat 40 bps -> cap 4e15) before the bands execute. The stale
-      // queue must fail closed instead of storing a stalling dead-band.
-      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, 6n * 10n ** 15n, 6n * 10n ** 15n);
-      await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 40, 0, 0);
+    it("keeps the step ceiling at WAD but requires both bands strictly below it", async function () {
+      const fx = await deployTimelockFixture(5000, { repegStepWad: WAD });
+      for (const [up, down] of [
+        [WAD, 1n],
+        [1n, WAD],
+      ] as const) {
+        await expect(
+          fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, up, down)
+        ).to.be.revertedWithCustomError(fx.timelock, "InvalidRepegThreshold");
+      }
+      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, WAD - 1n, WAD - 1n);
       await time.increase(DAY + 1);
-      await fx.timelock.connect(fx.creator).executeFeeParams(fx.poolAddr);
+      await fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr);
+      const cfg = await fx.pool.getFeeConfig();
+      expect(cfg.repegStepWad).to.equal(WAD);
+      expect(cfg.repegThresholdToken1UpWad).to.equal(WAD - 1n);
+      expect(cfg.repegThresholdToken1DownWad).to.equal(WAD - 1n);
+    });
+
+    for (const feesFirst of [false, true]) {
+      it("fee and threshold changes execute independently (fees first: " + feesFirst + ")", async function () {
+        const fx = await loadFixture(deployTimelockFixture);
+        const threshold = 10n ** 15n; // 0.1% = 10 bps, above the 1-bps floor.
+        await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, threshold, threshold);
+        await fx.timelock.connect(fx.creator).queueFeeParams(fx.poolAddr, 5, 9500, 1);
+        await time.increase(DAY + 1);
+        const methods = feesFirst
+          ? ["executeFeeParams", "executeRepegThresholds"]
+          : ["executeRepegThresholds", "executeFeeParams"];
+        for (const method of methods) await fx.timelock.connect(fx.creator)[method](fx.poolAddr);
+        const cfg = await fx.pool.getFeeConfig();
+        expect(cfg.baseFee).to.equal(5);
+        expect(cfg.feeFloorBps).to.equal(1);
+        expect(cfg.repegThresholdToken1UpWad).to.equal(threshold);
+        expect(cfg.repegThresholdToken1DownWad).to.equal(threshold);
+      });
+    }
+
+    it("rechecks queued thresholds after an intervening step decrease", async function () {
+      const fx = await loadFixture(deployTimelockFixture);
+      const threshold = 4n * 10n ** 15n;
+      const step = 35n * 10n ** 14n;
+      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, threshold, threshold);
+      await fx.timelock.connect(fx.creator).queueRepegStep(fx.poolAddr, step);
+      await time.increase(DAY + 1);
+      await fx.timelock.connect(fx.creator).executeRepegStep(fx.poolAddr);
       await expect(fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr)).to.be.revertedWithCustomError(
         fx.timelock,
-        "RepegThresholdExceedsFeeScale"
+        "RepegThresholdExceedsStep"
       );
+      const cfg = await fx.pool.getFeeConfig();
+      expect(cfg.repegStepWad).to.equal(step);
+      expect(cfg.repegThresholdToken1UpWad).to.equal(POOL_CONFIG.repegThresholdToken1UpWad);
     });
+
+    it("rechecks a queued step after an intervening threshold increase", async function () {
+      const fx = await loadFixture(deployTimelockFixture);
+      const threshold = 4n * 10n ** 15n;
+      await fx.timelock.connect(fx.creator).queueRepegStep(fx.poolAddr, 35n * 10n ** 14n);
+      await fx.timelock.connect(fx.creator).queueRepegThresholds(fx.poolAddr, threshold, threshold);
+      await time.increase(DAY + 1);
+      await fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr);
+      await expect(fx.timelock.connect(fx.creator).executeRepegStep(fx.poolAddr)).to.be.revertedWithCustomError(
+        fx.timelock,
+        "RepegThresholdExceedsStep"
+      );
+      expect((await fx.pool.getFeeConfig()).repegStepWad).to.equal(POOL_CONFIG.repegStepWad);
+    });
+
+    for (const upLarger of [false, true]) {
+      it("step updates respect both bands and allow equality (up larger: " + upLarger + ")", async function () {
+        const fx = await loadFixture(deployTimelockFixture);
+        const small = 3n * 10n ** 15n;
+        const large = 4n * 10n ** 15n;
+        await fx.timelock
+          .connect(fx.creator)
+          .queueRepegThresholds(fx.poolAddr, upLarger ? large : small, upLarger ? small : large);
+        await time.increase(DAY + 1);
+        await fx.timelock.connect(fx.creator).executeRepegThresholds(fx.poolAddr);
+        await expect(
+          fx.timelock.connect(fx.creator).queueRepegStep(fx.poolAddr, large - 1n)
+        ).to.be.revertedWithCustomError(fx.timelock, "RepegThresholdExceedsStep");
+        await fx.timelock.connect(fx.creator).queueRepegStep(fx.poolAddr, large);
+        await time.increase(DAY + 1);
+        await fx.timelock.connect(fx.creator).executeRepegStep(fx.poolAddr);
+        expect((await fx.pool.getFeeConfig()).repegStepWad).to.equal(large);
+      });
+    }
 
     it("cancel clears the pending bands; only the admin may queue or cancel", async function () {
       const fx = await loadFixture(deployTimelockFixture);
@@ -621,6 +732,162 @@ describe("EquilibraParamTimelock", function () {
   });
 
   describe("repeg share policy", function () {
+    for (const share of [5000, 7000]) {
+      it(`permits a same-value share update on/above the floor (${share})`, async () => {
+        const fx = await deployTimelockFixture(share);
+        const before = await fx.pool.getLpValueState();
+        await fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, share);
+        await time.increase(DAY + 1);
+        await expect(fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr))
+          .to.emit(fx.pool, "RepegShareUpdated")
+          .withArgs(share, before.genesisWad);
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(share);
+        expect(await fx.pool.getLpValueState()).to.deep.equal(before);
+      });
+    }
+
+    async function lowShareFixture() {
+      return deployTimelockFixture(2000);
+    }
+
+    async function oneBpsShareFixture() {
+      return deployTimelockFixture(1);
+    }
+
+    async function zeroShareFixture() {
+      return deployTimelockFixture(0);
+    }
+
+    it("allows successive 20% -> 30% -> 40% increases after each timelock delay", async function () {
+      const fx = await loadFixture(lowShareFixture);
+      let current = 2000n;
+      expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(current);
+      for (const next of [3000n, 4000n]) {
+        await expect(fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, next))
+          .to.emit(fx.timelock, "RepegShareQueued")
+          .withArgs(fx.poolAddr, next, anyValue);
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(current);
+        await expect(fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr)).to.be.revertedWithCustomError(
+          fx.timelock,
+          "ParamChangeNotReady"
+        );
+        await time.increase(DAY + 1);
+        await expect(fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr))
+          .to.emit(fx.pool, "RepegShareUpdated")
+          .withArgs(next, anyValue);
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(next);
+        expect((await fx.timelock.pendingRepegShare(fx.poolAddr)).eta).to.equal(0n);
+        current = next;
+      }
+    });
+
+    it("rejects 20% -> 20%, 10% and zero without queuing a change", async function () {
+      const fx = await loadFixture(lowShareFixture);
+      for (const next of [2000, 1000, 0]) {
+        await expect(fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, next)).to.be.revertedWithCustomError(
+          fx.timelock,
+          "RepegShareChangeOutOfRange"
+        );
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(2000n);
+        expect((await fx.timelock.pendingRepegShare(fx.poolAddr)).eta).to.equal(0n);
+      }
+    });
+
+    it("accepts the 50% boundary and preserves the floor after reaching it", async function () {
+      const fx = await loadFixture(lowShareFixture);
+      // Both an increase to the floor and a later decrease back to it
+      // remain legal; neither 50% nor 70% may fall below the floor.
+      for (const next of [5000n, 7000n, 5000n]) {
+        await fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, next);
+        await time.increase(DAY + 1);
+        await fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr);
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(next);
+        for (const belowFloor of [4999, 3000]) {
+          await expect(
+            fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, belowFloor)
+          ).to.be.revertedWithCustomError(fx.timelock, "RepegShareChangeOutOfRange");
+        }
+        expect((await fx.timelock.pendingRepegShare(fx.poolAddr)).eta).to.equal(0n);
+      }
+    });
+
+    it("allows one-bps share increments from a nonzero one-bps genesis share", async function () {
+      const fx = await loadFixture(oneBpsShareFixture);
+      expect((await fx.pool.getFeeConfig()).protocolFeePercent).to.equal(10n);
+      expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(1n);
+      for (const next of [2n, 3n]) {
+        await fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, next);
+        await time.increase(DAY + 1);
+        await fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr);
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(next);
+      }
+    });
+
+    it("keeps zero-share opt-out immutable even for a one-bps increase", async function () {
+      const fx = await loadFixture(zeroShareFixture);
+      for (const next of [0, 1, 2000, 5000]) {
+        await expect(fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, next)).to.be.revertedWithCustomError(
+          fx.timelock,
+          "RepegShareImmutable"
+        );
+      }
+      expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(0n);
+      expect((await fx.timelock.pendingRepegShare(fx.poolAddr)).eta).to.equal(0n);
+    });
+
+    it("retains the protocol-adjusted ceiling when raising a sub-floor share", async function () {
+      const fx = await loadFixture(lowShareFixture);
+      expect((await fx.pool.getFeeConfig()).protocolFeePercent).to.equal(10n);
+      // At protocol fee 10%, user 8550 maps to stored 9500 exactly.
+      await expect(fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, 8551)).to.be.revertedWithCustomError(
+        fx.timelock,
+        "RepegShareChangeOutOfRange"
+      );
+      await fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, 8550);
+      await time.increase(DAY + 1);
+      await fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr);
+      expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(8550n);
+    });
+
+    for (const liveShare of [0, 2500, 3000, 4000, 5000, 7000]) {
+      it("revalidates queued 30% against live share " + liveShare + " bps at execution", async function () {
+        const fx = await loadFixture(lowShareFixture);
+        await fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, 3000);
+        const pending = await fx.timelock.pendingRepegShare(fx.poolAddr);
+        expect(pending.repegShareBps).to.equal(3000n);
+
+        // A new queue would overwrite the old one. Change only the live
+        // pool state through its existing timelock-gated setter to exercise
+        // execution-time validation independently of queue-time validation.
+        const timelockAddress = await fx.timelock.getAddress();
+        await setBalance(timelockAddress, WAD);
+        await impersonateAccount(timelockAddress);
+        try {
+          const timelockSigner = await hre.ethers.getSigner(timelockAddress);
+          await fx.pool.connect(timelockSigner).setRepegShareBps(liveShare);
+        } finally {
+          await stopImpersonatingAccount(timelockAddress);
+        }
+        expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(BigInt(liveShare));
+        const lpBefore = await fx.pool.getLpValueState();
+        await time.increase(DAY + 1);
+
+        if (liveShare === 2500) {
+          await fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr);
+          expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(3000n);
+          expect((await fx.timelock.pendingRepegShare(fx.poolAddr)).eta).to.equal(0n);
+        } else {
+          await expect(fx.timelock.connect(fx.creator).executeRepegShare(fx.poolAddr)).to.be.revertedWithCustomError(
+            fx.timelock,
+            liveShare === 0 ? "RepegShareImmutable" : "RepegShareChangeOutOfRange"
+          );
+          expect((await fx.pool.getFeeConfig()).repegShareBps).to.equal(BigInt(liveShare));
+          expect(await fx.pool.getLpValueState()).to.deep.equal(lpBefore);
+          expect(await fx.timelock.pendingRepegShare(fx.poolAddr)).to.deep.equal(pending);
+        }
+      });
+    }
+
     it("enforces the runtime band [5000, 9500]", async function () {
       const fx = await loadFixture(deployTimelockFixture);
       await expect(fx.timelock.connect(fx.creator).queueRepegShare(fx.poolAddr, 4999)).to.be.revertedWithCustomError(

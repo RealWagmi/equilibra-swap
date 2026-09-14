@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title SwapPath
-/// @notice Packed-bytes path encoding for multi-hop swaps.
-///         Format: [token0 (20)][poolIndex (4)][token1 (20)][poolIndex (4)][token2 (20)]...
+/**
+ * @title SwapPath
+ * @notice Packed-bytes path encoding for multi-hop swaps:
+ * `[token0 (20)][poolIndex (4)][token1 (20)][poolIndex (4)][token2 (20)]...`.
+ */
 library SwapPath {
+    /**
+     * @notice The path is shorter than one hop.
+     */
     error PathTooShort();
+    /**
+     * @notice A slice extends past the end of the path.
+     */
     error SliceOutOfBounds();
 
     uint256 private constant ADDR_SIZE = 20;
@@ -14,14 +22,27 @@ library SwapPath {
     uint256 private constant POP_OFFSET = NEXT_OFFSET + ADDR_SIZE; // 44
     uint256 private constant MULTIPLE_POOLS_MIN_LENGTH = POP_OFFSET + NEXT_OFFSET; // 68
 
+    /**
+     * @dev Whether the path encodes two or more hops.
+     */
     function hasMultiplePools(bytes memory path) internal pure returns (bool) {
         return path.length >= MULTIPLE_POOLS_MIN_LENGTH;
     }
 
+    /**
+     * @dev Number of hops in the path. Reverts on a path shorter than one address.
+     */
     function numPools(bytes memory path) internal pure returns (uint256) {
         return (path.length - ADDR_SIZE) / NEXT_OFFSET;
     }
 
+    /**
+     * @dev Decode the first hop.
+     * @param path Encoded path of at least one hop, otherwise reverts `PathTooShort`.
+     * @return tokenA First token of the hop.
+     * @return tokenB Second token of the hop.
+     * @return poolIndex Pair-local pool index of the hop.
+     */
     function decodeFirstPool(
         bytes memory path
     ) internal pure returns (address tokenA, address tokenB, uint32 poolIndex) {
@@ -33,14 +54,24 @@ library SwapPath {
         }
     }
 
+    /**
+     * @dev Return the first hop `[tokenA][poolIndex][tokenB]` as a standalone path.
+     */
     function getFirstPool(bytes memory path) internal pure returns (bytes memory) {
         return _slice(path, 0, POP_OFFSET);
     }
 
+    /**
+     * @dev Drop the first token and pool index so the path starts at the next hop.
+     */
     function skipToken(bytes memory path) internal pure returns (bytes memory) {
         return _slice(path, NEXT_OFFSET, path.length - NEXT_OFFSET);
     }
 
+    /**
+     * @dev Copy `length` bytes of `data` starting at `start`. Reverts `SliceOutOfBounds` when the
+     * range exceeds the data.
+     */
     function _slice(
         bytes memory data,
         uint256 start,

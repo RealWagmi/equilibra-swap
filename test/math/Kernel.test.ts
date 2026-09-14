@@ -1,3 +1,9 @@
+import {
+  assertQuotePrecision,
+  assertExactOutputPrecision,
+  exactInputReference,
+  exactOutputReferenceWithL,
+} from "../helpers/continuousReference";
 // SPDX-License-Identifier: MIT
 //
 // EquilibraSwap math-kernel invariants. Asserts structural properties
@@ -9,19 +15,22 @@ import hre from "hardhat";
 import { expect } from "chai";
 
 const WAD = 10n ** 18n;
+const Q128 = 1n << 128n;
 
 // Production envelope for the new (a, λ) knobs.
 const A_MIN = 1n * 10n ** 17n; // 0.1 · W
-const A_MAX = 9n * 10n ** 17n; // 0.9 · W
-const LAMBDA_MIN = 10n ** 15n;
+const A_MAX = WAD - 1n; // Exact production ceiling; WAD itself is excluded.
+const LAMBDA_MIN = 10n ** 12n;
 const LAMBDA_MAX = 10n ** 18n;
 
 const SAMPLE_AB: Array<{ name: string; a: bigint; lambda: bigint }> = [
   { name: "centre", a: 5n * 10n ** 17n, lambda: 10n ** 16n },
   { name: "deep+wide", a: A_MAX, lambda: LAMBDA_MIN },
+  { name: "deep+narrow", a: A_MAX, lambda: LAMBDA_MAX },
+  { name: "shallow+wide", a: A_MIN, lambda: LAMBDA_MIN },
   { name: "shallow+narrow", a: A_MIN, lambda: LAMBDA_MAX },
-  { name: "WETH preset", a: 5n * 10n ** 17n, lambda: 10n ** 16n },
-  { name: "WBTC preset", a: 7n * 10n ** 17n, lambda: 5n * 10n ** 16n },
+  { name: "reference a=0.5", a: 5n * 10n ** 17n, lambda: 10n ** 16n },
+  { name: "reference a=0.7", a: 7n * 10n ** 17n, lambda: 5n * 10n ** 16n },
 ];
 
 function absBig(x: bigint): bigint {
@@ -37,19 +46,17 @@ async function deployMath() {
 
 describe("EquilibraSwapMath invariant kernel", () => {
   describe("computeK / solveLFromState round-trip", () => {
-    it("at the anchor xMath == yMath ⇒ L_eq == xMath, K == L²", async () => {
+    it("pins anchor L and K, including directed fixed-point rounding at A_MAX", async () => {
       const harness = await deployMath();
       for (const { name, a, lambda } of SAMPLE_AB) {
         const xMath = 10n ** 24n; // 1e24, healthy magnitude
         const yMath = xMath; // anchor
         const lWad = BigInt(await harness.solveLFromState(xMath, yMath, a, lambda));
         const kWad = BigInt(await harness.computeK(xMath, yMath, a, lambda));
-        // L = x at the anchor (exact, no sqrt rounding).
-        expect(lWad, `${name}: L at anchor`).to.equal(xMath);
-        // K = mulWad(L, L) at the anchor; allow ≤ 1 wei from internal
-        // operator ordering inside `_computeKFromL`.
+        const expectedL = (xMath * Q128) / WAD;
         const expectedK = (xMath * xMath) / WAD;
-        expect(absBig(kWad - expectedK), `${name}: K at anchor`).to.be.lte(1n);
+        expect(lWad, `${name}: L at anchor`).to.equal(expectedL);
+        expect(kWad, `${name}: K at anchor`).to.equal(expectedK);
       }
     });
 
@@ -66,7 +73,7 @@ describe("EquilibraSwapMath invariant kernel", () => {
           const l = BigInt(await harness.solveLFromState(x, y, a, lambda));
           const k = BigInt(await harness.computeK(x, y, a, lambda));
           // The W·L² target equals mulWad(L, L) under W = WAD.
-          const target = (l * l) / WAD;
+          const target = (l * l * WAD) / (Q128 * Q128);
           // Allow ≤ 1 ppt (10⁻¹²) relative error (plus a 1 000 wei
           // absolute floor for tiny K). The residual stacks across
           // sqrtWad + mulWad chains in `solveLFromState`, but on the
@@ -153,8 +160,8 @@ describe("EquilibraSwapMath invariant kernel", () => {
     });
   });
 
-  describe("Quote round-trip (frozen-L)", () => {
-    it("exact-in(dx) → dy ; exact-out(dy) → dx' ; |dx − dx'| ≤ small", async () => {
+  describe("Same-state quote inversion (not an executed trading round trip)", () => {
+    it("both quote directions match independent roots plus their explicit margins", async () => {
       const harness = await deployMath();
       const x = 10n ** 24n;
       const y = 10n ** 24n;
@@ -162,14 +169,11 @@ describe("EquilibraSwapMath invariant kernel", () => {
       for (const { name, a, lambda } of SAMPLE_AB) {
         for (const f of dxFractions) {
           const dx = (x * f) / WAD;
-          const [dy] = await harness.quoteExactInForward(x, y, dx, a, lambda);
-          // Mirror solve: starting from (x, y), withdrawing dy from y
-          // should require dx' ≈ dx in.
-          const [dxBack] = await harness.quoteExactOutForward(x, y, BigInt(dy), a, lambda);
-          const diff = absBig(BigInt(dxBack) - dx);
-          // Two secant residuals (≤ 2 wei each) on disjoint solves.
-          // Realistic envelope: ≤ ~10 wei for the dx fractions tested.
-          expect(diff, `${name}: round-trip dx vs dx' (f=${f})`).to.be.lte(16n);
+          const ref = await exactInputReference(harness, x, y, dx, a, lambda);
+          assertQuotePrecision(ref.quotedMath, ref.referenceMath, ref.iterations, 16n, name + ": exact-in");
+          const [dxBack, iterations] = await harness.quoteExactOutForward(x, y, ref.quotedMath, a, lambda);
+          const expectedInput = exactOutputReferenceWithL(x, y, ref.quotedMath, a, lambda, ref.lBefore);
+          assertExactOutputPrecision(BigInt(dxBack), expectedInput, BigInt(iterations), 16n, name + ": exact-out");
         }
       }
     });
@@ -186,17 +190,16 @@ describe("EquilibraSwapMath invariant kernel", () => {
       const Ls = lambdas.map(async (l) => BigInt(await harness.solveLFromState(xAnchor, xAnchor, a, l)));
       const resolvedLs = await Promise.all(Ls);
       expect(resolvedLs[0]).to.equal(resolvedLs[1]);
-      expect(resolvedLs[0]).to.equal(xAnchor);
+      expect(resolvedLs[0]).to.equal((xAnchor * Q128) / WAD);
 
-      // Mirror: at the anchor, L is independent of a too (since A=a,
-      // (W-a)=W-a, both terms vanish to L=x algebraically).
+      // Q128 anchor depth preserves the same identity at A_MAX.
       const lambda = 10n ** 16n;
       const aValues = [A_MIN, A_MAX];
       const Ls2 = await Promise.all(
         aValues.map(async (av) => BigInt(await harness.solveLFromState(xAnchor, xAnchor, av, lambda)))
       );
-      expect(Ls2[0]).to.equal(xAnchor);
-      expect(Ls2[1]).to.equal(xAnchor);
+      expect(Ls2[0]).to.equal((xAnchor * Q128) / WAD);
+      expect(Ls2[1]).to.equal((xAnchor * Q128) / WAD);
     });
   });
 });

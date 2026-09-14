@@ -117,7 +117,7 @@ describe("End-to-end smoke (factory + router + pool)", () => {
     const Factory = fx.factory;
     const badConfig = {
       aWad: preset.aWad,
-      lambdaWad: 0n, // below LAMBDA_MIN_WAD = 1e15
+      lambdaWad: 0n, // below LAMBDA_MIN_WAD = 1e12
       baseFee: 100,
       emaPeriod: 3600,
       repegStepWad: 10n ** 15n,

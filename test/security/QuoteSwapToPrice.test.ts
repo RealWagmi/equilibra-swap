@@ -4,6 +4,7 @@ import hre from "hardhat";
 import { MaxUint256 } from "ethers";
 
 import { EQUILIBRA_PRESETS } from "../../simulator/test_helpers/config";
+import { deployNativeRouterFixture } from "../fixtures/nativeRouter";
 
 const PRESET = EQUILIBRA_PRESETS.WETH;
 
@@ -30,6 +31,7 @@ interface PoolOpts {
   feeFloorBps?: number;
   aWad?: bigint;
   lambdaWad?: bigint;
+  protocolFeePercent?: number;
 }
 
 // Solidity-equivalent of `EquilibraSwapMath.sqrtPriceX96ToMathPriceWad`.
@@ -95,12 +97,13 @@ async function deployQuoterPool(opts: PoolOpts = {}) {
   await poolImpl.waitForDeployment();
 
   const Factory = await hre.ethers.getContractFactory("EquilibraFactory");
-  const factory = await Factory.deploy(await poolImpl.getAddress(), owner.address, owner.address, 0);
+  const factory = await Factory.deploy(
+    await poolImpl.getAddress(),
+    owner.address,
+    owner.address,
+    opts.protocolFeePercent ?? 0
+  );
   await factory.waitForDeployment();
-  // Drop the protocol cut so the post-swap reserves move identically
-  // in raw and net terms — keeps the gas snapshot stable and avoids
-  // an extra accounting wrinkle during quote/swap parity assertions.
-  await factory.setProtocolFee(0);
 
   // Seed liquidity proportional to the value-balanced anchor.
   // `priceTok1PerTok0Wad` here is "how many token1-WAD per 1 token0-WAD",
@@ -141,10 +144,8 @@ async function deployQuoterPool(opts: PoolOpts = {}) {
       // in `getOracleState` — stays comparable to the one the quoter
       // sampled before the swap. This is essential: if the anchor
       // moved between quote and swap, the V3-style invariant would be
-      // checked against a different reference frame. (The freeze idiom
-      // `threshold = WAD` with a live share is rejected by the
-      // factory's stall guard; with `share = 0` the step and both
-      // dead-bands are inert, so any in-range value is fine.)
+      // checked against a different reference frame. A zero share
+      // explicitly disables tracking instead of relying on a large band.
       repegStepWad: WAD,
       repegThresholdToken1UpWad: WAD,
       repegThresholdToken1DownWad: WAD,
@@ -172,7 +173,14 @@ async function deployQuoterPool(opts: PoolOpts = {}) {
   await token0.connect(trader).transfer(swapTraderAddr, minted0 / 2n);
   await token1.connect(trader).transfer(swapTraderAddr, minted1 / 2n);
 
+  const weth = await (await hre.ethers.getContractFactory("MockWETH9")).deploy();
+  const router = await (
+    await hre.ethers.getContractFactory("EquilibraRouter")
+  ).deploy(factoryAddr, await poolImpl.getAddress(), await weth.getAddress());
+
   return {
+    factory,
+    router,
     owner,
     trader,
     token0,
@@ -229,6 +237,25 @@ function absDiff(a: bigint, b: bigint): bigint {
   return a > b ? a - b : b - a;
 }
 
+async function injectProbeFailures(
+  factory: Awaited<ReturnType<typeof deployQuoterPool>>["factory"],
+  poolAddress: string,
+  token0: string,
+  token1: string
+) {
+  const implementation = await (await hre.ethers.getContractFactory("PriceTargetFailurePool")).deploy(poolAddress);
+  const adapterIndex = 7;
+  const adapterAddress = await factory.computePoolAddress(token0, token1, adapterIndex);
+  // Test-only view adapter: real source snapshots and quotes, selected failures.
+  // Its unrelated layout also checks that the router uses typed getters only.
+  await hre.network.provider.send("hardhat_setCode", [
+    adapterAddress,
+    await hre.ethers.provider.getCode(await implementation.getAddress()),
+  ]);
+  const adapter = await hre.ethers.getContractAt("PriceTargetFailurePool", adapterAddress);
+  return { adapter, adapterIndex };
+}
+
 // loadFixture needs a stable named function so hardhat-network-helpers
 // can identify (and snapshot-cache) the fixture across `it` blocks.
 async function symmetricFixture() {
@@ -243,11 +270,291 @@ async function asymmetricFixture() {
   });
 }
 
-describe("EquilibraPool quoteSwapToPrice", () => {
+describe("EquilibraRouter quoteSwapToPrice", () => {
+  for (const zeroForOne of [true, false]) {
+    it(`recovers from a real numeric-domain ceiling without losing executable quotes (${zeroForOne})`, async () => {
+      const smallRaw = 3n * 10n ** 26n;
+      const largeRaw = 3n * 10n ** 38n;
+      const f = await deployNativeRouterFixture({
+        initialSwap: false,
+        protocol: 5,
+        decimals: zeroForOne ? [6, 18] : [18, 6],
+        seedAmountsRaw: zeroForOne ? [smallRaw, largeRaw] : [largeRaw, smallRaw],
+      });
+      const tokenIn = f.tokens[zeroForOne ? 0 : 1].target;
+      const tokenOut = f.tokens[zeroForOne ? 1 : 0].target;
+      const cap = smallRaw - smallRaw / 100n;
+      expect(await f.pool.quoteExactIn(zeroForOne, smallRaw / 2n)).to.be.gt(0n);
+      await expect(f.pool.quoteExactIn(zeroForOne, cap)).to.be.revertedWithCustomError(f.pool, "MathOutOfRange");
+      const target = zeroForOne ? MIN_SQRT_RATIO : MAX_SQRT_RATIO - 1n;
+      const reserves = Array.from(await f.pool.getReserves());
+      const [input, output] = await f.router.quoteSwapToPrice(tokenIn, tokenOut, 0, target);
+      expect(input).to.be.gt(smallRaw / 4n);
+      expect(input).to.be.lt(cap);
+      expect(output).to.equal(await f.pool.quoteExactIn(zeroForOne, input));
+      expect(Array.from(await f.pool.getReserves())).to.deep.equal(reserves);
+      const outToken = f.tokens[zeroForOne ? 1 : 0];
+      const before = await outToken.balanceOf(f.owner.address);
+      await f.router.exactInputSingle({
+        tokenIn,
+        tokenOut,
+        poolIndex: 0,
+        recipient: f.owner.address,
+        amountIn: input,
+        amountOutMinimum: output,
+        deadline: MaxUint256,
+      });
+      expect((await outToken.balanceOf(f.owner.address)) - before).to.equal(output);
+      const after = await f.pool.getOracleState();
+      if (zeroForOne) expect(after.sqrtPriceX96).to.be.gte(target);
+      else expect(after.sqrtPriceX96).to.be.lte(target);
+    });
+  }
+
+  it("keeps the noise tolerance representable at a saturated target during refusal recovery", async () => {
+    const f = await deployNativeRouterFixture({
+      initialSwap: false,
+      isPrivate: true,
+      decimals: [0, 18],
+      seedAmountsRaw: [2000n, 2n * 10n ** 38n],
+      protocol: 25,
+    });
+    const anchor = await f.pool.getPriceScale();
+    expect(anchor).to.equal(10n);
+    expect((WAD * WAD * Q96 * WAD) / anchor).to.be.gt(MaxUint256);
+    expect(MaxUint256 * 25n).to.be.gt(MaxUint256);
+    expect((MaxUint256 * 25n) / 1000000n).to.be.lte(MaxUint256);
+    const { adapter, adapterIndex } = await injectProbeFailures(
+      f.factory,
+      await f.pool.getAddress(),
+      await f.tokens[0].getAddress(),
+      await f.tokens[1].getAddress()
+    );
+    // The refusal is synthetic; the source pool and its extreme price are real.
+    await adapter.setFailure(1000n, MaxUint256, hre.ethers.id("SolverDidNotConverge()").slice(0, 10));
+    const [input, output] = await f.router.quoteSwapToPrice(
+      f.tokens[0].target,
+      f.tokens[1].target,
+      adapterIndex,
+      MIN_SQRT_RATIO
+    );
+    expect(input).to.be.gt(0n);
+    expect(input).to.be.lt(1000n);
+    expect(output).to.equal(await f.pool.quoteExactIn(true, input));
+  });
+
+  for (const zeroForOne of [true, false]) {
+    it(`uses the typed dynamic fee and nonzero protocol cut in the target price (${zeroForOne})`, async () => {
+      const ctx = await deployQuoterPool({ protocolFeePercent: 25 });
+      const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+      const before = await getOracle(ctx.pool);
+      const [r0, r1] = await ctx.pool.getReserves();
+      const fee = await ctx.pool.getFeeConfig();
+      const target = (before.sqrtPriceX96 * (zeroForOne ? 99n : 101n)) / 100n;
+      const pTarget = sqrtPriceX96ToMathPriceWad(target, before.priceScaleWad, ctx.scale0, ctx.scale1);
+      const [input, output] = await ctx.router.quoteSwapToPrice(
+        zeroForOne ? ctx.token0 : ctx.token1,
+        zeroForOne ? ctx.token1 : ctx.token0,
+        0,
+        target
+      );
+      expect(input).to.be.gt(0n);
+      expect(output).to.be.gt(0n);
+      const x = r1 * ctx.scale1;
+      const y = (r0 * ctx.scale0 * WAD) / before.priceScaleWad;
+      const grossMath = zeroForOne ? (input * ctx.scale0 * WAD) / before.priceScaleWad : input * ctx.scale1;
+      const distance = await math.predictPostDistanceCp(zeroForOne ? y : x, zeroForOne ? x : y, grossMath);
+      const rate = await math.smoothstepFeeWad(
+        distance,
+        fee.feeRampBps * 10n ** 14n,
+        fee.feeFloorBps * 10n ** 14n,
+        fee.baseFee * 10n ** 14n
+      );
+      expect(rate).to.be.gt(fee.feeFloorBps * 10n ** 14n);
+      const protocolCut = (((input * rate) / WAD) * fee.protocolFeePercent) / 100n;
+      expect(protocolCut).to.be.gt(0n);
+      expect(await execSwapAndMeasureOut(ctx, zeroForOne, input)).to.equal(output);
+      const afterReserves = Array.from(await ctx.pool.getReserves());
+      expect(afterReserves).to.deep.equal(
+        zeroForOne ? [r0 + input - protocolCut, r1 - output] : [r0 - output, r1 + input - protocolCut]
+      );
+      expect((await ctx.pool.getProtocolFees())[zeroForOne ? 0 : 1]).to.equal(protocolCut);
+      const after = await getOracle(ctx.pool);
+      if (zeroForOne) expect(after.pMargWad).to.be.lt(pTarget);
+      else expect(after.pMargWad).to.be.gt(pTarget);
+      expect(absDiff(after.pMargWad, pTarget)).to.be.lte((pTarget * 25n) / 1000000n + 1n);
+    });
+  }
+
+  describe("bounded recovery of refused probes", () => {
+    async function recoveryFixture() {
+      return deployQuoterPool({ aWad: WAD - 1n, lambdaWad: 10n ** 12n, baseFee: 5, feeRampBps: 0, feeFloorBps: 0 });
+    }
+
+    for (const zeroForOne of [true, false]) {
+      it(`quotes a reachable 1-bps target after the former expanded-probe refusal is resolved: ${zeroForOne}`, async () => {
+        const ctx = await loadFixture(recoveryFixture);
+        await ctx.swapTrader.executeSwap(ctx.poolAddress, ctx.trader.address, zeroForOne, 100_000n * WAD, PAY_EXACT);
+        const [r0, r1] = await ctx.pool.getReserves();
+        const reserveIn = BigInt(zeroForOne ? r0 : r1);
+        const expanded = reserveIn - reserveIn / 100n;
+        const expandedQuote = await ctx.pool.quoteExactIn(zeroForOne, expanded);
+        expect(expandedQuote).to.be.gt(0n);
+        const unchanged = await ctx.pool.getOracleState();
+        const snap = await hre.network.provider.send("evm_snapshot");
+        try {
+          expect(await execSwapAndMeasureOut(ctx, zeroForOne, expanded)).to.equal(expandedQuote);
+        } finally {
+          expect(await hre.network.provider.send("evm_revert", [snap])).to.equal(true);
+        }
+        expect(Array.from(await ctx.pool.getReserves())).to.deep.equal([r0, r1]);
+        expect(await ctx.pool.getOracleState()).to.deep.equal(unchanged);
+        const before = await getOracle(ctx.pool);
+        const target = (before.sqrtPriceX96 * (zeroForOne ? 99_995n : 100_005n)) / 100_000n;
+        const [input, output] = await ctx.router.quoteSwapToPrice(
+          zeroForOne ? ctx.token0 : ctx.token1,
+          zeroForOne ? ctx.token1 : ctx.token0,
+          0,
+          target
+        );
+        expect(input).to.be.gt(0n);
+        expect(output).to.equal(await ctx.pool.quoteExactIn(zeroForOne, input));
+        expect(await execSwapAndMeasureOut(ctx, zeroForOne, input)).to.equal(output);
+        const after = await getOracle(ctx.pool);
+        if (zeroForOne) expect(after.sqrtPriceX96).to.be.gte(target);
+        else expect(after.sqrtPriceX96).to.be.lte(target);
+        expect(absDiff(after.sqrtPriceX96, target)).to.be.lte(target / 1_000_000n);
+      });
+    }
+
+    async function injectedFixture() {
+      const ctx = await deployQuoterPool();
+      return {
+        ...ctx,
+        ...(await injectProbeFailures(
+          ctx.factory,
+          ctx.poolAddress,
+          await ctx.token0.getAddress(),
+          await ctx.token1.getAddress()
+        )),
+      };
+    }
+
+    for (const failure of ["SolverDidNotConverge", "LpValueDecreased", "InsufficientLiquidity", "MathOutOfRange"]) {
+      it(`keeps only checked candidates below repeated ${failure} refusals`, async () => {
+        const ctx = await loadFixture(injectedFixture);
+        const ceiling = 10_000n * WAD;
+        await ctx.adapter.setFailure(ceiling, MaxUint256, hre.ethers.id(`${failure}()`).slice(0, 10));
+        const [input, output] = await ctx.router.quoteSwapToPrice(
+          ctx.token0,
+          ctx.token1,
+          ctx.adapterIndex,
+          MIN_SQRT_RATIO
+        );
+        expect(input).to.be.gt(0n);
+        expect(input).to.be.lt(ceiling);
+        expect(output).to.equal(await ctx.pool.quoteExactIn(true, input));
+      });
+    }
+
+    it("returns zeros after bounded recovery if every positive probe is refused", async () => {
+      const ctx = await loadFixture(injectedFixture);
+      await ctx.adapter.setFailure(1, MaxUint256, hre.ethers.id("SolverDidNotConverge()").slice(0, 10));
+      expect(await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, ctx.adapterIndex, MIN_SQRT_RATIO)).to.deep.equal(
+        [0n, 0n, false]
+      );
+    });
+
+    it("increases a dust probe instead of repeatedly halving it", async () => {
+      const ctx = await loadFixture(injectedFixture);
+      const dustEnd = 2_000n * WAD;
+      await ctx.adapter.setFailure(1, dustEnd, hre.ethers.id("AmountTooSmallAfterNormalization()").slice(0, 10));
+      const [input, output] = await ctx.router.quoteSwapToPrice(
+        ctx.token0,
+        ctx.token1,
+        ctx.adapterIndex,
+        MIN_SQRT_RATIO
+      );
+      expect(input).to.be.gt(dustEnd);
+      expect(output).to.equal(await ctx.pool.quoteExactIn(true, input));
+    });
+
+    it("propagates an unexpected error rather than disguising it as a failed probe", async () => {
+      const ctx = await loadFixture(injectedFixture);
+      await ctx.adapter.setFailure(1, MaxUint256, hre.ethers.id("InvalidPriceScale()").slice(0, 10));
+      await expect(
+        ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, ctx.adapterIndex, MIN_SQRT_RATIO)
+      ).to.be.revertedWithCustomError(ctx.pool, "InvalidPriceScale");
+    });
+  });
+
+  it("exposes the same anchor through the lightweight and full oracle getters", async () => {
+    const ctx = await loadFixture(asymmetricFixture);
+    const expected = (await ctx.pool.getOracleState()).priceScaleWad;
+    expect(expected).not.to.equal(WAD);
+    expect(await ctx.pool.getPriceScale()).to.equal(expected);
+    await execSwapAndMeasureOut(ctx, true, 100n * 10n ** BigInt(ctx.decimals0));
+    expect(await ctx.pool.getPriceScale()).to.equal((await ctx.pool.getOracleState()).priceScaleWad);
+  });
+
+  for (const zeroForOne of [true, false]) {
+    it(`resolves a second pool by pair-local index and token direction (${zeroForOne})`, async () => {
+      const ctx = await loadFixture(asymmetricFixture);
+      const [r0, r1] = await ctx.pool.getReserves();
+      const curve = await ctx.pool.getCurveParams();
+      const fee = await ctx.pool.getFeeConfig();
+      await ctx.factory.createPoolAndAddLiquidity(
+        ctx.token0,
+        ctx.token1,
+        {
+          aWad: curve.aWad,
+          lambdaWad: curve.lambdaWad,
+          baseFee: fee.baseFee + 50n,
+          feeRampBps: fee.feeRampBps,
+          feeFloorBps: fee.feeFloorBps,
+          emaPeriod: fee.emaPeriod,
+          repegStepWad: fee.repegStepWad,
+          repegThresholdToken1UpWad: fee.repegThresholdToken1UpWad,
+          repegThresholdToken1DownWad: fee.repegThresholdToken1DownWad,
+          repegShareBps: 0,
+        },
+        r0,
+        r1,
+        ctx.owner.address
+      );
+      const address = await ctx.factory.getPoolAt(ctx.token0, ctx.token1, 1);
+      const pool = await hre.ethers.getContractAt("EquilibraPool", address);
+      expect((await pool.getPoolMetadata()).pairPoolIndex).to.equal(1n);
+      const before = await pool.getOracleState();
+      const target = (before.sqrtPriceX96 * (zeroForOne ? 99n : 101n)) / 100n;
+      const tokenIn = zeroForOne ? ctx.token0 : ctx.token1;
+      const tokenOut = zeroForOne ? ctx.token1 : ctx.token0;
+      const quote = await ctx.router.quoteSwapToPrice(tokenIn, tokenOut, 1, target);
+      expect(quote[0]).to.be.gt(0n);
+      expect(quote[1]).to.equal(await pool.quoteExactIn(zeroForOne, quote[0]));
+      expect(quote).not.to.deep.equal(await ctx.router.quoteSwapToPrice(tokenIn, tokenOut, 0, target));
+      expect(await execSwapAndMeasureOut({ ...ctx, pool }, zeroForOne, quote[0])).to.equal(quote[1]);
+      const after = await pool.getOracleState();
+      if (zeroForOne) expect(after.sqrtPriceX96).to.be.gte(target);
+      else expect(after.sqrtPriceX96).to.be.lte(target);
+      expect(Array.from(await ctx.pool.getReserves())).to.deep.equal([r0, r1]);
+    });
+  }
+
   describe("input validation / bail-outs", () => {
+    it("rejects identical tokens and a missing pair-local pool", async () => {
+      const ctx = await loadFixture(symmetricFixture);
+      await expect(ctx.router.quoteSwapToPrice(ctx.token0, ctx.token0, 0, Q96)).to.be.revertedWithCustomError(
+        ctx.router,
+        "IdenticalTokens"
+      );
+      await expect(ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 1, Q96)).to.be.reverted;
+      await expect(ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0xffffffff, Q96)).to.be.reverted;
+    });
+
     it("returns (0, 0, false) for a zero V3 sqrt-price target", async () => {
       const ctx = await loadFixture(symmetricFixture);
-      const [amountIn, amountOut, crossesAnchor] = await ctx.pool.quoteSwapToPrice(true, 0n);
+      const [amountIn, amountOut, crossesAnchor] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, 0n);
       expect(amountIn).to.equal(0n);
       expect(amountOut).to.equal(0n);
       expect(crossesAnchor).to.equal(false);
@@ -260,7 +567,12 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       // wrong-direction by V3 convention. The quoter must bail with
       // the all-zero tuple instead of running a phantom swap.
       const wrongSideTarget = oracle.sqrtPriceX96 + oracle.sqrtPriceX96 / 100n;
-      const [amountIn, amountOut, crossesAnchor] = await ctx.pool.quoteSwapToPrice(true, wrongSideTarget);
+      const [amountIn, amountOut, crossesAnchor] = await ctx.router.quoteSwapToPrice(
+        ctx.token0,
+        ctx.token1,
+        0,
+        wrongSideTarget
+      );
       expect(amountIn).to.equal(0n);
       expect(amountOut).to.equal(0n);
       expect(crossesAnchor).to.equal(false);
@@ -271,7 +583,12 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const oracle = await getOracle(ctx.pool);
       // !zeroForOne raises V3 sqrtP — a target BELOW current is wrong.
       const wrongSideTarget = oracle.sqrtPriceX96 - oracle.sqrtPriceX96 / 100n;
-      const [amountIn, amountOut, crossesAnchor] = await ctx.pool.quoteSwapToPrice(false, wrongSideTarget);
+      const [amountIn, amountOut, crossesAnchor] = await ctx.router.quoteSwapToPrice(
+        ctx.token1,
+        ctx.token0,
+        0,
+        wrongSideTarget
+      );
       expect(amountIn).to.equal(0n);
       expect(amountOut).to.equal(0n);
       expect(crossesAnchor).to.equal(false);
@@ -289,7 +606,12 @@ describe("EquilibraPool quoteSwapToPrice", () => {
         [true, MIN_SQRT_RATIO],
         [false, MAX_SQRT_RATIO - 1n],
       ] as const) {
-        const [amountIn, amountOut] = await ctx.pool.quoteSwapToPrice(zeroForOne, target);
+        const [amountIn, amountOut] = await ctx.router.quoteSwapToPrice(
+          zeroForOne ? ctx.token0 : ctx.token1,
+          zeroForOne ? ctx.token1 : ctx.token0,
+          0,
+          target
+        );
         expect(amountIn, `zfo=${zeroForOne} amountIn`).to.be.greaterThan(0n);
         expect(amountOut, `zfo=${zeroForOne} amountOut`).to.be.greaterThan(0n);
         // An unreachable endpoint target is never bracketed, so the
@@ -297,7 +619,12 @@ describe("EquilibraPool quoteSwapToPrice", () => {
         const inputReserve = zeroForOne ? BigInt(r0) : BigInt(r1);
         expect(amountIn, `zfo=${zeroForOne} cap`).to.equal(inputReserve - inputReserve / 100n);
 
-        const [oppIn, oppOut, oppCross] = await ctx.pool.quoteSwapToPrice(!zeroForOne, target);
+        const [oppIn, oppOut, oppCross] = await ctx.router.quoteSwapToPrice(
+          !zeroForOne ? ctx.token0 : ctx.token1,
+          !zeroForOne ? ctx.token1 : ctx.token0,
+          0,
+          target
+        );
         expect(oppIn, `zfo=${!zeroForOne} amountIn`).to.equal(0n);
         expect(oppOut, `zfo=${!zeroForOne} amountOut`).to.equal(0n);
         expect(oppCross, `zfo=${!zeroForOne} crossesAnchor`).to.equal(false);
@@ -306,8 +633,8 @@ describe("EquilibraPool quoteSwapToPrice", () => {
 
     it("treats a sub-representable target the same as the first representable one", async () => {
       const ctx = await loadFixture(symmetricFixture);
-      const [inAtMin, outAtMin] = await ctx.pool.quoteSwapToPrice(true, MIN_SQRT_RATIO);
-      const [inAtFirst, outAtFirst] = await ctx.pool.quoteSwapToPrice(true, 1n << 48n);
+      const [inAtMin, outAtMin] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, MIN_SQRT_RATIO);
+      const [inAtFirst, outAtFirst] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, 1n << 48n);
       expect(inAtMin).to.equal(inAtFirst);
       expect(outAtMin).to.equal(outAtFirst);
     });
@@ -327,7 +654,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const before = await getOracle(ctx.pool);
       // 5% below current sqrt-price — well within reach.
       const sqrtTarget = (before.sqrtPriceX96 * 95n) / 100n;
-      const [amountIn, amountOut] = await ctx.pool.quoteSwapToPrice(true, sqrtTarget);
+      const [amountIn, amountOut] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(amountOut).to.be.gt(0n);
 
@@ -352,7 +679,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const before = await getOracle(ctx.pool);
       // 5% above current — symmetric counterpart of the zfo case.
       const sqrtTarget = (before.sqrtPriceX96 * 105n) / 100n;
-      const [amountIn, amountOut] = await ctx.pool.quoteSwapToPrice(false, sqrtTarget);
+      const [amountIn, amountOut] = await ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(amountOut).to.be.gt(0n);
 
@@ -383,18 +710,18 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       // Offsets in 1e-5 units: 0.01%, 0.05%, 0.2% away from spot.
       for (const off of [10n, 50n, 200n]) {
         const targetZfo = (before.sqrtPriceX96 * (100_000n - off)) / 100_000n;
-        const [inZfo] = await ctx.pool.quoteSwapToPrice(true, targetZfo);
+        const [inZfo] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, targetZfo);
         expect(inZfo, `zfo target -${off}e-5 quoted zero`).to.be.gt(0n);
 
         const targetOfz = (before.sqrtPriceX96 * (100_000n + off)) / 100_000n;
-        const [inOfz] = await ctx.pool.quoteSwapToPrice(false, targetOfz);
+        const [inOfz] = await ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0, targetOfz);
         expect(inOfz, `ofz target +${off}e-5 quoted zero`).to.be.gt(0n);
       }
 
       // One-sided guarantee holds on the CLOSEST target too: execute the
       // quoted amount for -0.01% and verify the limit was not crossed.
       const sqrtTarget = (before.sqrtPriceX96 * 99_990n) / 100_000n;
-      const [amountIn] = await ctx.pool.quoteSwapToPrice(true, sqrtTarget);
+      const [amountIn] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, sqrtTarget);
       const traderAddr = await ctx.trader.getAddress();
       await ctx.swapTrader.executeSwap(await ctx.pool.getAddress(), traderAddr, true, amountIn, PAY_EXACT);
       const after = await getOracle(ctx.pool);
@@ -409,7 +736,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const ctx = await loadFixture(symmetricFixture);
       const before = await getOracle(ctx.pool);
       const sqrtTarget = (before.sqrtPriceX96 * 99n) / 100n;
-      const [amountIn] = await ctx.pool.quoteSwapToPrice(true, sqrtTarget);
+      const [amountIn] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
 
       await ctx.swapTrader.executeSwap(
@@ -437,7 +764,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
 
       const amountsIn: bigint[] = [];
       for (const t of targets) {
-        const [a] = await ctx.pool.quoteSwapToPrice(true, t);
+        const [a] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, t);
         amountsIn.push(a);
       }
       // Each target is strictly further from the start; the implied
@@ -454,7 +781,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
 
       const amountsIn: bigint[] = [];
       for (const t of targets) {
-        const [a] = await ctx.pool.quoteSwapToPrice(false, t);
+        const [a] = await ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0, t);
         amountsIn.push(a);
       }
       expect(amountsIn[0]).to.be.lt(amountsIn[1]);
@@ -481,7 +808,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const pTarget = (WAD * 99n) / 100n; // 0.99 WAD
       const sqrtTarget = mathPriceToSqrtPriceX96(pTarget, after.priceScaleWad, ctx.scale0, ctx.scale1);
       // pMargTarget < pStart so we're in !zeroForOne territory.
-      const [amountIn, , crossesAnchor] = await ctx.pool.quoteSwapToPrice(false, sqrtTarget);
+      const [amountIn, , crossesAnchor] = await ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(crossesAnchor).to.equal(true);
     });
@@ -497,7 +824,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const after = await getOracle(ctx.pool);
       expect(after.pMargWad).to.be.gt(WAD);
       const sqrtTarget = (after.sqrtPriceX96 * 98n) / 100n;
-      const [amountIn, , crossesAnchor] = await ctx.pool.quoteSwapToPrice(true, sqrtTarget);
+      const [amountIn, , crossesAnchor] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(crossesAnchor).to.equal(false);
     });
@@ -513,7 +840,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       // 3% slip — comfortable for an 8/6 pair without smashing the
       // bracket-grow ceiling.
       const sqrtTarget = (before.sqrtPriceX96 * 97n) / 100n;
-      const [amountIn, amountOut] = await ctx.pool.quoteSwapToPrice(true, sqrtTarget);
+      const [amountIn, amountOut] = await ctx.router.quoteSwapToPrice(ctx.token0, ctx.token1, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(amountOut).to.be.gt(0n);
 
@@ -530,7 +857,7 @@ describe("EquilibraPool quoteSwapToPrice", () => {
       const ctx = await loadFixture(asymmetricFixture);
       const before = await getOracle(ctx.pool);
       const sqrtTarget = (before.sqrtPriceX96 * 103n) / 100n;
-      const [amountIn, amountOut] = await ctx.pool.quoteSwapToPrice(false, sqrtTarget);
+      const [amountIn, amountOut] = await ctx.router.quoteSwapToPrice(ctx.token1, ctx.token0, 0, sqrtTarget);
       expect(amountIn).to.be.gt(0n);
       expect(amountOut).to.be.gt(0n);
 

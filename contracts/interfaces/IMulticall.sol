@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title IMulticall
-/// @notice Enables batching multiple calls to the same contract in one tx.
-/// @dev Standard `multicall(bytes[])` shape so integrators can compose
-///      common patterns (swap + sweep, swap + unwrap, etc.) in a single
-///      transaction.
+/**
+ * @title IMulticall
+ * @notice Batches several calls to the same contract in one transaction.
+ */
 interface IMulticall {
-    /// @notice Call multiple functions on this contract and return the
-    ///         result of each one if they all succeed.
-    /// @dev Each element of `data` is executed via DELEGATECALL on
-    ///      `address(this)`, so `msg.sender` AND `msg.value` are
-    ///      preserved: every subcall observes the SAME `msg.value` as
-    ///      the outer batch. The attached ETH is provided once at entry
-    ///      (not re-funded per subcall), yet each subcall still SEES the
-    ///      full value. Callable methods therefore MUST NOT use
-    ///      `msg.value` for per-call accounting — a batch would
-    ///      double-count it across subcalls.
-    /// @param data Encoded function data for each of the inner calls.
-    /// @return results ABI-encoded return values from each inner call.
+    /**
+     * @notice Execute every call in `data` on this contract and return each result; the batch
+     * reverts if any call reverts.
+     * @dev Each element runs via `DELEGATECALL` on `address(this)`, so `msg.sender` and
+     * `msg.value` are preserved and every subcall observes the same `msg.value` as the batch.
+     * The attached ETH is provided once at entry, so callable methods must not use `msg.value`
+     * for per-call accounting.
+     * @param data ABI-encoded calldata of each inner call.
+     * @return results ABI-encoded return data of each inner call.
+     */
     function multicall(bytes[] calldata data) external payable returns (bytes[] memory results);
 }

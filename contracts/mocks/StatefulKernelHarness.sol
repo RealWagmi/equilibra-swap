@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import { EquilibraSwapMath } from "../libraries/EquilibraSwapMath.sol";
 import { FixedPointMathLib } from "solady/src/utils/FixedPointMathLib.sol";
+import { SwapMathDiagnostics } from "./SwapMathDiagnostics.sol";
 
 /// @title StatefulKernelHarness (asymmetric coords)
 /// @notice Minimal swap-only pool stub for exercising the canonical
@@ -88,7 +89,8 @@ contract StatefulKernelHarness {
             yMath,
             amountInMath,
             aWad,
-            lambdaWad
+            lambdaWad,
+            EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad)
         );
 
         // Lower math output into trader's token:
@@ -124,7 +126,8 @@ contract StatefulKernelHarness {
             yMath,
             amountOutMath,
             aWad,
-            lambdaWad
+            lambdaWad,
+            EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad)
         );
 
         // Lift input back to trader's token (ceil for pool-favourable
@@ -162,7 +165,8 @@ contract StatefulKernelHarness {
             yMath,
             amountInMath,
             aWad,
-            lambdaWad
+            lambdaWad,
+            EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad)
         );
         uint256 amountOutWad = inputIsQuote
             ? dyMath
@@ -196,7 +200,8 @@ contract StatefulKernelHarness {
             yMath,
             amountOutMath,
             aWad,
-            lambdaWad
+            lambdaWad,
+            EquilibraSwapMath.solveLFromState(xMath, yMath, aWad, lambdaWad)
         );
         // The kernel's dust soft-fail reports a zero input for a
         // wrong-side iterate; the production pool rejects that in its
@@ -228,7 +233,7 @@ contract StatefulKernelHarness {
 
     function getInvariantK() external view returns (uint256) {
         (uint256 xMath, uint256 yMath) = _mathSpace();
-        return EquilibraSwapMath.computeK(xMath, yMath, aWad, lambdaWad);
+        return SwapMathDiagnostics.computeK(xMath, yMath, aWad, lambdaWad);
     }
 
     function getMathReserves() external view returns (uint256 xMath, uint256 yMath) {

@@ -27,13 +27,13 @@ import hre from "hardhat";
 const WAD = 10n ** 18n;
 const A_MIN = 10n ** 17n; // 0.1 · W
 const A_MID = 5n * 10n ** 17n; // 0.5 · W
-const A_MAX = 99n * 10n ** 16n; // 0.99 · W
-const LAMBDA_MIN = 10n ** 15n; // 1e-3 · W
+const A_MAX = WAD - 1n; // largest fixed-point alpha strictly below 1
+const LAMBDA_MIN = 10n ** 12n; // 1e-6 · W
 const LAMBDA_MID = 10n ** 16n; // 1e-2 · W
 const LAMBDA_MAX = 10n ** 18n; // 1 · W
 
-// 3 × 3 envelope across the full production band (a ∈ [0.1, 0.99],
-// λ ∈ [1e-3, 1] of WAD). Picking the bound endpoints + the centre
+// 3 × 3 envelope across the full production band (a ∈ [0.1, 1 - 1/W],
+// λ ∈ [1e-6, 1] of WAD). Picking the bound endpoints + the centre
 // is sufficient to detect any monotone leak between the two knobs
 // — a single non-diagonal cell that drifts proves the decoupling
 // is broken.
@@ -60,11 +60,21 @@ describe("TwoKnobIndependence: (a × λ) decoupling matrix (ТЗ §9.4 #1)", fun
     // matrix to prove the property holds across the production
     // envelope.
     const xAnchor = 10n ** 22n; // 1e22 (≈ "10 000" math-units)
-    for (const a of A_GRID) {
+    for (const a of [A_MIN, A_MID, 990000000000000000n]) {
       for (const lambda of LAMBDA_GRID) {
         const l = BigInt(await h.solveLFromState(xAnchor, xAnchor, a, lambda));
-        expect(l, `L at anchor for (a=${a}, λ=${lambda}) should equal x=${xAnchor}, got ${l}`).to.equal(xAnchor);
+        expect(l, `L at anchor for (a=${a}, λ=${lambda}) should equal x=${xAnchor}, got ${l}`).to.equal(
+          (xAnchor * (1n << 128n)) / WAD
+        );
       }
+    }
+  });
+
+  it("pins maximum-alpha anchor depth to its exact Q128 value, independently of lambda", async function () {
+    const x = 10n ** 22n;
+    // Exact anchor identity, independent of alpha and lambda.
+    for (const lambda of LAMBDA_GRID) {
+      expect(await h.solveLFromState(x, x, A_MAX, lambda)).to.equal((x * (1n << 128n)) / WAD);
     }
   });
 

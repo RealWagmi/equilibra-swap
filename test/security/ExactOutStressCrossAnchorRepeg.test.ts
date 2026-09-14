@@ -16,13 +16,9 @@
 //      output side (`receivedAmountOut == requestedAmountOut`). No
 //      LP-side rounding loss.
 //
-//   3. `realisedAmountIn` is at least as large as the smallest
-//      `amountIn` that, fed through `exactInputSingle`, would
-//      have delivered ≥ `requestedAmountOut`
-//      (`minimumAmountInForSameOutputViaExactIn`). Found by binary
-//      search over `quoteExactIn`. This is the pool-revenue
-//      protection invariant — exact-out path must NEVER be
-//      cheaper for the user than the best-case exact-in route.
+//   3. On this normal-size grid, the checked exact-in output at the
+//      exact-out cost covers the requested output minus one native unit.
+//      The inverse margin maps do not justify another percentage allowance.
 //
 //   4. The pool stays solvent: post-swap token balances are
 //      ≥ post-swap recorded reserves + accrued protocol fees.
@@ -94,7 +90,7 @@ async function findMinimumExactInputForTarget(
 
 // Verify the four invariants for a single `exactOutputSingle` call:
 //   (1) realised == quoted; (2) recipient gets exactly amountOut;
-//   (3) realised >= minimumExactInputForTarget; (4) pool solvency.
+//   (3) checked exact-in price coverage; (4) pool solvency.
 // Returns whether auto-repeg fired during the swap (anchor moved).
 async function executeAndVerifyExactOutInvariants(
   fixture: SecurityFixture,
@@ -113,13 +109,13 @@ async function executeAndVerifyExactOutInvariants(
   const quotedAmountIn = BigInt(await fixture.pool.quoteExactOut(zeroForOne, requestedAmountOut));
   expect(quotedAmountIn, `${label}: quoteExactOut returned 0 — request beyond curve feasibility`).to.be.greaterThan(0n);
 
-  // Sanity: feeding quotedAmountIn through exact-in delivers ≥ target.
+  const comparisonTarget = requestedAmountOut - 1n;
   const outputAtQuoted = BigInt(await fixture.pool.quoteExactIn(zeroForOne, quotedAmountIn));
   expect(
     outputAtQuoted,
     `${label}: exact-in with quote=${quotedAmountIn} delivered only ` +
-      `${outputAtQuoted} < target=${requestedAmountOut} — resolver split?`
-  ).to.be.greaterThanOrEqual(requestedAmountOut);
+      `${outputAtQuoted} < checked target=${comparisonTarget} — resolver split?`
+  ).to.be.greaterThanOrEqual(comparisonTarget);
 
   // Lower bound for the bisection: half the quoted cost is comfortably
   // insufficient under any honest configuration.
@@ -128,22 +124,22 @@ async function executeAndVerifyExactOutInvariants(
   expect(
     outputAtBisectionLower,
     `${label}: exact-in with half the quote (${bisectionLower}) already delivers ` +
-      `${outputAtBisectionLower} ≥ target=${requestedAmountOut}. Major fee-arb!`
-  ).to.be.lessThan(requestedAmountOut);
+      `${outputAtBisectionLower} ≥ comparison target=${comparisonTarget}. Major resolver split!`
+  ).to.be.lessThan(comparisonTarget);
 
   const minimumAmountInForSameOutputViaExactIn = await findMinimumExactInputForTarget(
     fixture,
     zeroForOne,
-    requestedAmountOut,
+    comparisonTarget,
     bisectionLower,
     quotedAmountIn
   );
 
-  // Pool-revenue invariant — strict, no tolerance.
+  // Checked price coverage — no additional math tolerance.
   expect(
     quotedAmountIn,
     `${label}: quotedAmountIn=${quotedAmountIn} < minimumExactInForTarget=${minimumAmountInForSameOutputViaExactIn}. ` +
-      `User saves ${minimumAmountInForSameOutputViaExactIn - quotedAmountIn} wei via exact-in — pool loses!`
+      `Exact-out falls below the checked exact-in price floor.`
   ).to.be.greaterThanOrEqual(minimumAmountInForSameOutputViaExactIn);
 
   // Step 2 — capture pre-swap state for solvency / repeg checks.

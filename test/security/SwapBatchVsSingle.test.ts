@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// "Independent pass" / batching guard: a trader who splits a single
-// large swap into N consecutive smaller swaps must NEVER receive more
-// total output than they would by submitting one swap of the full
-// amount in the same atomic block.
-//
-// Why: any AMM that returns *more* on a split-execution exposes an
-// arbitrage where a sophisticated trader extracts value at the
-// expense of LPs. For a strictly concave curve (Equilibra's hybrid
-// invariant under flat 5 bps fee + repeg disabled), the splitting
-// inequality must be tight: `Σ smallOut ≤ singleOut`, allowing only
-// for floor-rounding noise (≤ N raw wei in the output token).
+// Batching guard under flat fees and a frozen anchor. Integer-path
+// comparisons retain their original dust budget. A cap-certified
+// single quote can underpay more than its split execution; only that
+// independently measured deficit may extend the comparison budget.
+// Every leg also checks its exact continuous reference and actual LP depth.
 //
 // We exercise both directions on both presets, at multiple pre-
 // depletion levels, and we additionally cover the cross-anchor case
@@ -34,6 +28,7 @@ import {
   type PresetName,
   type SecurityFixture,
 } from "../helpers/securityFixtures";
+import { assertQuotePrecision, exactInputReference } from "../helpers/continuousReference";
 
 const PRESETS_UNDER_TEST: PresetName[] = ["WETH", "WBTC"];
 
@@ -71,10 +66,69 @@ interface SplitVsSingleResult {
   splitTotalOut: bigint;
   splits: bigint[];
   delta: bigint; // splitTotalOut - singleOut (must be ≤ 0 + N·dust)
+  singleUnderquote: bigint;
+  singleIterations: bigint;
+  singleDepthGain: bigint;
+}
+
+type BatchFixture = SecurityFixture & { math: any };
+
+async function checkedPoolSwap(fx: BatchFixture, tokenIn: string, tokenOut: string, amount: bigint) {
+  const quoteIn = tokenIn.toLowerCase() === fx.quoteAddr.toLowerCase();
+  const zeroForOne = quoteIn === fx.quoteIsToken0;
+  const d0 = fx.quoteIsToken0 ? 6 : fx.baseDecimals;
+  const d1 = fx.quoteIsToken0 ? fx.baseDecimals : 6;
+  const scale0 = 10n ** BigInt(18 - d0);
+  const scale1 = 10n ** BigInt(18 - d1);
+  const WAD = 10n ** 18n;
+  const [r0, r1] = await fx.pool.getReserves();
+  const anchor = BigInt((await fx.pool.getOracleState()).priceScaleWad);
+  const x = r1 * scale1;
+  const y = (r0 * scale0 * WAD) / anchor;
+  const fee = await fx.pool.getFeeConfig();
+  expect(fee.feeRampBps, "reference fixture must use a flat fee").to.equal(0n);
+  expect(fee.repegShareBps, "reference anchor must remain frozen").to.equal(0n);
+  const clean = amount - (amount * BigInt(fee.baseFee)) / BPS;
+  const dx = zeroForOne ? (clean * scale0 * WAD) / anchor : clean * scale1;
+  const ref = await exactInputReference(
+    fx.math,
+    zeroForOne ? y : x,
+    zeroForOne ? x : y,
+    dx,
+    fx.preset.aWad,
+    fx.preset.lambdaWad
+  );
+  const lower = (v: bigint) => (zeroForOne ? v / scale1 : (v * anchor) / WAD / scale0);
+  const lpBefore = await fx.pool.getLpValueState();
+  const result = await exactInputSingle(fx, fx.trader, { tokenIn, tokenOut, amountIn: amount });
+  const kernelOut = lower(ref.quotedMath);
+  const cut = (((amount * BigInt(fee.baseFee)) / BPS) * BigInt(fee.protocolFeePercent)) / 100n;
+  const rawPost0 = r0 + (zeroForOne ? amount - cut : -kernelOut);
+  const rawPost1 = r1 + (zeroForOne ? -kernelOut : amount - cut);
+  const rawDepth = await fx.math.solveLFromState(
+    rawPost1 * scale1,
+    (rawPost0 * scale0 * WAD) / anchor,
+    fx.preset.aWad,
+    fx.preset.lambdaWad
+  );
+  expect(rawDepth, "single strict LP guard").to.be.gte(ref.lBefore);
+  expect(result.amountOut, "math quote already includes the common margin").to.equal(kernelOut);
+  // Preserve the independent solver-error comparison; the common margin is included in its amount budget.
+  assertQuotePrecision(kernelOut, lower(ref.referenceMath), ref.iterations, PER_SPLIT_DUST, "fee-inclusive kernel leg");
+  const referenceOut = lower(ref.referenceMath);
+  const [post0, post1] = await fx.pool.getReserves();
+  const lAfter = BigInt(
+    await fx.math.solveLFromState(post1 * scale1, (post0 * scale0 * WAD) / anchor, fx.preset.aWad, fx.preset.lambdaWad)
+  );
+  expect(lAfter, "actual fee-inclusive depth never decreases").to.be.at.least(ref.lBefore);
+  const lpAfter = await fx.pool.getLpValueState();
+  expect(lpAfter.unitValueWad).to.be.at.least(lpBefore.unitValueWad);
+  expect(lpAfter.growthWad).to.be.at.least(lpBefore.growthWad);
+  return { ...result, referenceOut, iterations: ref.iterations, depthGain: lAfter - ref.lBefore };
 }
 
 async function compareSplitVsSingle(
-  fx: SecurityFixture,
+  fx: BatchFixture,
   args: {
     tokenIn: string;
     tokenOut: string;
@@ -86,11 +140,7 @@ async function compareSplitVsSingle(
 
   // ---- Single big swap ----
   const snapSingle = await hre.network.provider.send("evm_snapshot", []);
-  const single = await exactInputSingle(fx, fx.trader, {
-    tokenIn,
-    tokenOut,
-    amountIn: totalAmount,
-  });
+  const single = await checkedPoolSwap(fx, tokenIn, tokenOut, totalAmount);
   const singleOut = single.amountOut;
   await hre.network.provider.send("evm_revert", [snapSingle]);
 
@@ -101,11 +151,7 @@ async function compareSplitVsSingle(
   for (let i = 0; i < splits; i++) {
     const isLast = i === splits - 1;
     const amt = isLast ? totalAmount - baseChunk * BigInt(splits - 1) : baseChunk;
-    const r = await exactInputSingle(fx, fx.trader, {
-      tokenIn,
-      tokenOut,
-      amountIn: amt,
-    });
+    const r = await checkedPoolSwap(fx, tokenIn, tokenOut, amt);
     splitOuts.push(r.amountOut);
     total += r.amountOut;
   }
@@ -115,18 +161,66 @@ async function compareSplitVsSingle(
     splitTotalOut: total,
     splits: splitOuts,
     delta: total - singleOut,
+    singleUnderquote: single.referenceOut > singleOut ? single.referenceOut - singleOut : 0n,
+    singleIterations: single.iterations,
+    singleDepthGain: single.depthGain,
   };
 }
 
 describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
   this.timeout(180_000);
 
+  for (const quoteIsToken0 of [true, false]) {
+    it(`pins WBTC 95% BASE→USDT precision and LP depth with quoteIsToken0=${quoteIsToken0}`, async function () {
+      // Numeric rounding depends on which token is anchor-normalized.
+      // Require both actual address orderings, independent of preceding tests.
+      let poolFixture: SecurityFixture | undefined;
+      for (let attempt = 0; attempt < 16; attempt++) {
+        const candidate = await deploySecurityFixture(buildPreset("WBTC"));
+        if (candidate.quoteIsToken0 === quoteIsToken0) {
+          poolFixture = candidate;
+          break;
+        }
+      }
+      expect(poolFixture, "required native-token orientation was not constructed").to.exist;
+      const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+      await math.waitForDeployment();
+      const fx: BatchFixture = { ...poolFixture!, math };
+      const r = await compareSplitVsSingle(fx, {
+        tokenIn: fx.baseAddr,
+        tokenOut: fx.quoteAddr,
+        totalAmount: (fx.initialBaseRaw * 9500n) / BPS,
+        splits: 10,
+      });
+      expect(r.delta).to.be.at.most(dustBudgetFor(r.singleOut, 10) + r.singleUnderquote);
+      // Q128 resolves the former late single-quote shortfall on the fast
+      // path in both token orderings. Every leg above is independently
+      // checked with the common margin and against post-fee L.
+      expect(r.singleIterations).to.equal(quoteIsToken0 ? 7n : 8n);
+      expect(r.singleOut).to.be.greaterThan(0n);
+      expect(r.singleUnderquote).to.be.gt(0n);
+      expect(r.delta).to.be.lessThan(0n);
+      console.log("Pinned WBTC 95% precision", {
+        quoteIsToken0,
+        singleOut: r.singleOut.toString(),
+        iterations: r.singleIterations.toString(),
+        verifiedUnderquote: r.singleUnderquote.toString(),
+        splitAdvantage: r.delta.toString(),
+        actualDepthGain: r.singleDepthGain.toString(),
+      });
+    });
+  }
+
   for (const presetName of PRESETS_UNDER_TEST) {
     const preset = buildPreset(presetName);
-    const fixtureFor = async () => deploySecurityFixture(preset);
+    const fixtureFor = async () => {
+      const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+      await math.waitForDeployment();
+      return { ...(await deploySecurityFixture(preset)), math };
+    };
 
     describe(`${presetName} (aWad=${fmtWad(REAL_PRESETS[presetName].aWad, 4)}, lambdaWad=${fmtWad(REAL_PRESETS[presetName].lambdaWad, 4)})`, function () {
-      it("Splitting USDT→BASE from balanced state never beats a single swap (10..95% of QUOTE reserve)", async function () {
+      it("[stress] USDT→BASE splitting stays within dust plus verified single underquote (10..95% of QUOTE reserve)", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
 
@@ -144,7 +238,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
               splits: SPLITS,
             });
 
-            const dustBudget = dustBudgetFor(r.singleOut, SPLITS);
+            const dustBudget = dustBudgetFor(r.singleOut, SPLITS) + r.singleUnderquote;
             rows.push({
               pct: `${(Number(pct) / 100).toFixed(1)}%`,
               singleOut: fmtBase(r.singleOut, presetName),
@@ -165,7 +259,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
         console.table(rows);
       });
 
-      it("Splitting BASE→USDT from balanced state never beats a single swap (10..95% of BASE reserve)", async function () {
+      it("[stress] BASE→USDT splitting stays within dust plus verified single underquote (10..95% of BASE reserve)", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
 
@@ -183,7 +277,16 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
               splits: SPLITS,
             });
 
-            const dustBudget = dustBudgetFor(r.singleOut, SPLITS);
+            const dustBudget = dustBudgetFor(r.singleOut, SPLITS) + r.singleUnderquote;
+            if (presetName === "WBTC" && pct === 9500n) {
+              console.log("WBTC 95% BASE→USDT precision regression", {
+                singleOut: r.singleOut.toString(),
+                iterations: r.singleIterations.toString(),
+                verifiedUnderquote: r.singleUnderquote.toString(),
+                splitAdvantage: r.delta.toString(),
+                actualDepthGain: r.singleDepthGain.toString(),
+              });
+            }
             rows.push({
               pct: `${(Number(pct) / 100).toFixed(1)}%`,
               singleOut: fmtQuote(r.singleOut),
@@ -204,7 +307,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
         console.table(rows);
       });
 
-      it("Splitting from a pre-depleted state (away regime) never beats a single swap", async function () {
+      it("[stress] Away-regime splitting stays within dust plus verified single underquote", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
         const failures: string[] = [];
@@ -231,7 +334,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
                 splits: SPLITS,
               });
 
-              const dustBudget = dustBudgetFor(r.singleOut, SPLITS);
+              const dustBudget = dustBudgetFor(r.singleOut, SPLITS) + r.singleUnderquote;
               const beat = r.delta > dustBudget;
               rows.push({
                 preDep: `${(Number(preDep) / 100).toFixed(1)}%`,
@@ -261,7 +364,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
         ).to.equal(true);
       });
 
-      it("Splitting through an anchor crossing (toward + overshoot) never beats a single swap", async function () {
+      it("[stress] Cross-anchor splitting stays within dust plus verified single underquote", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
         const failures: string[] = [];
@@ -295,7 +398,7 @@ describe("SwapBatchVsSingle [real presets, fee=5bps, repeg=off]", function () {
               splits: SPLITS,
             });
 
-            const dustBudget = dustBudgetFor(r.singleOut, SPLITS);
+            const dustBudget = dustBudgetFor(r.singleOut, SPLITS) + r.singleUnderquote;
             const beat = r.delta > dustBudget;
             rows.push({
               preDep: `${(Number(preDep) / 100).toFixed(1)}%`,

@@ -42,6 +42,7 @@ export type RustTraceState = {
   protocolFee0?: string;
   protocolFee1?: string;
   equilibraEmaPrice?: string;
+  equilibraEmaLogWad?: string;
   equilibraLastTimestamp?: string;
   equilibraLastRecenterTimestamp?: string;
   equilibraAnchorPriceWad?: string;
@@ -114,7 +115,7 @@ export type RustCurvePreset = {
 };
 
 export type RustBenchmarkRunConfig = {
-  version: "benchmark-run-config/v11";
+  version: "benchmark-run-config/v13";
   simulationEngine: "ts" | "rust";
   simulation: {
     startTimestamp: number;
@@ -133,11 +134,10 @@ export type RustBenchmarkRunConfig = {
     arbitrageur: {
       minProfitUsd: number;
       minProfitBps: number;
-      gasPriceGwei: number;
       maxSearchIterations: number;
       probeUsd: number;
+      probeTriggerBps: number;
       minTradeUsd: number;
-      gasUsedEstimates: Record<"equilibra" | "uniswapV2" | "curve", string>;
       postArbExternalSwaps: {
         count: number;
         shareBps: number;
@@ -213,6 +213,7 @@ export type SnapshotForRustQuote = {
   equilibraE0?: bigint;
   equilibraE1?: bigint;
   equilibraEmaPrice?: bigint;
+  equilibraEmaLogWad?: bigint;
   equilibraLastTimestamp?: bigint;
   equilibraLastRecenterTimestamp?: bigint;
   equilibraRepegStepWad?: bigint;
@@ -510,6 +511,7 @@ function appendEquilibraTraceFields(snapshot: SnapshotForRustQuote, pool: RustPo
   pool.equilibraE0 = equilibraE0.toString();
   pool.equilibraE1 = equilibraE1.toString();
   pool.equilibraEmaPrice = equilibraEmaPrice.toString();
+  pool.equilibraEmaLogWad = requireBigintField(snapshot.equilibraEmaLogWad, "equilibraEmaLogWad").toString();
   pool.equilibraLastTimestamp = equilibraLastTimestamp.toString();
   pool.equilibraLastRecenterTimestamp = equilibraLastRecenterTimestamp.toString();
   pool.equilibraRepegStepWad = equilibraRepegStepWad.toString();

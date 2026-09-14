@@ -337,7 +337,7 @@ describe("RepegConservation (Equilibra-only multi-cycle)", () => {
   // If `priceScale` runs away on-chain with this pattern, the bug
   // is in the algorithm itself. If `priceScale` stays bounded,
   // the bug is simulator-specific (arb model or stateless quote).
-  it("INV-I: simulator-pattern stress — 1000 swaps, priceScale stays bounded", async function () {
+  it("[stress] INV-I: simulator-pattern stress — 1000 swaps, priceScale stays bounded", async function () {
     this.timeout(120_000);
     const fx = await loadFixture(deployFixture);
     const psInitial = BigInt((await fx.pool.getOracleState()).priceScaleWad);

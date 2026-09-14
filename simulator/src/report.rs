@@ -44,33 +44,37 @@ struct OracleStore {
 }
 
 impl OracleStore {
-    fn load(dir: &Path) -> Result<(Self, OracleSnapshot)> {
-        let eth_path = dir.join("eth-usd.json");
-        let btc_path = dir.join("btc-usd.json");
-        let raw_files = BTreeMap::from([
-            (
-                "btc-usd.json".to_string(),
-                fs::read(&btc_path).with_context(|| format!("read {}", btc_path.display()))?,
-            ),
-            (
-                "eth-usd.json".to_string(),
-                fs::read(&eth_path).with_context(|| format!("read {}", eth_path.display()))?,
-            ),
-        ]);
+    fn load(dir: &Path, expected: &OracleSnapshot) -> Result<(Self, OracleSnapshot)> {
+        let mut raw_files = BTreeMap::new();
+        for entry in &expected.files {
+            let path = dir.join(&entry.file_name);
+            raw_files.insert(
+                entry.file_name.clone(),
+                fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            );
+        }
         let snapshot = oracle_snapshot_from_bytes(&raw_files)?;
-        let mut eth: OracleData = serde_json::from_slice(&raw_files["eth-usd.json"])
-            .with_context(|| format!("parse {}", eth_path.display()))?;
-        let mut btc: OracleData = serde_json::from_slice(&raw_files["btc-usd.json"])
-            .with_context(|| format!("parse {}", btc_path.display()))?;
-        eth.points.sort_by_key(|p| p.t);
-        btc.points.sort_by_key(|p| p.t);
-        Ok((
-            Self {
-                eth: dedupe_oracle_points(eth.points),
-                btc: dedupe_oracle_points(btc.points),
-            },
-            snapshot,
-        ))
+        if &snapshot != expected {
+            return Err(anyhow!(
+                "report oracle files do not match execution snapshot"
+            ));
+        }
+        let mut oracle = Self {
+            eth: Vec::new(),
+            btc: Vec::new(),
+        };
+        for (name, raw) in raw_files {
+            let mut data: OracleData = serde_json::from_slice(&raw)
+                .with_context(|| format!("parse {}", dir.join(&name).display()))?;
+            data.points.sort_by_key(|point| point.t);
+            let points = dedupe_oracle_points(data.points);
+            if name == "eth-usd.json" {
+                oracle.eth = points;
+            } else {
+                oracle.btc = points;
+            }
+        }
+        Ok((oracle, snapshot))
     }
 
     fn get_points(&self, symbol: &str) -> Result<&[OraclePoint]> {
@@ -141,7 +145,6 @@ pub struct ReportRunMetadata {
     pub end_timestamp: u64,
     pub duration_days: u64,
     pub initial_liquidity_usd: f64,
-    pub gas_price_gwei: f64,
     pub amm_list: Vec<String>,
     pub pool_list: Vec<String>,
     pub generated_at: String,
@@ -186,7 +189,6 @@ pub struct AmmSummary {
     pub donation_events: u64,
     pub arb_trade_count: u64,
     pub arb_total_profit_usd: f64,
-    pub arb_gas_cost_usd: f64,
     pub total_volume_usd: f64,
     pub arb_volume_usd: f64,
     pub total_fees_usd: f64,
@@ -350,7 +352,6 @@ struct ContextAccumulator {
     composition_history: Vec<(u64, f64, f64)>,
     arb_trade_count: u64,
     arb_total_profit_usd: f64,
-    arb_gas_cost_usd: f64,
     user_total_volume_usd: f64,
     total_volume_usd: f64,
     total_fees_usd: f64,
@@ -392,7 +393,6 @@ impl ContextAccumulator {
             composition_history: Vec::new(),
             arb_trade_count: 0,
             arb_total_profit_usd: 0.0,
-            arb_gas_cost_usd: 0.0,
             user_total_volume_usd: 0.0,
             total_volume_usd: 0.0,
             total_fees_usd: 0.0,
@@ -462,13 +462,20 @@ pub fn generate_report_from_results(
     // file bytes, so the digest is comparable across both report paths
     // and reproducible regardless of on-disk formatting.
     let result_digest = canonical_result_digest(&mut results)?;
-    generate_report_from_run_results(results, output_dir, oracle_data_dir, &result_digest)
+    generate_report_from_run_results(
+        results,
+        output_dir,
+        oracle_data_dir,
+        &provenance.material.oracle_snapshot,
+        &result_digest,
+    )
 }
 
 pub fn generate_report_from_run_results(
     results: RunResults,
     output_dir: &Path,
     oracle_data_dir: &Path,
+    oracle_snapshot: &OracleSnapshot,
     result_digest: &str,
 ) -> Result<()> {
     static REPORT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -494,7 +501,13 @@ pub fn generate_report_from_run_results(
         "resultDigest": result_digest,
     });
     let generated = (|| -> Result<()> {
-        generate_report_into_directory(results, &staging, oracle_data_dir, result_digest)?;
+        generate_report_into_directory(
+            results,
+            &staging,
+            oracle_data_dir,
+            oracle_snapshot,
+            result_digest,
+        )?;
         write_json_atomic(&staging.join("REPORT_COMPLETE.json"), &completion)?;
         sync_directory_tree(&staging)?;
         publish_report_directory(&staging, output_dir)?;
@@ -510,11 +523,12 @@ fn generate_report_into_directory(
     results: RunResults,
     output_dir: &Path,
     oracle_data_dir: &Path,
+    oracle_snapshot: &OracleSnapshot,
     result_digest: &str,
 ) -> Result<()> {
     validate_run_results_contract(&results)
         .with_context(|| "validate sim_results schema before report generation")?;
-    let (oracle, actual_oracle) = OracleStore::load(oracle_data_dir)
+    let (oracle, actual_oracle) = OracleStore::load(oracle_data_dir, oracle_snapshot)
         .with_context(|| format!("load oracle data from {}", oracle_data_dir.display()))?;
     if actual_oracle.oracle_digest != results.metadata.oracle_digest {
         return Err(anyhow!(
@@ -641,7 +655,6 @@ fn generate_report_into_directory(
         };
         acc.arb_trade_count = state.trade_count;
         acc.arb_total_profit_usd = state.total_profit_usd;
-        acc.arb_gas_cost_usd = state.total_gas_cost_usd;
 
         for trade in &state.trades {
             let oracle_symbol = oracle_symbol_for_pool(&acc.context.pool_key);
@@ -780,7 +793,6 @@ fn generate_report_into_directory(
         end_timestamp: results.metadata.end_timestamp,
         duration_days: results.metadata.duration_days,
         initial_liquidity_usd: results.metadata.initial_liquidity_usd,
-        gas_price_gwei: results.metadata.gas_price_gwei,
         amm_list: results.metadata.amm_list.clone(),
         pool_list: results.metadata.pool_list.clone(),
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -1115,7 +1127,6 @@ fn build_summaries(accumulators: &BTreeMap<String, ContextAccumulator>) -> Resul
             donation_events: acc.donation_events,
             arb_trade_count: acc.arb_trade_count,
             arb_total_profit_usd: acc.arb_total_profit_usd,
-            arb_gas_cost_usd: acc.arb_gas_cost_usd,
             total_volume_usd: acc.total_volume_usd,
             arb_volume_usd: (acc.total_volume_usd - acc.user_total_volume_usd).max(0.0),
             total_fees_usd: acc.total_fees_usd,
@@ -1980,7 +1991,6 @@ mod tests {
             end_timestamp: 200,
             duration_days: 0,
             initial_liquidity_usd: 1_000_000.0,
-            gas_price_gwei: 0.05,
             amm_list: vec!["equilibra".to_string()],
             pool_list: vec!["WETH".to_string()],
             generated_at: "test".to_string(),

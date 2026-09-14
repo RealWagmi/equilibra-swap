@@ -289,9 +289,7 @@
       aWad: "aWad",
       lambdaWad: "lambdaWad",
       repegStepWad: "repegStepWad",
-      // Both direction dead-bands share one absolute range (the step's
-      // [1, 1e18]); the per-side stall guard vs the fee scale is
-      // enforced server-side by validate_run_config.
+      // Both direction dead-bands share the fee-independent [1, 1e18] range.
       repegThresholdToken1UpWad: "repegThresholdWad",
       repegThresholdToken1DownWad: "repegThresholdWad",
     };
@@ -725,15 +723,15 @@
     },
     aWad: {
       t: "a — depth at anchor (WAD)",
-      b: "At the anchor the amplification equals <code>a</code>: larger values deepen the central plateau, concentrating depth near the anchor price. Range <code>[1e17, 99e16]</code> (0.1–0.99 of WAD). Fully decoupled from λ — moving <code>a</code> never shifts the cliff position. <code>a = 1e18</code> is forbidden: the depth solve degenerates at pure constant-sum.",
+      b: "At the anchor the amplification equals <code>a</code>: larger values deepen the central plateau, concentrating depth near the anchor price. Range <code>[100000000000000000, 999999999999999999]</code> (0.1 ≤ a &lt; 1). Fully decoupled from λ — moving <code>a</code> never shifts the cliff position. <code>a = 1e18</code> is forbidden: balanced marginal curvature vanishes.",
     },
     lambdaWad: {
       t: "λ — plateau width (WAD)",
-      b: "At <code>λ·D = WAD</code> the amplification halves. Larger λ narrows the plateau (earlier hand-off to the constant-product tail); smaller widens it. Range <code>[1e15, 1e18]</code>. Subtlety: with <code>a</code> near its ceiling, the bottom decade of λ makes the swap solver miss on trades larger than the output-side reserve — check the solver lamp in Curve Lab for the live safe price range, and prefer <code>λ ≥ 1e16</code> at high <code>a</code>.",
+      b: "At <code>λ·D = WAD</code> the amplification halves. Larger λ narrows the plateau (earlier hand-off to the constant-product tail); smaller widens it. Range <code>[1e12, 1e18]</code> (0.000001–1). Near maximum <code>a</code>, a wide plateau can lead to refused quotes or less accurate outputs in severely depleted tails. Check the solver lamp in Curve Lab for the sampled working price range; the parameter range does not guarantee every swap is quotable.",
     },
     feeBps: {
       t: "Fee ceiling (bps)",
-      b: "Ceiling of the dynamic swap fee, in bps of the input. Range <code>[5, 2000]</code>. With the ramp off this is simply the flat fee; with a live ramp the per-swap fee climbs from the floor toward this value as the post-swap state distance grows.",
+      b: "Ceiling of the dynamic swap fee, in bps of the input. Range <code>[1, 2000]</code>. With the ramp off this is simply the flat fee; with a live ramp the per-swap fee climbs from the floor toward this value as the post-swap state distance grows.",
     },
     feeRampBps: {
       t: "Fee ramp width (bps)",
@@ -741,7 +739,7 @@
     },
     feeFloorBps: {
       t: "Fee floor (bps)",
-      b: "Lower bound of the dynamic fee; tiny mean-reverting flow near the anchor pays this. Range <code>[0, ceiling]</code>; equality with the ceiling is allowed only when the ramp is off. With auto-repeg live the floor also sets the stall-guard scale: each repeg dead-band must stay ≤ <code>floor·1e14</code> (flat ceiling when the ramp is off), so a floor of 0 with a live ramp is undeployable while auto-repeg is on.",
+      b: "Lower bound of the dynamic fee; tiny mean-reverting flow near the anchor pays this. With a live ramp its range is <code>[1, ceiling)</code>. With the ramp off, the flat ceiling may be <code>[1, 2000]</code> and this stored <code>uint16</code> floor is ignored (but must be at most <code>65535</code>). Independent of the repeg activation thresholds.",
     },
     repegShareBps: {
       t: "Repeg budget share (bps)",
@@ -749,7 +747,7 @@
     },
     emaPeriod: {
       t: "EMA period (s)",
-      b: "Half-life of the geometric price EMA the anchor follows, in seconds. Range <code>[60, 419731]</code> (≈ 4.86 days). Longer periods are harder to manipulate through the oracle but track repricings more slowly. Immutable after pool creation on chain — treat it as a launch decision, not a tuning knob.",
+      b: "Half-life of the geometric price EMA the anchor follows, in seconds. Public-pool range <code>[600, 419731]</code> (≈ 4.86 days). Longer periods are harder to manipulate through the oracle but track repricings more slowly. Immutable after pool creation on chain — treat it as a launch decision, not a tuning knob.",
     },
     donationAprBps: {
       t: "Donation stream (bps of TVL per year; 0 = off)",
@@ -765,11 +763,11 @@
     },
     repegThresholdUp: {
       t: "Dead-band, token1 up (WAD)",
-      b: "Auto-repeg activation dead-band while <code>ema &gt; priceScale</code> — token1 priced ABOVE the anchor. Geometric deviation, so ±2× reads 1.0 either way. Layout subtlety: with the base in slot 0 a RISING base market is an internal token1-DOWN move, so bull-market catch-up is tuned by the Down knob; this one damps drawdown tracking. Stall guard: with auto-repeg live each band must stay ≤ <code>feeScale·1e14</code> or the first permitted move is already unaffordable and the anchor stalls.",
+      b: "Auto-repeg activation dead-band while <code>ema &gt; priceScale</code> — token1 priced ABOVE the anchor. Geometric deviation, so ±2× reads 1.0 either way. Layout subtlety: with the base in slot 0 a RISING base market is an internal token1-DOWN move, so bull-market catch-up is tuned by the Down knob; this one damps drawdown tracking. Range <code>[1, 1e18]</code>, independent of fees. <code>1e15</code> means 0.1% (10 bps). Reaching the band permits an attempt; the LP-budget checks still decide whether the anchor can move.",
     },
     repegThresholdDown: {
       t: "Dead-band, token1 down (WAD)",
-      b: "Same dead-band for <code>ema &lt; priceScale</code> — with the base in slot 0 this is the base asset RISING. Setting Down &lt; Up chases base rallies more eagerly than drawdowns (momentum asymmetry; the bundled presets ship 2.5e15 / 1.5e15). Pegged pools prefer tiny symmetric bands (1e14) instead — the split is a volatile-pair tool. Same stall-guard rule as the Up band.",
+      b: "Same dead-band for <code>ema &lt; priceScale</code> — with the base in slot 0 this is the base asset RISING. Setting Down &lt; Up chases base rallies more eagerly than drawdowns (momentum asymmetry; the bundled presets ship 2.5e15 / 1.5e15). For pegged pairs, choose a symmetric band for the desired tracking sensitivity and concentration. Same fee-independent <code>[1, 1e18]</code> range as Up; the LP-budget checks still apply.",
     },
     protocolFeePercent: {
       t: "Protocol fee (%)",

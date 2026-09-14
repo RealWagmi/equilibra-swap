@@ -30,10 +30,12 @@ use primitive_types::U256;
 use super::equilibra_math::{
     self, compute_lp_unit_value_wad as math_compute_lp_unit_value_wad, from_wad_up_by_scale,
     marginal_price_from_state, mul_div_ceil, mul_div_floor as math_mul_div_floor, mul_wad,
-    predict_post_distance_cp, quote_exact_in_forward, quote_exact_out_forward, scale_for_decimals,
-    smoothstep_fee_wad, solve_l_from_state, to_math_space, to_wad_by_scale, A_MAX_WAD, A_MIN_WAD,
-    BPS, LAMBDA_MAX_WAD, LAMBDA_MIN_WAD, WAD,
+    predict_post_distance_cp, scale_for_decimals, smoothstep_fee_wad, solve_l_from_state,
+    to_math_space, to_wad_by_scale, A_MAX_WAD, A_MIN_WAD, BPS, LAMBDA_MAX_WAD, LAMBDA_MIN_WAD, WAD,
 };
+
+#[cfg(test)]
+use super::equilibra_math::quote_exact_in_forward;
 
 // ---------------------------------------------------------------------------
 // Constants mirroring `contracts/libraries/Constants.sol`.
@@ -47,8 +49,10 @@ const MAX_EMA_PERIOD: u128 = 7 * 24 * 3600;
 
 /// Base-fee (fee ceiling) bounds. Mirror `Constants.MIN_BASE_FEE` /
 /// `Constants.MAX_BASE_FEE`.
-pub const MIN_BASE_FEE_BPS: u128 = 5;
+pub const MIN_BASE_FEE_BPS: u128 = 1;
 pub const MAX_BASE_FEE_BPS: u128 = 2_000;
+/// Storage mirrors the pool's `uint16 feeFloorBps`, including flat-fee mode.
+pub const MAX_FEE_FLOOR_BPS: u128 = u16::MAX as u128;
 pub const MAX_FEE_RAMP_BPS: u128 = 10_000;
 /// Ramp monotonicity guard multiplier. Mirrors
 /// `Constants.FEE_RAMP_GUARD_MULT`; see [`fee_ramp_guard_ok`].
@@ -99,8 +103,8 @@ pub const FEE_BPS_TO_WAD: u128 = 100_000_000_000_000u128; // 1e14
 /// satisfy `feeRampBps · (BPS − baseFee)² ≥ FEE_RAMP_GUARD_MULT · BPS ·
 /// (baseFee − feeFloorBps)²`, otherwise the terminal rate climbs faster
 /// than the gross input grows and a larger exact-in trade returns less
-/// output. Callers must have validated `fee_floor_bps ≤ fee_bps ≤ BPS`
-/// first; `fee_ramp_bps == 0` (flat-fee mode) always passes.
+/// output. Live-ramp callers must first validate
+/// `1 ≤ fee_floor_bps < fee_bps ≤ BPS`; flat-fee mode always passes.
 pub fn fee_ramp_guard_ok(fee_bps: u128, fee_floor_bps: u128, fee_ramp_bps: u128) -> bool {
     if fee_ramp_bps == 0 {
         return true;
@@ -286,7 +290,7 @@ impl EquilibraStatefulConfig {
                 repeg_threshold_token1_down_wad,
             ),
         ] {
-            if value == 0 || value > WAD {
+            if value == 0 || value >= WAD {
                 return Err(anyhow!("equilibra_stateful: invalid {} {}", label, value));
             }
         }
@@ -304,32 +308,34 @@ impl EquilibraStatefulConfig {
                 MAX_BASE_FEE_BPS
             ));
         }
-        if fee_ramp_bps > MAX_FEE_RAMP_BPS {
+        if fee_floor_bps > MAX_FEE_FLOOR_BPS {
             return Err(anyhow!(
-                "equilibra_stateful: fee_ramp_bps {} > MAX",
-                fee_ramp_bps
-            ));
-        }
-        if fee_floor_bps > fee_bps {
-            return Err(anyhow!(
-                "equilibra_stateful: fee_floor_bps {} > fee_bps {}",
+                "equilibra_stateful: fee_floor_bps {} > MAX_FEE_FLOOR_BPS ({})",
                 fee_floor_bps,
-                fee_bps
+                MAX_FEE_FLOOR_BPS
             ));
         }
-        if fee_ramp_bps != 0 && fee_bps == fee_floor_bps {
-            return Err(anyhow!(
-                "equilibra_stateful: feeRampBps != 0 && baseFee == feeFloorBps"
-            ));
-        }
-        if !fee_ramp_guard_ok(fee_bps, fee_floor_bps, fee_ramp_bps) {
-            return Err(anyhow!(
-                "equilibra_stateful: feeRampBps {} too narrow for span {} at ceiling {} \
-                 (FeeRampTooNarrow on chain)",
-                fee_ramp_bps,
-                fee_bps - fee_floor_bps,
-                fee_bps
-            ));
+        if fee_ramp_bps != 0 {
+            if fee_ramp_bps > MAX_FEE_RAMP_BPS {
+                return Err(anyhow!(
+                    "equilibra_stateful: fee_ramp_bps {} > MAX",
+                    fee_ramp_bps
+                ));
+            }
+            if fee_floor_bps == 0 || fee_floor_bps >= fee_bps {
+                return Err(anyhow!(
+                    "equilibra_stateful: live fee ramp requires 1 <= fee_floor_bps < fee_bps",
+                ));
+            }
+            if !fee_ramp_guard_ok(fee_bps, fee_floor_bps, fee_ramp_bps) {
+                return Err(anyhow!(
+                    "equilibra_stateful: feeRampBps {} too narrow for span {} at ceiling {} \
+                     (FeeRampTooNarrow on chain)",
+                    fee_ramp_bps,
+                    fee_bps - fee_floor_bps,
+                    fee_bps
+                ));
+            }
         }
         if repeg_share_bps > MAX_REPEG_SHARE_BPS {
             return Err(anyhow!(
@@ -407,7 +413,7 @@ pub struct EquilibraStatefulState {
     pub protocol_fee1: u128,
     pub e0: u128,
     pub e1: u128,
-    pub ema_price_wad: u128,
+    pub ema_log_wad: i128,
     pub last_ema_ts: u64,
     pub last_repeg_ts: u64,
     pub lp_unit_value_genesis_wad: u128,
@@ -420,6 +426,13 @@ pub struct EquilibraStatefulState {
 }
 
 impl EquilibraStatefulState {
+    pub fn ema_price_wad(&self) -> Result<u128> {
+        to_u128(
+            equilibra_math::ema_log_to_price(self.ema_log_wad)?,
+            "emaPriceWad",
+        )
+    }
+
     pub const fn empty() -> Self {
         Self {
             reserve0: 0,
@@ -430,7 +443,7 @@ impl EquilibraStatefulState {
             protocol_fee1: 0,
             e0: 0,
             e1: 0,
-            ema_price_wad: 0,
+            ema_log_wad: 0,
             last_ema_ts: 0,
             last_repeg_ts: 0,
             lp_unit_value_genesis_wad: 0,
@@ -454,6 +467,7 @@ pub struct EquilibraExchangeStatefulOut {
     pub e0: u128,
     pub e1: u128,
     pub ema_price_wad: u128,
+    pub ema_log_wad: i128,
     pub last_ema_ts: u64,
     pub last_repeg_ts: u64,
     pub lp_unit_value_genesis_wad: u128,
@@ -480,6 +494,16 @@ pub struct EquilibraExchangeStatefulOut {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct ExactInResolved {
+    pub amount_out_raw: u128,
+    pub fee_amount_raw: u128,
+    pub protocol_cut_raw: u128,
+    pub lp_fee_raw: u128,
+    pub fee_wad_effective: u128,
+    pub iters: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ExactOutResolved {
     pub amount_in_raw: u128,
     pub amount_in_clean_raw: u128,
@@ -493,6 +517,86 @@ pub struct ExactOutResolved {
 pub struct EquilibraExchangeExactOutStatefulOut {
     pub amount_in: u128,
     pub state: EquilibraExchangeStatefulOut,
+}
+
+struct CheckedPostSwap {
+    reserve0: u128,
+    reserve1: u128,
+    depth: U256,
+    protocol_cut_raw: u128,
+}
+
+/// Fee-inclusive quote with the same common margin, native bounds and strict LP guard as execution.
+pub fn quote_exact_in_stateful(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    token_in: &str,
+    amount_in: u128,
+) -> Result<ExactInResolved> {
+    Ok(resolve_exact_in_checked(config, state, token_in, amount_in)?.0)
+}
+
+fn resolve_exact_in_checked(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    token_in: &str,
+    amount_in: u128,
+) -> Result<(ExactInResolved, CheckedPostSwap)> {
+    if amount_in == 0 {
+        return Err(anyhow!("equilibra_swap_stateful_zero_amount"));
+    }
+    let zero_for_one = resolve_direction(config, token_in)?;
+    if state.reserve0 == 0 || state.reserve1 == 0 {
+        return Err(anyhow!("equilibra_swap_stateful_insufficient_liquidity"));
+    }
+    if state.price_scale_wad == 0 {
+        return Err(anyhow!("equilibra_swap_stateful_invalid_price_scale"));
+    }
+    let fee_wad_effective =
+        resolve_dynamic_fee_wad_from_cp(config, state, zero_for_one, amount_in)?;
+    let mut fee_amount_u =
+        math_mul_div_floor(U256::from(amount_in), fee_wad_effective.into(), WAD.into())?;
+    if fee_amount_u.is_zero() && fee_wad_effective != 0 {
+        fee_amount_u = U256::one();
+    }
+    if fee_amount_u > U256::from(amount_in) {
+        return Err(anyhow!("equilibra_swap_stateful_fee_ge_input"));
+    }
+    if fee_amount_u == U256::from(amount_in) {
+        return Err(anyhow!(
+            "equilibra_stateful: amount_too_small_after_normalization"
+        ));
+    }
+    let fee_amount_raw = to_u128(fee_amount_u, "feeAmount")?;
+    let protocol_cut_raw = protocol_cut(config, fee_amount_raw)?;
+    let clean_amount_in = amount_in - fee_amount_raw;
+    let (amount_out_raw, iters, depth_before_q128) =
+        compute_exact_in_amount_out(config, state, zero_for_one, clean_amount_in)?;
+    if amount_out_raw == 0 {
+        return Err(anyhow!(
+            "equilibra_stateful: amount_too_small_after_normalization"
+        ));
+    }
+    let post = checked_post_swap(
+        config,
+        state,
+        zero_for_one,
+        amount_in,
+        amount_out_raw,
+        protocol_cut_raw,
+        depth_before_q128,
+    )?;
+    Ok((
+        ExactInResolved {
+            amount_out_raw,
+            fee_amount_raw,
+            protocol_cut_raw,
+            lp_fee_raw: fee_amount_raw - protocol_cut_raw,
+            fee_wad_effective,
+            iters,
+        },
+        post,
+    ))
 }
 
 /// Execute a single exact-input swap.
@@ -525,56 +629,16 @@ pub fn swap_stateful(
     // Step 1: EMA update.
     update_ema_in_place(config, &mut state, timestamp)?;
 
-    // Step 2: resolve dynamic fee (WAD rate) + compute swap math.
-    let fee_wad_effective =
-        resolve_dynamic_fee_wad_from_cp(config, &state, zero_for_one, amount_in)?;
-    let amount_in_u = U256::from(amount_in);
-    let fee_amount_u = math_mul_div_floor(amount_in_u, fee_wad_effective.into(), WAD.into())?;
-    if fee_amount_u >= amount_in_u {
-        return Err(anyhow!("equilibra_swap_stateful_fee_ge_input"));
-    }
-    let protocol_cut_u = if config.protocol_fee_percent != 0 {
-        math_mul_div_floor(
-            fee_amount_u,
-            config.protocol_fee_percent.into(),
-            U256::from(100),
-        )?
-    } else {
-        U256::zero()
-    };
-    let lp_fee_u = fee_amount_u - protocol_cut_u;
-    let fee_amount_raw = to_u128(fee_amount_u, "feeAmount")?;
-    let protocol_cut_raw = to_u128(protocol_cut_u, "protocolCut")?;
-    let lp_fee_raw = to_u128(lp_fee_u, "lpFeeCut")?;
+    // Resolve the same checked, fee-inclusive quote exposed to callers.
+    let (resolved, post) = resolve_exact_in_checked(config, &state, token_in, amount_in)?;
+    let amount_out = resolved.amount_out_raw;
+    let fee_amount_raw = resolved.fee_amount_raw;
+    let protocol_cut_raw = resolved.protocol_cut_raw;
+    let lp_fee_raw = resolved.lp_fee_raw;
 
-    let clean_amount_in = amount_in
-        .checked_sub(fee_amount_raw)
-        .ok_or_else(|| anyhow!("eq_swap clean_amount_in underflow"))?;
-
-    let amount_out = compute_exact_in_amount_out(config, &state, zero_for_one, clean_amount_in)?;
-    if amount_out == 0 {
-        return Err(anyhow!("equilibra_swap_stateful_insufficient_output"));
-    }
-
-    // Step 3: liquidity domain checks.
-    if zero_for_one && amount_out >= state.reserve1 {
-        return Err(anyhow!("equilibra_swap_stateful_insufficient_liquidity"));
-    }
-    if !zero_for_one && amount_out >= state.reserve0 {
-        return Err(anyhow!("equilibra_swap_stateful_insufficient_liquidity"));
-    }
-
-    // Step 4-5: apply reserves + protocol fee accrual + e0/e1.
-    let (reserve0_after, reserve1_after) = apply_swap_to_reserves(
-        zero_for_one,
-        state.reserve0,
-        state.reserve1,
-        amount_in,
-        amount_out,
-        protocol_cut_raw,
-    )?;
-    state.reserve0 = reserve0_after;
-    state.reserve1 = reserve1_after;
+    // Apply the reserves validated by the shared native settlement path.
+    state.reserve0 = post.reserve0;
+    state.reserve1 = post.reserve1;
     if zero_for_one {
         state.protocol_fee0 = state
             .protocol_fee0
@@ -599,7 +663,7 @@ pub fn swap_stateful(
     let AccrueResult {
         vp_now: vp_before_repeg,
         delta_wad: lp_value_growth_delta_wad,
-    } = accrue_lp_value_growth(config, &mut state)?;
+    } = accrue_lp_value_growth(&mut state, post.depth)?;
 
     // Step 7: auto-repeg.
     let RepegOutcome {
@@ -643,7 +707,8 @@ pub fn swap_stateful(
         protocol_fee1: state.protocol_fee1,
         e0: state.e0,
         e1: state.e1,
-        ema_price_wad: state.ema_price_wad,
+        ema_price_wad: state.ema_price_wad()?,
+        ema_log_wad: state.ema_log_wad,
         last_ema_ts: state.last_ema_ts,
         last_repeg_ts: state.last_repeg_ts,
         lp_unit_value_genesis_wad: state.lp_unit_value_genesis_wad,
@@ -666,13 +731,22 @@ pub fn swap_stateful(
     })
 }
 
-/// Single-pass exact-out resolver with smoothstep dynamic fee.
+/// Checked exact-out resolver with the common output margin, dynamic fee and one strict LP guard.
 pub fn quote_exact_out_stateful(
     config: &EquilibraStatefulConfig,
     state: &EquilibraStatefulState,
     token_in: &str,
     amount_out_raw: u128,
 ) -> Result<ExactOutResolved> {
+    Ok(resolve_exact_out_checked(config, state, token_in, amount_out_raw)?.0)
+}
+
+fn resolve_exact_out_checked(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    token_in: &str,
+    amount_out_raw: u128,
+) -> Result<(ExactOutResolved, CheckedPostSwap)> {
     if amount_out_raw == 0 {
         return Err(anyhow!("equilibra_stateful: quote_exact_out zero amount"));
     }
@@ -697,12 +771,49 @@ pub fn quote_exact_out_stateful(
         ));
     }
 
-    let (clean_in_wad, iters) =
+    let (clean_in_wad, iters, depth_before_q128) =
         compute_exact_out_clean_in_wad(config, state, zero_for_one, amount_out_wad)?;
 
     let clean_in_raw_u = from_wad_up_by_scale(clean_in_wad, in_scale)?;
-    let clean_in_raw = to_u128(clean_in_raw_u, "cleanInRaw")?;
+    // Match the pool's typed normalization guard before gross-up. A
+    // wrong-side discrete solver result can be the zero-input sentinel.
+    if clean_in_raw_u.is_zero() {
+        return Err(anyhow!(
+            "equilibra_stateful: amount_too_small_after_normalization"
+        ));
+    }
 
+    let clean_in_raw = to_u128(clean_in_raw_u, "cleanInRaw")?;
+    let (amount_in_raw, fee_amount_raw, fee_wad) =
+        resolve_exact_out_fee(config, state, zero_for_one, clean_in_raw)?;
+    let post = checked_post_swap(
+        config,
+        state,
+        zero_for_one,
+        amount_in_raw,
+        amount_out_raw,
+        protocol_cut(config, fee_amount_raw)?,
+        depth_before_q128,
+    )?;
+    Ok((
+        ExactOutResolved {
+            amount_in_raw,
+            amount_in_clean_raw: clean_in_raw,
+            fee_amount_raw,
+            fee_wad_effective: fee_wad,
+            iters,
+        },
+        post,
+    ))
+}
+
+fn resolve_exact_out_fee(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    zero_for_one: bool,
+    clean_in_raw: u128,
+) -> Result<(u128, u128, u128)> {
+    let clean_in_raw_u = U256::from(clean_in_raw);
     // Two-endpoint max of the CP-proxy fee (mirrors Solidity
     // _executeExactOutWithDynamicFee). The predictor distance is
     // quasi-convex (V-shaped, min at xPost=sqrt(xy)) in the gross input,
@@ -710,8 +821,9 @@ pub fn quote_exact_out_stateful(
     // The settled gross lies in [grossUp(clean, floor), grossUp(clean,
     // base)] and a quasi-convex function's max over an interval is at an
     // endpoint, so max(feeCp(grossLo), feeCp(grossHi)) >= the fee
-    // exact-in resolves at the settled gross -> the
-    // exactIn(quoteExactOut) >= out identity holds with no iteration.
+    // exact-in resolves at the settled gross. This bounds the fee rate,
+    // not the inversion error of independent rounded counterpart solves.
+    // Exact-out quote and exact-out swap still share this entire resolver.
     let base_fee_wad = config.fee_bps * FEE_BPS_TO_WAD;
     // Flat-fee short-circuit (mirrors Solidity, audit O-5): with the
     // ramp disabled the CP resolver returns base_fee for ANY gross, so
@@ -737,20 +849,14 @@ pub fn quote_exact_out_stateful(
         )?;
         fee_lo.max(fee_hi)
     };
-    // +1 wei safety bump (mirrors Solidity; covers secant K-residual).
+    // Keep Solidity's existing +1 raw input fee bump after gross-up.
     let amount_in_u = gross_up_exact_out(clean_in_raw_u, fee_wad)? + U256::one();
     let amount_in_raw = to_u128(amount_in_u, "amountInRaw")?;
     let fee_amount_raw = amount_in_raw
         .checked_sub(clean_in_raw)
         .ok_or_else(|| anyhow!("equilibra_stateful: amount_in_raw < clean_in_raw"))?;
 
-    Ok(ExactOutResolved {
-        amount_in_raw,
-        amount_in_clean_raw: clean_in_raw,
-        fee_amount_raw,
-        fee_wad_effective: fee_wad,
-        iters,
-    })
+    Ok((amount_in_raw, fee_amount_raw, fee_wad))
 }
 
 /// Execute exact-output swap.
@@ -785,45 +891,14 @@ pub fn swap_stateful_exact_out(
     let mut state = state_in;
     update_ema_in_place(config, &mut state, timestamp)?;
 
-    let resolved = quote_exact_out_stateful(config, &state, token_in, amount_out_raw)?;
+    let (resolved, post) = resolve_exact_out_checked(config, &state, token_in, amount_out_raw)?;
     let amount_in = resolved.amount_in_raw;
     let fee_amount_raw = resolved.fee_amount_raw;
 
-    let fee_amount_u = U256::from(fee_amount_raw);
-    let protocol_cut_u = if config.protocol_fee_percent != 0 {
-        math_mul_div_floor(
-            fee_amount_u,
-            config.protocol_fee_percent.into(),
-            U256::from(100),
-        )?
-    } else {
-        U256::zero()
-    };
-    let lp_fee_u = fee_amount_u - protocol_cut_u;
-    let protocol_cut_raw = to_u128(protocol_cut_u, "protocolCut")?;
-    let lp_fee_raw = to_u128(lp_fee_u, "lpFeeCut")?;
-
-    if zero_for_one && amount_out_raw >= state.reserve1 {
-        return Err(anyhow!(
-            "equilibra_swap_stateful_exact_out_insufficient_liquidity"
-        ));
-    }
-    if !zero_for_one && amount_out_raw >= state.reserve0 {
-        return Err(anyhow!(
-            "equilibra_swap_stateful_exact_out_insufficient_liquidity"
-        ));
-    }
-
-    let (reserve0_after, reserve1_after) = apply_swap_to_reserves(
-        zero_for_one,
-        state.reserve0,
-        state.reserve1,
-        amount_in,
-        amount_out_raw,
-        protocol_cut_raw,
-    )?;
-    state.reserve0 = reserve0_after;
-    state.reserve1 = reserve1_after;
+    let protocol_cut_raw = post.protocol_cut_raw;
+    let lp_fee_raw = fee_amount_raw - protocol_cut_raw;
+    state.reserve0 = post.reserve0;
+    state.reserve1 = post.reserve1;
     if zero_for_one {
         state.protocol_fee0 = state
             .protocol_fee0
@@ -847,7 +922,7 @@ pub fn swap_stateful_exact_out(
     let AccrueResult {
         vp_now: vp_before_repeg,
         delta_wad: lp_value_growth_delta_wad,
-    } = accrue_lp_value_growth(config, &mut state)?;
+    } = accrue_lp_value_growth(&mut state, post.depth)?;
 
     let RepegOutcome {
         new_price_scale_wad,
@@ -891,7 +966,8 @@ pub fn swap_stateful_exact_out(
             protocol_fee1: state.protocol_fee1,
             e0: state.e0,
             e1: state.e1,
-            ema_price_wad: state.ema_price_wad,
+            ema_price_wad: state.ema_price_wad()?,
+            ema_log_wad: state.ema_log_wad,
             last_ema_ts: state.last_ema_ts,
             last_repeg_ts: state.last_repeg_ts,
             lp_unit_value_genesis_wad: state.lp_unit_value_genesis_wad,
@@ -927,6 +1003,7 @@ pub struct EquilibraGenesisInit {
     pub shares_out: u128,
     pub price_scale_wad: u128,
     pub ema_price_wad: u128,
+    pub ema_log_wad: i128,
     pub last_ema_ts: u64,
     pub last_repeg_ts: u64,
     pub lp_unit_value_genesis_wad: u128,
@@ -988,13 +1065,18 @@ pub fn init_genesis(
         ));
     }
 
+    let ema_log_wad = equilibra_math::price_to_ema_log(price_scale_u)?;
     Ok(EquilibraGenesisInit {
         reserve0: amount0,
         reserve1: amount1,
         total_supply,
         shares_out,
         price_scale_wad,
-        ema_price_wad: price_scale_wad,
+        ema_price_wad: to_u128(
+            equilibra_math::ema_log_to_price(ema_log_wad)?,
+            "emaPriceWad",
+        )?,
+        ema_log_wad,
         last_ema_ts: now_ts,
         last_repeg_ts: now_ts,
         lp_unit_value_genesis_wad,
@@ -1044,12 +1126,17 @@ pub fn add_liquidity_proportional(
     }
     let r0 = state_in.reserve0;
     let r1 = state_in.reserve1;
-    let mut a0_used = amount0_desired;
-    let mut a1_used = mul_div_floor_u128(amount0_desired, r1, r0)?;
-    if a1_used > amount1_desired {
-        a1_used = amount1_desired;
-        a0_used = mul_div_floor_u128(amount1_desired, r0, r1)?;
-    }
+    // Shares are priced on token0: round its matching token1 payment up.
+    // Keep the wide ratio probe until the limiting side is known.
+    let a1_probe = mul_div_ceil(amount0_desired.into(), r1.into(), r0.into())?;
+    let (a0_used, a1_used) = if a1_probe > U256::from(amount1_desired) {
+        (
+            mul_div_floor_u128(amount1_desired, r0, r1)?,
+            amount1_desired,
+        )
+    } else {
+        (amount0_desired, to_u128(a1_probe, "eq_add amount1")?)
+    };
     if a0_used == 0 || a1_used == 0 {
         return Err(anyhow!(
             "equilibra_add_liquidity: too small after normalisation"
@@ -1209,6 +1296,89 @@ fn mul_div_floor_u128(a: u128, b: u128, denom: u128) -> Result<u128> {
     to_u128(r, "mul_div_floor_u128")
 }
 
+fn protocol_cut(config: &EquilibraStatefulConfig, fee_amount_raw: u128) -> Result<u128> {
+    if config.protocol_fee_percent == 0 {
+        return Ok(0);
+    }
+    to_u128(
+        math_mul_div_floor(
+            fee_amount_raw.into(),
+            config.protocol_fee_percent.into(),
+            U256::from(100),
+        )?,
+        "protocolCut",
+    )
+}
+
+/// Check native reserves and recover post-fee depth for LP growth and repeg.
+/// LP fees stay in reserves; the protocol cut does not. The callers compare
+/// fresh Q128 depth and may apply exactly one native correction.
+fn post_swap_state(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    zero_for_one: bool,
+    amount_in: u128,
+    amount_out: u128,
+    protocol_cut_raw: u128,
+) -> Result<CheckedPostSwap> {
+    let reserve_out = if zero_for_one {
+        state.reserve1
+    } else {
+        state.reserve0
+    };
+    if amount_out >= reserve_out {
+        return Err(anyhow!("equilibra_stateful: insufficient liquidity"));
+    }
+    let (reserve0, reserve1) = apply_swap_to_reserves(
+        zero_for_one,
+        state.reserve0,
+        state.reserve1,
+        amount_in,
+        amount_out,
+        protocol_cut_raw,
+    )?;
+    let (x_math, y_math) = load_math_state(config, reserve0, reserve1, state.price_scale_wad)?;
+    let depth = if x_math.is_zero() || y_math.is_zero() {
+        U256::zero()
+    } else {
+        solve_l_from_state(
+            x_math,
+            y_math,
+            config.a_wad.into(),
+            config.lambda_wad.into(),
+        )?
+    };
+    Ok(CheckedPostSwap {
+        reserve0,
+        reserve1,
+        depth,
+        protocol_cut_raw,
+    })
+}
+
+fn checked_post_swap(
+    config: &EquilibraStatefulConfig,
+    state: &EquilibraStatefulState,
+    zero_for_one: bool,
+    amount_in: u128,
+    amount_out: u128,
+    protocol_cut_raw: u128,
+    depth_before_q128: U256,
+) -> Result<CheckedPostSwap> {
+    let post = post_swap_state(
+        config,
+        state,
+        zero_for_one,
+        amount_in,
+        amount_out,
+        protocol_cut_raw,
+    )?;
+    if post.depth < depth_before_q128 {
+        return Err(anyhow!("equilibra_stateful: LpValueDecreased"));
+    }
+    Ok(post)
+}
+
 fn apply_swap_to_reserves(
     zero_for_one: bool,
     reserve0: u128,
@@ -1249,7 +1419,12 @@ fn gross_up_exact_out(clean_in_raw: U256, fee_wad: u128) -> Result<U256> {
     }
     let denom = U256::from(WAD - fee_wad);
     let q = math_mul_div_floor(clean_in_raw - U256::one(), U256::from(WAD), denom)?;
-    Ok(q + U256::one())
+    let gross = q + U256::one();
+    Ok(if gross == clean_in_raw && fee_wad != 0 {
+        gross + U256::one()
+    } else {
+        gross
+    })
 }
 
 /// Lift `(reserve0, reserve1)` into math-space `(xMath, yMath)` via the
@@ -1274,7 +1449,7 @@ fn compute_exact_in_amount_out(
     state: &EquilibraStatefulState,
     zero_for_one: bool,
     clean_amount_in_raw: u128,
-) -> Result<u128> {
+) -> Result<(u128, u32, U256)> {
     let (in_scale, out_scale) = if zero_for_one {
         (config.token0_scale, config.token1_scale)
     } else {
@@ -1311,27 +1486,35 @@ fn compute_exact_in_amount_out(
         return Err(anyhow!("equilibra_stateful: amountInMath zero"));
     }
 
-    let amount_out_wad = if zero_for_one {
+    let (out_delta_math, iters, depth_before) = if zero_for_one {
         // Deposit on yMath; output on xMath.
-        let (out_delta_math, _) =
-            quote_exact_in_forward(y_math, x_math, amount_in_math, a_u, lambda_u)?;
-        if out_delta_math >= x_math {
-            return Err(anyhow!("equilibra_stateful: insufficient liquidity"));
-        }
+        equilibra_math::quote_exact_in_forward_with_depth(
+            y_math,
+            x_math,
+            amount_in_math,
+            a_u,
+            lambda_u,
+        )?
+    } else {
+        equilibra_math::quote_exact_in_forward_with_depth(
+            x_math,
+            y_math,
+            amount_in_math,
+            a_u,
+            lambda_u,
+        )?
+    };
+    // The kernel leaves a positive counterpart; native settlement checks the raw bound.
+    let amount_out_wad = if zero_for_one {
         // xMath output → token1 (base) wad: identity
         out_delta_math
     } else {
-        let (out_delta_math, _) =
-            quote_exact_in_forward(x_math, y_math, amount_in_math, a_u, lambda_u)?;
-        if out_delta_math >= y_math {
-            return Err(anyhow!("equilibra_stateful: insufficient liquidity"));
-        }
         // yMath output → token0 (quote) wad: wad = math · priceScale / WAD (floor, pool-favourable)
         mul_wad(out_delta_math, price_scale)?
     };
 
     let raw = amount_out_wad / out_scale;
-    to_u128(raw, "amountOutRaw")
+    Ok((to_u128(raw, "amountOutRaw")?, iters, depth_before))
 }
 
 fn compute_exact_out_clean_in_wad(
@@ -1339,7 +1522,7 @@ fn compute_exact_out_clean_in_wad(
     state: &EquilibraStatefulState,
     zero_for_one: bool,
     amount_out_wad: U256,
-) -> Result<(U256, u32)> {
+) -> Result<(U256, u32, U256)> {
     let (x_math, y_math) = load_math_state(
         config,
         state.reserve0,
@@ -1365,17 +1548,29 @@ fn compute_exact_out_clean_in_wad(
         return Err(anyhow!("equilibra_stateful: amountOutMath zero"));
     }
 
-    let (in_delta_math, iters) = if zero_for_one {
+    let (in_delta_math, iters, depth_before) = if zero_for_one {
         // Output side is xMath; input goes to yMath.
         if amount_out_math >= x_math {
             return Err(anyhow!("equilibra_stateful: insufficient liquidity"));
         }
-        quote_exact_out_forward(y_math, x_math, amount_out_math, a_u, lambda_u)?
+        equilibra_math::quote_exact_out_forward_with_depth(
+            y_math,
+            x_math,
+            amount_out_math,
+            a_u,
+            lambda_u,
+        )?
     } else {
         if amount_out_math >= y_math {
             return Err(anyhow!("equilibra_stateful: insufficient liquidity"));
         }
-        quote_exact_out_forward(x_math, y_math, amount_out_math, a_u, lambda_u)?
+        equilibra_math::quote_exact_out_forward_with_depth(
+            x_math,
+            y_math,
+            amount_out_math,
+            a_u,
+            lambda_u,
+        )?
     };
 
     // Lift math input back to wad (ceil for pool-favourable rounding).
@@ -1386,7 +1581,7 @@ fn compute_exact_out_clean_in_wad(
         // xMath input → token1 (base) wad: identity
         in_delta_math
     };
-    Ok((clean_in_wad, iters))
+    Ok((clean_in_wad, iters, depth_before))
 }
 
 /// EMA update — mirrors `_updateEma` + `PoolOracle.updateEma`.
@@ -1421,68 +1616,24 @@ fn update_ema_in_place(
         return Ok(());
     }
 
-    // Bootstrap path mirrors the on-chain `PoolOracle.updateEma`:
-    // when `ema_price_wad == 0` the seed is the *uncapped* spot. At
-    // genesis the pool is near-balanced, so `pMarg ≈ WAD` and
-    // `spot ≈ priceScale` — always fits the u128 slot.
-    if state.ema_price_wad == 0 {
-        state.ema_price_wad = to_u128(spot_raw_u, "spotRaw")?;
+    // Timestamp, not logarithm zero, identifies an uninitialized EMA.
+    if state.last_ema_ts == 0 {
+        state.ema_log_wad = equilibra_math::price_to_ema_log(spot_raw_u)?;
         state.last_ema_ts = now_ts;
         return Ok(());
     }
-
     let elapsed = (now_ts - state.last_ema_ts) as u128;
     let alpha_wad = ema_alpha_factor(elapsed, config.ema_period)?;
-
-    // Non-bootstrap path: apply the symmetric `[priceScale/MUL,
-    // priceScale*MUL]` cap **in U256**, *before* narrowing to u128.
-    // On chain this clamp runs in uint256, so `spotRaw` itself can
-    // exceed any narrower slot before being compressed. The capped
-    // value is guaranteed to fit in u128 because
-    // `priceScale * EMA_PRICE_CAP_MUL` does (checked below). This
-    // is what makes the EMA write bit-exact with the contract even
-    // at extreme depletion, where the raw `pMarg · priceScale / WAD`
-    // explodes past `u128::MAX` but the contract would still record
-    // a value inside `[priceScale/2, priceScale*2]`.
-    let price_scale = state.price_scale_wad;
-    // priceScale × EMA_PRICE_CAP_MUL may overflow u128 once priceScale
-    // exceeds u128::MAX / MUL (i.e., the on-chain uint256 anchor has
-    // grown past the simulator's u128 slot). Saturating to u128::MAX is
-    // NOT a silent divergence from the contract: the spot being clamped
-    // always fits u128 itself, so `min(spot, saturated_cap)` selects the
-    // same value the on-chain uint256 `min(spot, ps × MUL)` would — the
-    // cap only matters when it is BELOW the spot, and a saturated cap
-    // never is. Result parity holds bit-for-bit; no logging is needed.
-    let max_spot_u128 = price_scale
-        .checked_mul(EMA_PRICE_CAP_MUL)
-        .unwrap_or(u128::MAX);
-    let min_spot_u128 = price_scale / EMA_PRICE_CAP_DIV;
-    let max_spot_u = U256::from(max_spot_u128);
-    let min_spot_u = U256::from(min_spot_u128);
-    let capped_spot_u = if spot_raw_u > max_spot_u {
-        max_spot_u
-    } else if spot_raw_u < min_spot_u {
-        min_spot_u
-    } else {
-        spot_raw_u
-    };
-    let capped_spot = to_u128(capped_spot_u, "cappedSpot")?;
-
-    // Geometric (log-domain) EMA: `ema' = ema · exp((1−α)·ln(spot/ema))`.
-    // The geometric mean is reciprocal-invariant, so the oracle behaves
-    // identically whichever pair side the price is quoted in (an
-    // arithmetic mix carries a Jensen-gap bias in one orientation that
-    // systematically distorts the repeg target). `spot == ema` is an
-    // EXACT fixed point. The on-chain `PoolOracle.updateEma` runs the
-    // same op order (`geometric_ema_step` is op-for-op with Solady's
-    // `lnWad` / `expWad`), and `test/simparity/` pins the two
-    // implementations bit-for-bit.
-    let raw_new = equilibra_math::geometric_ema_step(
-        U256::from(state.ema_price_wad),
-        U256::from(capped_spot),
+    // The Solidity cap is uint256; do not narrow an intermediate capped spot.
+    let price_scale = U256::from(state.price_scale_wad);
+    let capped_spot = spot_raw_u
+        .min(price_scale * U256::from(EMA_PRICE_CAP_MUL))
+        .max(price_scale / U256::from(EMA_PRICE_CAP_DIV));
+    state.ema_log_wad = equilibra_math::geometric_ema_log_step(
+        state.ema_log_wad,
+        capped_spot,
         U256::from(alpha_wad),
     )?;
-    state.ema_price_wad = to_u128(raw_new, "newEma")?;
     state.last_ema_ts = now_ts;
     Ok(())
 }
@@ -1585,8 +1736,8 @@ struct AccrueResult {
 }
 
 fn accrue_lp_value_growth(
-    config: &EquilibraStatefulConfig,
     state: &mut EquilibraStatefulState,
+    checked_depth: U256,
 ) -> Result<AccrueResult> {
     if state.total_supply == 0 || state.price_scale_wad == 0 {
         return Ok(AccrueResult {
@@ -1594,12 +1745,13 @@ fn accrue_lp_value_growth(
             delta_wad: 0,
         });
     }
-    let live = compute_pool_lp_unit_value(
-        config,
-        state.reserve0,
-        state.reserve1,
-        state.price_scale_wad,
-        state.total_supply,
+    let live = to_u128(
+        math_compute_lp_unit_value_wad(
+            checked_depth,
+            state.price_scale_wad.into(),
+            state.total_supply.into(),
+        )?,
+        "lpUnitValueWad",
     )?;
     if live == 0 {
         return Ok(AccrueResult {
@@ -1752,18 +1904,9 @@ fn try_auto_repeg(
             0,
         ));
     }
-    if state_in.ema_price_wad == 0 {
-        return Ok(blocked(
-            EquilibraRecenterGateBlocked::EmaZero,
-            0,
-            vp_before,
-            0,
-            price_scale_old,
-            0,
-        ));
-    }
+    let ema_price_wad = state_in.ema_price_wad()?;
 
-    let deviation_wad = compute_relative_deviation_wad(state_in.ema_price_wad, price_scale_old)?;
+    let deviation_wad = compute_relative_deviation_wad(ema_price_wad, price_scale_old)?;
     let dev_bps_u = to_u128(
         math_mul_div_floor(U256::from(deviation_wad), U256::from(BPS), U256::from(WAD))?,
         "emaDeviationBps",
@@ -1778,7 +1921,7 @@ fn try_auto_repeg(
     // token1-UP move (token1's price in token0 above the anchor).
     // Layout note: under the mainnet base-in-slot-0 layout a rising
     // base market registers as token1-DOWN.
-    let active_threshold_wad = if state_in.ema_price_wad > price_scale_old {
+    let active_threshold_wad = if ema_price_wad > price_scale_old {
         config.repeg_threshold_token1_up_wad
     } else {
         config.repeg_threshold_token1_down_wad
@@ -1845,7 +1988,7 @@ fn try_auto_repeg(
         if applied.is_zero() {
             break;
         }
-        let candidate = apply_log_step(price_scale_old, state_in.ema_price_wad, applied)?;
+        let candidate = apply_log_step(price_scale_old, ema_price_wad, applied)?;
         if candidate == price_scale_old {
             // Dust move — smaller halvings can only stay dust. Break
             // even at rung 0: Solidity consults the parachute on EVERY
@@ -1976,7 +2119,7 @@ fn try_donation_parachute(
     }
 
     let applied = applied_repeg_step(config.repeg_step_wad, deviation_wad, REPEG_DAMPING_DIVISOR)?;
-    let candidate = apply_log_step(price_scale_old, state_in.ema_price_wad, applied)?;
+    let candidate = apply_log_step(price_scale_old, state_in.ema_price_wad()?, applied)?;
     if candidate == price_scale_old {
         return Ok(blocked(
             EquilibraRecenterGateBlocked::DonationParachuteInsufficient,
@@ -2128,6 +2271,962 @@ pub use super::equilibra_math::{
     from_math_space_up as math_from_math_space_up, marginal_price as math_marginal_price,
     mul_div_ceil as math_mul_div_ceil,
 };
+
+#[cfg(test)]
+mod checked_swap_tests {
+    use super::super::equilibra_math::quote_exact_out_forward;
+    use super::*;
+
+    fn config(decimals0: u8, decimals1: u8, protocol: u128, ramp: u128) -> EquilibraStatefulConfig {
+        config_at_alpha(
+            decimals0,
+            decimals1,
+            protocol,
+            ramp,
+            990_000_000_000_000_000,
+        )
+    }
+
+    fn config_at_alpha(
+        decimals0: u8,
+        decimals1: u8,
+        protocol: u128,
+        ramp: u128,
+        alpha: u128,
+    ) -> EquilibraStatefulConfig {
+        EquilibraStatefulConfig::new(
+            "token0",
+            "token1",
+            decimals0,
+            decimals1,
+            10,
+            alpha,
+            1_000_000_000_000_000, // Original lambda of the native settlement vectors.
+            protocol,
+            600,
+            500_000_000_000_000,
+            100_000_000_000_000,
+            100_000_000_000_000,
+            ramp,
+            1,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn simulation_genesis_has_no_public_price_interval() {
+        let cfg = config_at_alpha(18, 18, 0, 0, WAD / 10);
+        for price in [999_999u128, 1_000_000, 10u128.pow(30), 10u128.pow(30) + 1] {
+            let genesis = init_genesis(&cfg, price * 1_000_000, 10u128.pow(24), 1).unwrap();
+            assert_eq!(genesis.price_scale_wad, price);
+        }
+    }
+
+    #[test]
+    fn constructor_accepts_lambda_endpoints_and_rejects_adjacent_values() {
+        for alpha in [A_MIN_WAD, A_MAX_WAD] {
+            for lambda in [
+                LAMBDA_MIN_WAD - 1,
+                LAMBDA_MIN_WAD,
+                LAMBDA_MAX_WAD,
+                LAMBDA_MAX_WAD + 1,
+            ] {
+                let result = EquilibraStatefulConfig::new(
+                    "token0",
+                    "token1",
+                    18,
+                    18,
+                    10,
+                    alpha,
+                    lambda,
+                    0,
+                    600,
+                    500_000_000_000_000,
+                    100_000_000_000_000,
+                    100_000_000_000_000,
+                    0,
+                    1,
+                    0,
+                );
+                if (LAMBDA_MIN_WAD..=LAMBDA_MAX_WAD).contains(&lambda) {
+                    let cfg = result.unwrap();
+                    for token in ["token0", "token1"] {
+                        let quote = quote_exact_in_stateful(&cfg, &state(18, 18), token, 100 * WAD)
+                            .unwrap();
+                        assert!(quote.amount_out_raw > 0);
+                    }
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("lambda_wad"));
+                }
+            }
+        }
+    }
+
+    fn state(decimals0: u8, decimals1: u8) -> EquilibraStatefulState {
+        let reserve0 = 500_000 * 10u128.pow(decimals0.into());
+        let reserve1 = 500_000 * 10u128.pow(decimals1.into());
+        EquilibraStatefulState {
+            reserve0,
+            reserve1,
+            price_scale_wad: WAD,
+            total_supply: 500_000 * WAD,
+            e0: reserve0,
+            e1: reserve1,
+            ema_log_wad: 0,
+            lp_unit_value_genesis_wad: 2 * WAD,
+            lp_unit_value_wad: 2 * WAD,
+            ..EquilibraStatefulState::empty()
+        }
+    }
+
+    fn depth(config: &EquilibraStatefulConfig, r0: u128, r1: u128) -> U256 {
+        let (x, y) = load_math_state(config, r0, r1, WAD).unwrap();
+        solve_l_from_state(x, y, config.a_wad.into(), config.lambda_wad.into()).unwrap()
+    }
+
+    #[test]
+    fn deposit_ratio_probe_keeps_wide_quotient_until_limiting_side_is_known() {
+        let cfg = config_at_alpha(18, 18, 0, 0, WAD / 10);
+        for ratio in [1u128, 2] {
+            let genesis = init_genesis(&cfg, WAD, ratio * WAD, 1).unwrap();
+            let st = EquilibraStatefulState {
+                reserve0: genesis.reserve0,
+                reserve1: genesis.reserve1,
+                price_scale_wad: genesis.price_scale_wad,
+                total_supply: genesis.total_supply,
+                ema_log_wad: genesis.ema_log_wad,
+                e0: genesis.reserve0,
+                e1: genesis.reserve1,
+                lp_unit_value_genesis_wad: genesis.lp_unit_value_genesis_wad,
+                lp_unit_value_wad: genesis.lp_unit_value_genesis_wad,
+                ..EquilibraStatefulState::empty()
+            };
+            let desired1 = WAD / 100;
+            let used0 = desired1 / ratio;
+            let reference = add_liquidity_proportional(&st, used0, desired1, &cfg).unwrap();
+            let actual = add_liquidity_proportional(&st, u128::MAX, desired1, &cfg).unwrap();
+            assert_eq!(actual, reference);
+            assert_eq!((actual.0, actual.1), (used0, desired1));
+            assert_eq!(actual.2, used0 * genesis.total_supply / WAD);
+            let probe =
+                math_mul_div_floor(u128::MAX.into(), st.reserve1.into(), st.reserve0.into())
+                    .unwrap();
+            assert_eq!(probe > U256::from(u128::MAX), ratio > 1);
+            assert!(add_liquidity_proportional(&st, u128::MAX, u128::MAX, &cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn deposit_rounding_funds_both_assets_without_exceeding_either_maximum() {
+        let cfg = config_at_alpha(0, 0, 0, 0, WAD / 10);
+        for (r0, r1, desired0, desired1, used0, used1) in [
+            (3, 5, 1, 2, 1, 2),
+            (3, 5, 2, 3, 1, 3),
+            (5, 3, 2, 2, 2, 2),
+            (5, 3, 3, 1, 1, 1),
+            (3, 5, 3, 5, 3, 5),
+        ] {
+            let genesis = init_genesis(&cfg, r0, r1, 1).unwrap();
+            for parked in [0, genesis.total_supply / 3] {
+                let st = EquilibraStatefulState {
+                    reserve0: r0,
+                    reserve1: r1,
+                    total_supply: genesis.total_supply,
+                    price_scale_wad: genesis.price_scale_wad,
+                    donation_shares: parked,
+                    ..EquilibraStatefulState::empty()
+                };
+                let active = st.total_supply - parked;
+                let result = add_liquidity_proportional(&st, desired0, desired1, &cfg).unwrap();
+                let shares = used0 * active / r0;
+                let buffer_top_up = shares * parked / active;
+                assert_eq!((result.0, result.1, result.2), (used0, used1, shares));
+                assert_eq!((result.3, result.4), (r0 + used0, r1 + used1));
+                assert_eq!(result.5, st.total_supply + shares + buffer_top_up);
+                assert_eq!(result.7, parked + buffer_top_up);
+                assert!(result.6 > 0);
+                assert!(used0 <= desired0 && used1 <= desired1);
+                assert!(shares * r0 <= used0 * active);
+                assert!(shares * r1 <= used1 * active);
+                if (r0, r1) == (3, 5) {
+                    let err = add_liquidity_proportional(&st, 1, 1, &cfg).unwrap_err();
+                    assert!(err.to_string().contains("too small after normalisation"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_diagonal_genesis_is_rejected_before_any_swap() {
+        let cfg = config_at_alpha(6, 6, 0, 0, 990_000_000_000_000_000);
+        let err = init_genesis(&cfg, 10u128.pow(21), 10u128.pow(28), 1).unwrap_err();
+        assert!(err.to_string().contains("invariant product overflow"));
+    }
+
+    #[test]
+    fn repeg_numeric_failure_propagates_instead_of_returning_a_completed_swap() {
+        // Same synthetic boundary as NumericDomainRegression.test.ts.
+        let mut cfg = config_at_alpha(6, 6, 0, 0, 990_000_000_000_000_000);
+        cfg.fee_bps = 5;
+        cfg.repeg_share_bps = 5000;
+        cfg.repeg_step_wad = WAD / 200;
+        let q = U256::one() << 128;
+        let scale = U256::exp10(12);
+        let mut st = state(6, 6);
+        st.reserve0 = to_u128((q * 3 / 2 - U256::exp10(33)) / scale, "r0").unwrap();
+        st.reserve1 = to_u128(q / 2 / scale, "r1").unwrap();
+        st.ema_log_wad = equilibra_math::price_to_ema_log(U256::from(WAD / 2)).unwrap();
+        st.last_ema_ts = 1000;
+        let input = 1_000_000;
+        let quote = quote_exact_in_stateful(&cfg, &st, "token1", input).unwrap();
+        assert!(quote.amount_out_raw > 0);
+        let without_repeg = swap_stateful(&cfg, st, "token1", input, 1000, true).unwrap();
+        assert_eq!(without_repeg.amount_out, quote.amount_out_raw);
+        let err = swap_stateful(&cfg, st, "token1", input, 1000, false).unwrap_err();
+        assert!(
+            err.to_string().contains("invariant distance overflow"),
+            "{err}"
+        );
+        assert_eq!(st.price_scale_wad, WAD); // execution consumes a copy; no partial state escapes
+    }
+
+    #[test]
+    fn minimum_raw_fee_preserves_nonzero_floors_and_native_settlement() {
+        for decimals in [0u8, 1, 2, 6, 8, 18] {
+            for ramp in [0, 10_000] {
+                let mut cfg = config(decimals, decimals, 25, ramp);
+                cfg.fee_bps = 5;
+                let st = state(decimals, decimals);
+                for zfo in [false, true] {
+                    let token = if zfo { "token0" } else { "token1" };
+                    for input in [1000u128, 1999, 2000, 3000, 3999, 4000, 100_000] {
+                        let rate = resolve_dynamic_fee_wad_from_cp(&cfg, &st, zfo, input).unwrap();
+                        assert!(rate > 0);
+                        let fee = (input * rate / WAD).max(1);
+                        if ramp == 0 {
+                            assert_eq!(fee, (input * 5 / BPS).max(1));
+                        }
+                        let expected = compute_exact_in_amount_out(&cfg, &st, zfo, input - fee)
+                            .unwrap()
+                            .0;
+                        let quote = quote_exact_in_stateful(&cfg, &st, token, input).unwrap();
+                        let swap = swap_stateful(&cfg, st, token, input, 0, true).unwrap();
+                        assert_eq!(quote.fee_amount_raw, fee);
+                        assert_eq!(swap.fee_amount_raw, fee);
+                        assert_eq!(quote.amount_out_raw, expected);
+                        assert_eq!(swap.amount_out, expected);
+                        assert_eq!(quote.protocol_cut_raw, fee * 25 / 100);
+                        assert_eq!(swap.protocol_cut_raw, quote.protocol_cut_raw);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_out_margin_boundary_matches_swap_before_solver_execution() {
+        let cfg = config(18, 18, 0, 0);
+        let st = state(18, 18);
+        for (token, reserve) in [("token0", st.reserve1), ("token1", st.reserve0)] {
+            let requested = reserve - reserve / 100_000_000;
+            assert!(requested < reserve);
+            let quote = quote_exact_out_stateful(&cfg, &st, token, requested).unwrap_err();
+            let swap = swap_stateful_exact_out(&cfg, st, token, requested, 0, true).unwrap_err();
+            assert_eq!(
+                quote.to_string(),
+                "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity)"
+            );
+            assert_eq!(swap.to_string(), quote.to_string());
+        }
+    }
+
+    #[test]
+    fn minimum_fee_cannot_consume_the_entire_exact_input() {
+        for decimals in [0u8, 1, 2, 6, 8, 18] {
+            let cfg = config(decimals, decimals, 0, 0);
+            let st = state(decimals, decimals);
+            for token in ["token0", "token1"] {
+                let quote = quote_exact_in_stateful(&cfg, &st, token, 1).unwrap_err();
+                let swap = swap_stateful(&cfg, st, token, 1, 0, true).unwrap_err();
+                assert_eq!(
+                    quote.to_string(),
+                    "equilibra_stateful: amount_too_small_after_normalization"
+                );
+                assert_eq!(swap.to_string(), quote.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn stateful_fee_floor_u16_boundary_is_enforced() {
+        let flat = EquilibraStatefulConfig::new(
+            "token0",
+            "token1",
+            18,
+            18,
+            MIN_BASE_FEE_BPS,
+            990_000_000_000_000_000,
+            1_000_000_000_000_000,
+            25,
+            600,
+            500_000_000_000_000,
+            100_000_000_000_000,
+            100_000_000_000_000,
+            0,
+            MAX_FEE_FLOOR_BPS,
+            0,
+        );
+        assert!(
+            flat.is_ok(),
+            "flat 1 bps fee accepts the uint16 floor boundary"
+        );
+
+        let oversized = EquilibraStatefulConfig::new(
+            "token0",
+            "token1",
+            18,
+            18,
+            MIN_BASE_FEE_BPS,
+            990_000_000_000_000_000,
+            1_000_000_000_000_000,
+            25,
+            600,
+            500_000_000_000_000,
+            100_000_000_000_000,
+            100_000_000_000_000,
+            0,
+            MAX_FEE_FLOOR_BPS + 1,
+            0,
+        )
+        .unwrap_err();
+        assert!(oversized
+            .to_string()
+            .contains("fee_floor_bps 65536 > MAX_FEE_FLOOR_BPS (65535)"));
+    }
+
+    #[test]
+    fn live_dynamic_rate_rejects_a_zero_floor() {
+        let err = EquilibraStatefulConfig::new(
+            "token0",
+            "token1",
+            18,
+            18,
+            10,
+            990_000_000_000_000_000,
+            1_000_000_000_000_000,
+            25,
+            600,
+            500_000_000_000_000,
+            100_000_000_000_000,
+            100_000_000_000_000,
+            10_000,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("live fee ramp requires 1 <= fee_floor_bps < fee_bps"));
+    }
+
+    #[test]
+    fn live_dynamic_rate_rejects_a_floor_equal_to_its_ceiling() {
+        let err = EquilibraStatefulConfig::new(
+            "token0",
+            "token1",
+            18,
+            18,
+            2,
+            990_000_000_000_000_000,
+            1_000_000_000_000_000,
+            25,
+            600,
+            500_000_000_000_000,
+            100_000_000_000_000,
+            100_000_000_000_000,
+            10_000,
+            2,
+            0,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("live fee ramp requires 1 <= fee_floor_bps < fee_bps"));
+    }
+
+    #[test]
+    fn exact_out_minimum_fee_is_separate_from_the_existing_input_bump() {
+        for rate in [0u128, 1, 5 * FEE_BPS_TO_WAD, 2000 * FEE_BPS_TO_WAD] {
+            for clean in [1u128, 2, 999, 1000, 1999, 2000, 2999, 3000, 10_000] {
+                let floor_inverse = (clean - 1) * WAD / (WAD - rate) + 1;
+                let expected = if rate == 0 {
+                    floor_inverse
+                } else {
+                    floor_inverse.max(clean + 1)
+                };
+                let gross = gross_up_exact_out(clean.into(), rate).unwrap().as_u128();
+                assert_eq!(gross, expected);
+                let fee_at = |amount: u128| {
+                    let fee = amount * rate / WAD;
+                    if rate == 0 {
+                        fee
+                    } else {
+                        fee.max(1)
+                    }
+                };
+                assert!(gross - fee_at(gross) >= clean);
+                if gross > 1 {
+                    assert!(gross - 1 - fee_at(gross - 1) < clean);
+                }
+            }
+        }
+        let mut cfg = config(18, 18, 0, 0);
+        cfg.fee_bps = 5;
+        let st = state(18, 18);
+        for zfo in [false, true] {
+            for clean in [1u128, 999, 1999, 2000, 3000, 4000] {
+                let (input, fee, rate) = resolve_exact_out_fee(&cfg, &st, zfo, clean).unwrap();
+                let floor_inverse = (clean - 1) * BPS / (BPS - 5) + 1;
+                assert_eq!(rate, 5 * FEE_BPS_TO_WAD);
+                assert_eq!(input, floor_inverse.max(clean + 1) + 1);
+                assert_eq!(fee, input - clean);
+                assert!(fee >= 2, "minimum fee plus the unchanged safety bump");
+            }
+        }
+    }
+
+    #[test]
+    fn raised_alpha_quotes_preserve_lp_depth_and_native_parity() {
+        let mut checked = 0;
+        let mut max_iters = 0;
+        for alpha in [
+            999_750_062_484_378_906u128,
+            999_950_002_499_875_007,
+            A_MAX_WAD,
+        ] {
+            for (d0, d1) in [(18u8, 18u8), (6, 6), (8, 6)] {
+                let cfg = config_at_alpha(d0, d1, 5, 10_000, alpha);
+                for (num, den) in [(1u128, 10u128), (1, 2), (1, 1), (2, 1), (10, 1)] {
+                    let mut state = state(d0, d1);
+                    state.reserve0 = state.reserve0 * num / den;
+                    state.e0 = state.reserve0;
+                    let pre_depth = depth(&cfg, state.reserve0, state.reserve1);
+                    for zero_for_one in [true, false] {
+                        let token = if zero_for_one { "token0" } else { "token1" };
+                        let (reserve_in, reserve_out) = if zero_for_one {
+                            (state.reserve0, state.reserve1)
+                        } else {
+                            (state.reserve1, state.reserve0)
+                        };
+                        for percent in [1u128, 10, 99] {
+                            let amount = reserve_in * percent / 100;
+                            let quote =
+                                quote_exact_in_stateful(&cfg, &state, token, amount).unwrap();
+                            let swap = swap_stateful(&cfg, state, token, amount, 0, true).unwrap();
+                            assert_eq!(quote.amount_out_raw, swap.amount_out);
+                            assert_eq!(quote.fee_amount_raw, swap.fee_amount_raw);
+                            assert!(depth(&cfg, swap.reserve0, swap.reserve1) >= pre_depth);
+                            max_iters = max_iters.max(quote.iters);
+                            checked += 1;
+
+                            let amount = reserve_out * percent / 100;
+                            let quote =
+                                quote_exact_out_stateful(&cfg, &state, token, amount).unwrap();
+                            let swap = swap_stateful_exact_out(&cfg, state, token, amount, 0, true)
+                                .unwrap();
+                            assert_eq!(quote.amount_in_raw, swap.amount_in);
+                            assert_eq!(quote.fee_amount_raw, swap.state.fee_amount_raw);
+                            assert!(
+                                depth(&cfg, swap.state.reserve0, swap.state.reserve1) >= pre_depth
+                            );
+                            max_iters = max_iters.max(quote.iters);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 540);
+        assert!(
+            max_iters > 0 && max_iters <= 40,
+            "every native quote must stay within the hard cap"
+        );
+    }
+
+    #[test]
+    fn raised_alpha_one_wei_exact_out_quote_matches_settlement() {
+        for alpha in [
+            999_750_062_484_378_906u128,
+            999_950_002_499_875_007,
+            A_MAX_WAD,
+        ] {
+            let cfg = config_at_alpha(18, 18, 5, 10_000, alpha);
+            let mut state = state(18, 18);
+            state.reserve0 *= 20;
+            state.e0 = state.reserve0;
+            let before = format!("{state:?}");
+            let quote = quote_exact_out_stateful(&cfg, &state, "token1", 1).unwrap();
+            let swap = swap_stateful_exact_out(&cfg, state, "token1", 1, 0, true).unwrap();
+            assert_eq!(quote.amount_in_raw, 3);
+            assert_eq!(swap.amount_in, quote.amount_in_raw);
+            assert_eq!(swap.state.amount_out, 1);
+            assert!(
+                depth(&cfg, swap.state.reserve0, swap.state.reserve1)
+                    >= depth(&cfg, state.reserve0, state.reserve1)
+            );
+            assert_eq!(format!("{state:?}"), before);
+        }
+    }
+
+    #[test]
+    fn quotes_match_swaps_with_native_rounding_and_protocol_cuts() {
+        for (d0, d1) in [(18, 18), (6, 18), (8, 6)] {
+            for protocol in [0, 5, 25] {
+                for ramp in [0, 10_000] {
+                    let cfg = config(d0, d1, protocol, ramp);
+                    let state = state(d0, d1);
+                    let pre_depth = depth(&cfg, state.reserve0, state.reserve1);
+                    for token0_in in [false, true] {
+                        let token = if token0_in { "token0" } else { "token1" };
+                        let in_decimals = if token0_in { d0 } else { d1 };
+                        let out_decimals = if token0_in { d1 } else { d0 };
+                        let input = 100 * 10u128.pow(in_decimals.into());
+                        let quote = quote_exact_in_stateful(&cfg, &state, token, input).unwrap();
+                        let swap = swap_stateful(&cfg, state, token, input, 60, true).unwrap();
+                        assert_eq!(quote.amount_out_raw, swap.amount_out);
+                        assert_eq!(quote.fee_amount_raw, swap.fee_amount_raw);
+                        assert_eq!(quote.protocol_cut_raw, swap.protocol_cut_raw);
+                        assert!(depth(&cfg, swap.reserve0, swap.reserve1) >= pre_depth);
+
+                        let output = 100 * 10u128.pow(out_decimals.into());
+                        let quote = quote_exact_out_stateful(&cfg, &state, token, output).unwrap();
+                        let swap =
+                            swap_stateful_exact_out(&cfg, state, token, output, 60, true).unwrap();
+                        assert_eq!(quote.amount_in_raw, swap.amount_in);
+                        assert_eq!(quote.fee_amount_raw, swap.state.fee_amount_raw);
+                        assert!(depth(&cfg, swap.state.reserve0, swap.state.reserve1) >= pre_depth);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_depth_strictly_rejects_lp_value_decrease() {
+        let cfg = config(18, 18, 25, 0);
+        let state = state(18, 18);
+        let pre_depth = depth(&cfg, state.reserve0, state.reserve1);
+        // Deliberately unfavorable native settlement must fail the strict guard.
+        let error = checked_post_swap(&cfg, &state, false, WAD, 2 * WAD, 0, pre_depth)
+            .err()
+            .expect("decreasing LP depth must reject");
+        assert!(error.to_string().contains("LpValueDecreased"));
+    }
+
+    #[test]
+    fn common_margin_and_strict_guard_match_shared_solidity_witnesses() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Witness {
+            a_wad: String,
+            lambda_wad: String,
+            reserve_in: String,
+            reserve_out: String,
+            amount: String,
+            raw: String,
+            expected: String,
+            exact_out: bool,
+            error: Option<String>,
+        }
+        let cases: std::collections::BTreeMap<String, Witness> = serde_json::from_str(
+            include_str!("../../tests/fixtures/equilibra-lp-repair.json"),
+        )
+        .unwrap();
+        assert_eq!(cases.len(), 7);
+        for (name, w) in cases {
+            let parse = |v: &str| v.parse::<u128>().unwrap();
+            let mut cfg = config_at_alpha(18, 18, 25, 0, parse(&w.a_wad));
+            cfg.fee_bps = 5;
+            cfg.fee_floor_bps = 0;
+            cfg.lambda_wad = parse(&w.lambda_wad);
+            for zfo in [true, false] {
+                let mut st = state(18, 18);
+                let (rin, rout, amount, raw) = (
+                    parse(&w.reserve_in),
+                    parse(&w.reserve_out),
+                    parse(&w.amount),
+                    parse(&w.raw),
+                );
+                (st.reserve0, st.reserve1) = if zfo { (rin, rout) } else { (rout, rin) };
+                st.e0 = st.reserve0;
+                st.e1 = st.reserve1;
+                let before = st;
+                let token = if zfo { "token0" } else { "token1" };
+                let actual_raw = if w.exact_out {
+                    compute_exact_out_clean_in_wad(&cfg, &st, zfo, amount.into())
+                        .unwrap()
+                        .0
+                        .as_u128()
+                } else {
+                    compute_exact_in_amount_out(&cfg, &st, zfo, amount - 1)
+                        .unwrap()
+                        .0
+                };
+                assert_eq!(actual_raw, raw, "{name}");
+                let pre = depth(&cfg, st.reserve0, st.reserve1);
+                let initial = if w.exact_out {
+                    (((raw - 1) * 10000 / 9995 + 1).max(raw + 1)) + 1
+                } else {
+                    amount
+                };
+                let fee = if w.exact_out { initial - raw } else { 1 };
+                let initial_post = post_swap_state(
+                    &cfg,
+                    &st,
+                    zfo,
+                    initial,
+                    if w.exact_out { amount } else { raw },
+                    fee * 25 / 100,
+                )
+                .unwrap();
+                assert_eq!(
+                    initial_post.depth < pre,
+                    w.error.as_deref() == Some("LpValueDecreased"),
+                    "{name}: one strict guard"
+                );
+                let quote = if w.exact_out {
+                    quote_exact_out_stateful(&cfg, &st, token, amount).map(|q| q.amount_in_raw)
+                } else {
+                    quote_exact_in_stateful(&cfg, &st, token, amount).map(|q| q.amount_out_raw)
+                };
+                let swap = if w.exact_out {
+                    swap_stateful_exact_out(&cfg, st, token, amount, 0, true)
+                        .map(|s| (s.amount_in, s.state.reserve0, s.state.reserve1))
+                } else {
+                    swap_stateful(&cfg, st, token, amount, 0, true)
+                        .map(|s| (s.amount_out, s.reserve0, s.reserve1))
+                };
+                if let Some(error) = &w.error {
+                    let leaf = if error == "AmountTooSmallAfterNormalization" {
+                        "amount_too_small_after_normalization"
+                    } else {
+                        error.as_str()
+                    };
+                    assert_eq!(
+                        quote.unwrap_err().to_string(),
+                        format!("equilibra_stateful: {leaf}"),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        swap.unwrap_err().to_string(),
+                        format!("equilibra_stateful: {leaf}"),
+                        "{name}"
+                    );
+                } else {
+                    let expected = parse(&w.expected);
+                    assert_eq!(quote.unwrap(), expected, "{name}");
+                    let (actual, r0, r1) = swap.unwrap();
+                    assert_eq!(actual, expected, "{name}");
+                    assert!(depth(&cfg, r0, r1) >= pre, "{name}");
+                }
+                assert_eq!(st, before);
+            }
+        }
+    }
+
+    #[test]
+    fn native_boundary_quotes_and_reserves_match_solidity() {
+        // Shared with NativeBoundaryVectors.test.ts: token0 has
+        // 8 decimals, token1 has 6. Each trade restores these fixed native
+        // pre-reserves; includes raw-unit and 99%-reserve amounts both ways.
+        let cfg = config(8, 6, 5, 10_000);
+        let genesis = init_genesis(&cfg, 100_000_000_000_000, 500_000_000_000, 0).unwrap();
+        assert_eq!(genesis.price_scale_wad, 2 * WAD);
+        assert_eq!(cfg.token0_scale, U256::from(10_000_000_000u64));
+        assert_eq!(cfg.token1_scale, U256::from(1_000_000_000_000u64));
+        let cases: Vec<(bool, bool, bool, String, String, String, String)> = serde_json::from_str(
+            include_str!("../../tests/fixtures/equilibra-native-quotes.json"),
+        )
+        .expect("shared Solidity/Rust native vectors");
+        for (skew, zero_for_one, exact_out, amount, expected_quote, expected_r0, expected_r1) in
+            cases
+        {
+            let amount: u128 = amount.parse().unwrap();
+            let expected_quote: u128 = expected_quote.parse().unwrap();
+            let expected_r0: u128 = expected_r0.parse().unwrap();
+            let expected_r1: u128 = expected_r1.parse().unwrap();
+            let (r0, r1) = if skew {
+                (203_951_604_822_890, 25_000_000_000)
+            } else {
+                (genesis.reserve0, genesis.reserve1)
+            };
+            let state = EquilibraStatefulState {
+                reserve0: r0,
+                reserve1: r1,
+                e0: r0,
+                e1: r1,
+                price_scale_wad: genesis.price_scale_wad,
+                total_supply: genesis.total_supply,
+                ema_log_wad: genesis.ema_log_wad,
+                lp_unit_value_genesis_wad: genesis.lp_unit_value_genesis_wad,
+                lp_unit_value_wad: genesis.lp_unit_value_genesis_wad,
+                ..EquilibraStatefulState::empty()
+            };
+            let token = if zero_for_one { "token0" } else { "token1" };
+            if exact_out {
+                let quote = quote_exact_out_stateful(&cfg, &state, token, amount).unwrap();
+                let swap = swap_stateful_exact_out(&cfg, state, token, amount, 0, true).unwrap();
+                assert_eq!(quote.amount_in_raw, expected_quote);
+                assert_eq!(swap.amount_in, expected_quote);
+                assert_eq!(
+                    (swap.state.reserve0, swap.state.reserve1),
+                    (expected_r0, expected_r1)
+                );
+            } else if expected_quote == 0 {
+                assert!(quote_exact_in_stateful(&cfg, &state, token, amount).is_err());
+                assert!(swap_stateful(&cfg, state, token, amount, 0, true).is_err());
+            } else {
+                let quote = quote_exact_in_stateful(&cfg, &state, token, amount).unwrap();
+                let swap = swap_stateful(&cfg, state, token, amount, 0, true).unwrap();
+                assert_eq!(quote.amount_out_raw, expected_quote);
+                assert_eq!(swap.amount_out, expected_quote);
+                assert_eq!((swap.reserve0, swap.reserve1), (expected_r0, expected_r1));
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_zero_clean_input_is_rejected_before_gross_up() {
+        let mut cfg = config(18, 18, 0, 0);
+        cfg.a_wad = A_MIN_WAD;
+        let mut st = state(18, 18);
+        st.reserve0 *= 20;
+        st.e0 = st.reserve0;
+        assert_eq!(
+            quote_exact_out_forward(
+                st.reserve1.into(),
+                st.reserve0.into(),
+                U256::one(),
+                cfg.a_wad.into(),
+                cfg.lambda_wad.into()
+            )
+            .unwrap(),
+            (U256::zero(), 2)
+        );
+        let before = st;
+        let quote = quote_exact_out_stateful(&cfg, &st, "token1", 1).unwrap_err();
+        let swap = swap_stateful_exact_out(&cfg, st, "token1", 1, 60, true).unwrap_err();
+        assert_eq!(
+            quote.to_string(),
+            "equilibra_stateful: amount_too_small_after_normalization"
+        );
+        assert_eq!(swap.to_string(), quote.to_string());
+        assert_eq!(st, before);
+    }
+
+    #[test]
+    fn exact_in_native_settlement_never_adds_another_correction() {
+        for (d0, d1, zero_for_one, input) in [
+            (18u8, 18u8, true, 18u128),
+            (18, 18, false, 9),
+            (6, 18, true, 2),
+            (8, 18, true, 2),
+            (18, 8, false, 18),
+        ] {
+            let mut cfg = config_at_alpha(d0, d1, 0, 0, A_MIN_WAD);
+            cfg.fee_bps = 5;
+            let mut state = state(d0, d1);
+            state.reserve0 = 11 * 10u128.pow(d0.into()) / 10;
+            state.reserve1 = 908_695_585_459_600_090u128 * 10u128.pow(d1.into()) / WAD;
+            state.e0 = state.reserve0;
+            state.e1 = state.reserve1;
+            state.total_supply = WAD;
+            let before = state;
+            let token = if zero_for_one { "token0" } else { "token1" };
+            let (expected, _, pre) =
+                compute_exact_in_amount_out(&cfg, &state, zero_for_one, input - 1).unwrap();
+            let quote = quote_exact_in_stateful(&cfg, &state, token, input).unwrap();
+            let swap = swap_stateful(&cfg, state, token, input, 60, true).unwrap();
+            assert_eq!(quote.amount_out_raw, expected);
+            assert_eq!(swap.amount_out, expected);
+            assert_eq!((quote.fee_amount_raw, quote.protocol_cut_raw), (1, 0));
+            let reserves = if zero_for_one {
+                (state.reserve0 + input, state.reserve1 - expected)
+            } else {
+                (state.reserve0 - expected, state.reserve1 + input)
+            };
+            assert_eq!((swap.reserve0, swap.reserve1), reserves);
+            assert!(depth(&cfg, swap.reserve0, swap.reserve1) >= pre);
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn exact_in_dust_has_one_math_margin_and_a_strict_lp_guard() {
+        let cfg = config_at_alpha(18, 18, 0, 0, A_MAX_WAD);
+        for (r0, r1, clean_input) in [
+            (20 * 10u128.pow(30), 10u128.pow(30), 1),
+            (10u128.pow(24), 10u128.pow(24), 2),
+        ] {
+            let mut st = state(18, 18);
+            st.reserve0 = r0;
+            st.reserve1 = r1;
+            st.e0 = r0;
+            st.e1 = r1;
+            let before = st;
+            let (raw, _, pre) = compute_exact_in_amount_out(&cfg, &st, false, clean_input).unwrap();
+            assert_eq!(raw, 1);
+            let input = clean_input + 1;
+            let quote = quote_exact_in_stateful(&cfg, &st, "token1", input).unwrap();
+            let swap = swap_stateful(&cfg, st, "token1", input, 60, true).unwrap();
+            assert_eq!(quote.amount_out_raw, raw);
+            assert_eq!(swap.amount_out, raw);
+            assert_eq!(swap.fee_amount_raw, 1);
+            assert!(depth(&cfg, swap.reserve0, swap.reserve1) >= pre);
+            assert_eq!(st, before);
+        }
+    }
+
+    #[test]
+    fn exact_out_keeps_adjusted_math_input_without_a_native_repair() {
+        for (d0, d1) in [(18, 18), (6, 18), (8, 6)] {
+            let cfg = config(d0, d1, 5, 0);
+            let state = state(d0, d1);
+            for zero_for_one in [false, true] {
+                let (_reserve_in, reserve_out, in_scale, out_scale) = if zero_for_one {
+                    (
+                        state.reserve0,
+                        state.reserve1,
+                        cfg.token0_scale,
+                        cfg.token1_scale,
+                    )
+                } else {
+                    (
+                        state.reserve1,
+                        state.reserve0,
+                        cfg.token1_scale,
+                        cfg.token0_scale,
+                    )
+                };
+                let token = if zero_for_one { "token0" } else { "token1" };
+                let out = reserve_out / 1000;
+                let (clean_wad, _, _) = compute_exact_out_clean_in_wad(
+                    &cfg,
+                    &state,
+                    zero_for_one,
+                    U256::from(out) * out_scale,
+                )
+                .unwrap();
+                let unadjusted =
+                    to_u128(from_wad_up_by_scale(clean_wad, in_scale).unwrap(), "test").unwrap();
+                let quote = quote_exact_out_stateful(&cfg, &state, token, out).unwrap();
+                assert_eq!(quote.amount_in_clean_raw, unadjusted);
+                assert_eq!(
+                    quote.amount_in_raw,
+                    to_u128(
+                        gross_up_exact_out(U256::from(unadjusted), cfg.fee_bps * FEE_BPS_TO_WAD,)
+                            .unwrap(),
+                        "test"
+                    )
+                    .unwrap()
+                        + 1
+                );
+                assert_eq!(
+                    quote.fee_amount_raw,
+                    quote.amount_in_raw - quote.amount_in_clean_raw
+                );
+                let swap = swap_stateful_exact_out(&cfg, state, token, out, 60, true).unwrap();
+                assert_eq!(swap.amount_in, quote.amount_in_raw);
+                assert_eq!(swap.state.amount_out, out);
+            }
+        }
+    }
+
+    #[test]
+    fn former_quantization_cap_cases_now_match_native_quotes_and_swaps() {
+        let x = 1_000_000_000_000u128 * WAD;
+        let clean = 1_000_000_000_000u128;
+        let gross = 1_001_001_001_001u128;
+        assert_eq!(gross - gross * 10 / BPS, clean);
+        let mut checked = 0;
+        for alpha in [
+            909_610_000_000_000_030u128,
+            990_000_000_000_000_000,
+            999_750_062_484_378_906,
+            999_950_002_499_875_007,
+            A_MAX_WAD,
+        ] {
+            for protocol in [0, 5, 25] {
+                for exact_out in [false, true] {
+                    let y = if exact_out { x * 20 } else { x / 20 };
+                    let mut cfg = config_at_alpha(18, 18, protocol, 0, alpha);
+                    cfg.lambda_wad = if exact_out {
+                        LAMBDA_MIN_WAD
+                    } else {
+                        16_780_000_000_000_000
+                    };
+                    // These exhausted the old WAD-amplification solver.
+                    let (_, iters) = if exact_out {
+                        quote_exact_out_forward(
+                            x.into(),
+                            y.into(),
+                            clean.into(),
+                            alpha.into(),
+                            cfg.lambda_wad.into(),
+                        )
+                    } else {
+                        quote_exact_in_forward(
+                            x.into(),
+                            y.into(),
+                            clean.into(),
+                            alpha.into(),
+                            cfg.lambda_wad.into(),
+                        )
+                    }
+                    .unwrap();
+                    assert!(iters <= 40);
+                    for zero_for_one in [false, true] {
+                        let mut state = state(18, 18);
+                        (state.reserve0, state.reserve1) =
+                            if zero_for_one { (x, y) } else { (y, x) };
+                        state.e0 = state.reserve0;
+                        state.e1 = state.reserve1;
+                        state.total_supply = x;
+                        let before = state;
+                        let token = if zero_for_one { "token0" } else { "token1" };
+                        let (quote, swap) = if exact_out {
+                            (
+                                quote_exact_out_stateful(&cfg, &state, token, clean)
+                                    .unwrap()
+                                    .amount_in_raw,
+                                swap_stateful_exact_out(&cfg, state, token, clean, 60, true)
+                                    .unwrap()
+                                    .amount_in,
+                            )
+                        } else {
+                            (
+                                quote_exact_in_stateful(&cfg, &state, token, gross)
+                                    .unwrap()
+                                    .amount_out_raw,
+                                swap_stateful(&cfg, state, token, gross, 60, true)
+                                    .unwrap()
+                                    .amount_out,
+                            )
+                        };
+                        assert_eq!(
+                            quote, swap,
+                            "exact_out={exact_out}, alpha={alpha}, protocol={protocol}, zero_for_one={zero_for_one}"
+                        );
+                        assert_eq!(state, before);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 60);
+    }
+}
 
 #[cfg(test)]
 mod log_step_tests {
@@ -2291,19 +3390,17 @@ mod genesis_precision_tests {
     }
 
     #[test]
-    fn genesis_vp_boundary_vectors_match_solidity() {
-        let accepted = init_genesis(&config(), 4_116_559_088_214, 4_116_559_088_214, 1)
-            .expect("inside-tolerance vector");
-        assert_eq!(
-            accepted.lp_unit_value_genesis_wad,
-            1_999_999_960_000_088_308
-        );
-        assert_eq!(2 * WAD - accepted.lp_unit_value_genesis_wad, 39_999_911_692);
-
-        let err = init_genesis(&config(), 6_215_937_829_629, 6_215_937_829_629, 1)
-            .expect_err("outside-tolerance vector must fail");
-        assert!(err.to_string().contains("genesis vp imprecise"));
-        assert!(err.to_string().contains("1999999959999278175"));
+    fn q128_genesis_vectors_match_solidity_without_false_depth_rejections() {
+        for raw in [
+            100_000_000u128,
+            10_000_000_000,
+            4_116_559_088_214,
+            6_215_937_829_629,
+        ] {
+            let state = init_genesis(&config(), raw, raw, 1).expect("accurate balanced genesis");
+            assert_eq!(state.lp_unit_value_genesis_wad, 2 * WAD - 1);
+            assert_eq!((state.reserve0, state.reserve1), (raw, raw));
+        }
     }
 
     #[test]
@@ -2328,7 +3425,7 @@ mod ema_cap_tests {
     //! When `pMarg × priceScale / WAD` exceeded `u128::MAX` (extreme
     //! imbalance + large priceScale), the conversion failed and the
     //! whole `update_ema_in_place` call returned `Ok(())` without
-    //! touching `state.ema_price_wad` — silently freezing the EMA
+    //! touching `state.ema_log_wad` — silently freezing the EMA
     //! and, downstream, the auto-repeg gate. The on-chain
     //! `PoolOracle.updateEma` uses `uint256` end-to-end and clamps
     //! before storing, so it never has this failure mode. Fix: cap
@@ -2390,7 +3487,7 @@ mod ema_cap_tests {
         state.reserve0 = r;
         state.reserve1 = r;
         update_ema_in_place(&config, &mut state, 1_000_000).expect("bootstrap at balance");
-        let ema_boot = state.ema_price_wad;
+        let ema_boot = state.ema_price_wad().unwrap();
         assert!(ema_boot > 0, "bootstrap seeds EMA");
         assert!(
             ema_boot >= price_scale * 9 / 10 && ema_boot <= price_scale * 11 / 10,
@@ -2405,21 +3502,22 @@ mod ema_cap_tests {
         update_ema_in_place(&config, &mut state, now).expect("non-bootstrap update must NOT skip");
 
         assert_ne!(
-            state.ema_price_wad, ema_boot,
+            state.ema_price_wad().unwrap(),
+            ema_boot,
             "EMA must update under extreme imbalance, never freeze"
         );
         let max_spot = price_scale * EMA_PRICE_CAP_MUL;
         assert!(
-            state.ema_price_wad <= max_spot,
+            state.ema_price_wad().unwrap() <= max_spot,
             "EMA {} must be ≤ priceScale × MUL = {} (upper cap parity)",
-            state.ema_price_wad,
+            state.ema_price_wad().unwrap(),
             max_spot
         );
         assert!(
-            state.ema_price_wad > ema_boot,
+            state.ema_price_wad().unwrap() > ema_boot,
             "EMA must move toward the upper cap (was {}, got {})",
             ema_boot,
-            state.ema_price_wad
+            state.ema_price_wad().unwrap()
         );
     }
 
@@ -2436,7 +3534,7 @@ mod ema_cap_tests {
         state.reserve0 = r;
         state.reserve1 = r;
         update_ema_in_place(&config, &mut state, 1_000_000).expect("bootstrap");
-        let ema_boot = state.ema_price_wad;
+        let ema_boot = state.ema_price_wad().unwrap();
 
         // Drain reserve0 → math-space spot collapses far below half.
         state.reserve0 = 10u128.pow(15);
@@ -2445,16 +3543,16 @@ mod ema_cap_tests {
 
         let min_spot = price_scale / EMA_PRICE_CAP_DIV;
         assert!(
-            state.ema_price_wad >= min_spot,
+            state.ema_price_wad().unwrap() >= min_spot,
             "EMA {} must be ≥ priceScale / DIV = {} (lower cap parity)",
-            state.ema_price_wad,
+            state.ema_price_wad().unwrap(),
             min_spot
         );
         assert!(
-            state.ema_price_wad < ema_boot,
+            state.ema_price_wad().unwrap() < ema_boot,
             "EMA must move toward the lower cap (was {}, got {})",
             ema_boot,
-            state.ema_price_wad
+            state.ema_price_wad().unwrap()
         );
     }
 
@@ -2564,7 +3662,7 @@ mod ema_cap_tests {
             state.protocol_fee1 = out.protocol_fee1;
             state.e0 = out.e0;
             state.e1 = out.e1;
-            state.ema_price_wad = out.ema_price_wad;
+            state.ema_log_wad = out.ema_log_wad;
             state.last_ema_ts = out.last_ema_ts;
             state.last_repeg_ts = out.last_repeg_ts;
             state.lp_unit_value_wad = out.lp_unit_value_wad;
@@ -2717,7 +3815,8 @@ mod ema_cap_tests {
             // zfo output side is xMath → token1 (base) wad identity.
             let amount_out_wad = out_math;
             let out_raw = amount_out_wad / config.token1_scale;
-            out_raw.try_into().unwrap()
+            let native_out: u128 = out_raw.try_into().unwrap();
+            native_out - (state.reserve1 - 1) / state.reserve0 - 1
         };
         eprintln!("stateless_output={}", stateless_output);
 
@@ -2934,7 +4033,10 @@ mod ema_cap_tests {
         // priceScale, no runaway.
         eprintln!(
             "init: priceScale={}, ema={}, r0={}, r1={}",
-            state.price_scale_wad, state.ema_price_wad, state.reserve0, state.reserve1
+            state.price_scale_wad,
+            state.ema_price_wad().unwrap(),
+            state.reserve0,
+            state.reserve1
         );
         for i in 0..100u64 {
             now += 60;
@@ -2958,14 +4060,14 @@ mod ema_cap_tests {
                     state.protocol_fee1 = o.protocol_fee1;
                     state.e0 = o.e0;
                     state.e1 = o.e1;
-                    state.ema_price_wad = o.ema_price_wad;
+                    state.ema_log_wad = o.ema_log_wad;
                     state.last_ema_ts = o.last_ema_ts;
                     state.last_repeg_ts = o.last_repeg_ts;
                     state.lp_unit_value_wad = o.lp_unit_value_wad;
                     state.lp_value_growth_wad = o.lp_value_growth_wad;
                     if i < 10 || i % 20 == 0 {
                         let ratio_ppm = if state.price_scale_wad > 0 {
-                            (state.ema_price_wad as i128 - state.price_scale_wad as i128)
+                            (state.ema_price_wad().unwrap() as i128 - state.price_scale_wad as i128)
                                 .unsigned_abs()
                                 * 1_000_000
                                 / state.price_scale_wad
@@ -2974,8 +4076,8 @@ mod ema_cap_tests {
                         };
                         eprintln!(
                             "i={} token={} recentered={}: ps={} ema={} ema/ps_ppm={} pre_swap_diff_ppm={}",
-                            i, token_in, o.recentered, state.price_scale_wad, state.ema_price_wad, ratio_ppm,
-                            (state.ema_price_wad as i128 - state.price_scale_wad as i128) * 1_000_000 / state.price_scale_wad as i128,
+                            i, token_in, o.recentered, state.price_scale_wad, state.ema_price_wad().unwrap(), ratio_ppm,
+                            (state.ema_price_wad().unwrap() as i128 - state.price_scale_wad as i128) * 1_000_000 / state.price_scale_wad as i128,
                         );
                     }
                 }
@@ -3071,7 +4173,7 @@ mod ema_cap_tests {
             state.protocol_fee1 = out.protocol_fee1;
             state.e0 = out.e0;
             state.e1 = out.e1;
-            state.ema_price_wad = out.ema_price_wad;
+            state.ema_log_wad = out.ema_log_wad;
             state.last_ema_ts = out.last_ema_ts;
             state.last_repeg_ts = out.last_repeg_ts;
             state.lp_unit_value_wad = out.lp_unit_value_wad;
@@ -3117,7 +4219,7 @@ mod halving_ladder_tests {
             "tk1",
             18,
             18,
-            100,                         // fee_bps (flat: feeScale cap 1e16)
+            100,                         // fee_bps (flat)
             909_610_000_000_000_030u128, // a_wad (canonical preset)
             16_780_000_000_000_000u128,  // lambda_wad
             0,                           // protocol_fee_percent
@@ -3146,7 +4248,7 @@ mod halving_ladder_tests {
         st.reserve1 = 800_000 * W;
         st.price_scale_wad = W;
         st.total_supply = 1_000_000 * W;
-        st.ema_price_wad = W + W / 50; // +2%
+        st.ema_log_wad = equilibra_math::price_to_ema_log(U256::from(W + W / 50)).unwrap(); // +2%
         st.last_ema_ts = 1_000;
         st.last_repeg_ts = 1_000;
         st.lp_value_growth_wad = 0;
@@ -3160,14 +4262,15 @@ mod halving_ladder_tests {
         st: &EquilibraStatefulState,
     ) -> Vec<(u128, u128)> {
         let deviation =
-            compute_relative_deviation_wad(st.ema_price_wad, st.price_scale_wad).unwrap();
+            compute_relative_deviation_wad(st.ema_price_wad().unwrap(), st.price_scale_wad)
+                .unwrap();
         let base_applied =
             applied_repeg_step(config.repeg_step_wad, deviation, REPEG_DAMPING_DIVISOR).unwrap();
         (0..=MAX_REPEG_STEP_HALVINGS)
             .map(|k| {
                 let candidate = apply_log_step(
                     st.price_scale_wad,
-                    st.ema_price_wad,
+                    st.ema_price_wad().unwrap(),
                     base_applied >> k as usize,
                 )
                 .unwrap();
@@ -3424,7 +4527,8 @@ mod halving_ladder_tests {
         );
         let st = ladder_state();
         let deviation =
-            compute_relative_deviation_wad(st.ema_price_wad, st.price_scale_wad).unwrap();
+            compute_relative_deviation_wad(st.ema_price_wad().unwrap(), st.price_scale_wad)
+                .unwrap();
         assert!(
             deviation >= config.repeg_threshold_token1_up_wad
                 && deviation < config.repeg_threshold_token1_up_wad * config.parachute_band_mult,
@@ -3531,15 +4635,26 @@ mod halving_ladder_tests {
         let config = ladder_config();
         let mut st = ladder_state();
         // At price_scale = 1e17 an applied step of a few wei floors the
-        // mulWad move back onto the old scale: deviation 10 wei =>
-        // applied 2 wei => candidate == price_scale (dust) on the very
+        // mulWad move back onto the old scale: deviation 10–20 wei =>
+        // applied 2–4 wei => candidate == price_scale (dust) on the very
         // first rung. Solidity consults the parachute on EVERY
         // no-commit ladder exit — including this rung-0 dust break —
         // and here the parachute declines at its lag qualifier
-        // (10 wei < K x the 1-wei band, K = 30 default) before
+        // (deviation < K x the 1-wei band, K = 30 default) before
         // re-deriving any candidate.
         st.price_scale_wad = W / 10;
-        st.ema_price_wad = W / 10 + 1;
+        // The encoded target must remain above the anchor after ln/exp rounding.
+        st.ema_log_wad = equilibra_math::price_to_ema_log(U256::from(W / 10 + 2)).unwrap();
+        let ema = st.ema_price_wad().unwrap();
+        let deviation = compute_relative_deviation_wad(ema, st.price_scale_wad).unwrap();
+        assert!(deviation > 0 && deviation < config.parachute_band_mult);
+        let applied =
+            applied_repeg_step(config.repeg_step_wad, deviation, REPEG_DAMPING_DIVISOR).unwrap();
+        assert!(!applied.is_zero());
+        assert_eq!(
+            apply_log_step(st.price_scale_wad, ema, applied).unwrap(),
+            st.price_scale_wad
+        );
         let out = run(&config, &st, 1);
         assert!(!out.recentered);
         assert!(!out.via_parachute);
@@ -3566,9 +4681,10 @@ mod halving_ladder_tests {
         // control flow where the post-ladder handover runs even though
         // the ladder never probed a rung.
         st.price_scale_wad = W / 10;
-        st.ema_price_wad = W / 10 + 4;
+        st.ema_log_wad = equilibra_math::price_to_ema_log(U256::from(W / 10 + 4)).unwrap();
         let deviation =
-            compute_relative_deviation_wad(st.ema_price_wad, st.price_scale_wad).unwrap();
+            compute_relative_deviation_wad(st.ema_price_wad().unwrap(), st.price_scale_wad)
+                .unwrap();
         assert!(
             deviation >= config.repeg_threshold_token1_up_wad * config.parachute_band_mult,
             "precondition: lag qualifier must pass (deviation {deviation})"
@@ -3593,7 +4709,7 @@ mod halving_ladder_tests {
         // damped step `deviation / 5` to zero: the ladder never runs.
         // The post-ladder parachute is consulted and declines on its
         // lag qualifier (2 wei < K x the 1-wei band, K = 30 default).
-        st.ema_price_wad = W + 2;
+        st.ema_log_wad = equilibra_math::price_to_ema_log(U256::from(W + 2)).unwrap();
         let out = run(&config, &st, 1);
         assert!(!out.recentered);
         assert_eq!(

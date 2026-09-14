@@ -143,7 +143,7 @@ describe("DynamicFee monotonicity (WAD rate residual)", function () {
       }
     });
 
-    it("pseudo-random g1 < g2 pairs never lose more than the residual (both directions)", async function () {
+    it("[stress] pseudo-random g1 < g2 pairs never lose more than the residual (both directions)", async function () {
       const f = await loadFixture(deployPresetPool);
       const rng = lcg(0xd1ce5eedn);
       const MAX_G = 4n * 10n ** 23n;

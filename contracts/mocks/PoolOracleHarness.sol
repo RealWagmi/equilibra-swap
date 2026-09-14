@@ -8,22 +8,30 @@ import { PoolOracle } from "../libraries/PoolOracle.sol";
 ///      from TypeScript tests without spinning up a full pool.
 contract PoolOracleHarness {
     function updateEma(
-        uint256 emaPriceWad,
+        int256 emaLogWad,
         uint64 lastUpdateTs,
         uint256 spotPriceWad,
         uint256 priceScaleWad,
         uint32 emaPeriod,
         uint64 nowTs
-    ) external pure returns (uint256 newEmaPriceWad, uint64 newLastUpdateTs) {
+    ) external pure returns (int256 newEmaLogWad, uint64 newLastUpdateTs) {
         PoolOracle.EmaState memory next = PoolOracle.updateEma(
-            PoolOracle.EmaState({ emaPriceWad: emaPriceWad, lastUpdateTs: lastUpdateTs }),
+            PoolOracle.EmaState({ emaLogWad: emaLogWad, lastUpdateTs: lastUpdateTs }),
             spotPriceWad,
             priceScaleWad,
             emaPeriod,
             nowTs
         );
-        newEmaPriceWad = next.emaPriceWad;
+        newEmaLogWad = next.emaLogWad;
         newLastUpdateTs = next.lastUpdateTs;
+    }
+
+    function priceToEmaLog(uint256 priceWad) external pure returns (int256) {
+        return PoolOracle.priceToEmaLog(priceWad);
+    }
+
+    function emaLogToPrice(int256 emaLogWad) external pure returns (uint256) {
+        return PoolOracle.emaLogToPrice(emaLogWad);
     }
 
     function shiftPriceScale(

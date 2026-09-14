@@ -1,3 +1,5 @@
+import { exactInputReference } from "../helpers/continuousReference";
+import { poolEmaLogWad } from "../helpers/storageLayout";
 import { loadFixture, time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
 import hre from "hardhat";
@@ -710,11 +712,7 @@ describe("RepegProfitShare", () => {
       const cascadeFixture = async () =>
         deployRepegFixture({
           repegStepWad: hre.ethers.parseUnits("5", 15),
-          // Auto-repeg disabled: the vp-metric probes below are
-          // share-independent, no repeg is (or ever was) triggered —
-          // at 5 bps the growth budget is ~nil — and a live share with
-          // a 5e15 step on a 5-bps flat pool now trips the factory's
-          // stall guard (cap = baseFee·1e14 = 5e14).
+          // These share-independent vp probes keep the anchor fixed.
           repegShareBps: 0,
           baseFee: 5, // 5 bps — matches the cascade run
           feeRampBps: 0,
@@ -852,7 +850,7 @@ describe("RepegProfitShare", () => {
   // residual, not from the repeg budget.
   // ---------------------------------------------------------------------------
   describe("repeg threshold independence from protocolFeePercent", () => {
-    it("two pools with same curve + different protocolFeePercent share the same gate-1 surplus", async () => {
+    it("protocol-fee compensation preserves the fee-funded surplus, excluding retained quote margin", async () => {
       const REPEG_SHARE_BPS = 5000; // 50/50 LP-vs-repeg split at the level of "total fee"
       const SWAP_AMOUNT = hre.ethers.parseEther("50000");
       const NUM_SWAPS = 4;
@@ -872,7 +870,19 @@ describe("RepegProfitShare", () => {
           repegStepWad: 10n ** 16n,
           emaPeriod: 419_731,
         });
+        const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+        let marginGrowth = 0n;
         for (let i = 0; i < NUM_SWAPS; i++) {
+          const [r0, r1] = await fx.pool.getReserves();
+          const clean = SWAP_AMOUNT - SWAP_AMOUNT / 100n;
+          const ref = await exactInputReference(math, r0, r1, clean, PRESET.aWad, PRESET.lambdaWad);
+          const quoted = await fx.pool.quoteExactIn(true, SWAP_AMOUNT);
+          const postIn = r0 + SWAP_AMOUNT - ((SWAP_AMOUNT / 100n) * BigInt(protocolFeePercent)) / 100n;
+          const supply = await fx.pool.totalSupply();
+          const actualUnit = await fx.pool.exposed_computeLpUnitValueWad(postIn, r1 - quoted, supply);
+          const referenceUnit = await fx.pool.exposed_computeLpUnitValueWad(postIn, r1 - ref.referenceMath, supply);
+          expect(actualUnit).to.be.at.least(referenceUnit);
+          marginGrowth += actualUnit - referenceUnit;
           await fx.router.connect(fx.trader).exactInputSingle({
             tokenIn: await fx.token0.getAddress(),
             tokenOut: await fx.token1.getAddress(),
@@ -886,6 +896,7 @@ describe("RepegProfitShare", () => {
         const lp = await fx.pool.getLpValueState();
         return {
           growth: BigInt(lp.growthWad),
+          feeGrowth: BigInt(lp.growthWad) - marginGrowth,
           vpGenesis: BigInt(lp.genesisWad),
           unit: BigInt(lp.unitValueWad),
         };
@@ -894,8 +905,8 @@ describe("RepegProfitShare", () => {
       const p0 = await deployAndRun(0);
       const p20 = await deployAndRun(20);
 
-      // The realised growth IS proportional to (1 − p/100) because only
-      // `lpFeeCut` enters reserves. Both numbers should be > 0.
+      // Fee growth is protocol-scaled; retained output margin is not a fee
+      // and contributes additional depth. Separate it using the independent root.
       expect(p0.growth).to.be.gt(0n);
       expect(p20.growth).to.be.gt(0n);
       expect(p20.growth).to.be.lt(p0.growth);
@@ -905,16 +916,16 @@ describe("RepegProfitShare", () => {
       //   `share_effective = repegShareBps / (BPS − p · 100)`
       // For p = 0:    surplus = growth · 5000 / 10000 = growth × 0.5
       // For p = 20%:  surplus = growth · 5000 / 8000  = growth × 0.625
-      // Both must equal the same `growth(p=0) × 0.5` (within ulps).
+      // After subtracting independently measured margin growth, the fee-funded
+      // portions must agree within the original 100-ppm trajectory bound.
       const BPS = 10000n;
-      const surplus0 = (p0.growth * BigInt(REPEG_SHARE_BPS)) / (BPS - 0n * 100n);
-      const surplus20 = (p20.growth * BigInt(REPEG_SHARE_BPS)) / (BPS - 20n * 100n);
+      const surplus0 = (p0.feeGrowth * BigInt(REPEG_SHARE_BPS)) / (BPS - 0n * 100n);
+      const surplus20 = (p20.feeGrowth * BigInt(REPEG_SHARE_BPS)) / (BPS - 20n * 100n);
 
       const diff = surplus0 > surplus20 ? surplus0 - surplus20 : surplus20 - surplus0;
       const ppmDrift = (diff * 1_000_000n) / surplus0;
 
-      // Sub-1-ppm drift between the two pools' rebalance budgets —
-      // protocol fee no longer slows down the repeg cadence.
+      // Compare fee-funded growth, not the extra depth from output retention.
       expect(ppmDrift).to.be.lessThan(
         100n,
         `Rebalance budget differs by ${ppmDrift} ppm between p=0 and p=20% pools — threshold formula must compensate`
@@ -972,68 +983,62 @@ describe("RepegProfitShare", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Worst-case gas envelope for `exactInputSingle`. Combines the three
-  // biggest gas-consumers on the swap path:
-  //   1. `_accrueProtocolFees` SSTORE  — fires when `protocolFeePercent > 0`.
-  //   2. `_accrueLpValueGrowth` SSTORE — fires whenever LP growth accrues
-  //      (every swap with a non-trivial size).
-  //   3. `_tryAutoRepeg` SSTOREs       — fires when both gates pass:
-  //         · `_anchorPrice`
-  //         · `_lpUnitValueWad`        (latched to vpAfter)
-  //         · `_lastRepegTs`
-  //         · `PriceScaleUpdated` event
-  //
-  // Bound is loose (~210k) so compiler variance and minor refactors don't
-  // produce flakes; the test exists primarily so a future change that
-  // **regresses** the worst case by tens of thousands of gas shows up here
-  // instead of in the gas-reporter aggregate.
+  // Gas envelopes for protocol fees, LP growth and a successful auto-repeg.
+  // The first swap samples the PRE-swap 1:1 price, so its stored EMA log
+  // stays zero even though protocol-fee and LP-growth slots become nonzero.
+  // Measure the second swap's first nonzero EMA write separately (200k),
+  // and retain the 185k envelope for the third, steady-state swap.
+  // These are distinct persistent-state costs, not transaction-warm slots:
+  // the EVM access list starts cold again on every transaction.
   // ---------------------------------------------------------------------------
   describe("worst-case gas envelope", () => {
-    it("exactInputSingle that fires repeg with non-zero protocolFeePercent stays under 185k gas", async function () {
-      // Gas envelopes are only meaningful on production (viaIR,
-      // optimizer-on) bytecode: coverage instrumentation adds a hook
-      // call per statement and compiles with the optimizer off, which
-      // inflates the same tx to ~235k. Skip under coverage — the
-      // envelope is enforced on every regular `npm test` run.
-      if (process.env.SOLIDITY_COVERAGE === "true") this.skip();
-      // Pool config maximising every SSTORE on the swap path:
-      //   • protocolFee = 25 (max) → `_protocolFeesPacked` SSTORE.
-      //   • repegShareBps = 7500 (max compatible with p = 25) → gate wide open.
-      //   • both repeg dead-bands small → activation gate fires after the EMA drifts.
+    async function gasFixture() {
       const fx = await deployRepegFixture({
         protocolFeePercent: 25,
         repegShareBps: 7500,
         repegStepWad: hre.ethers.parseUnits("1", 15), // 0.1 %
       });
       const { pool, router, trader, token0, token1 } = fx;
-
-      // Pre-swap: drag the EMA past `repegStepWad` and pre-warm the
-      // protocol-fee / LP-unit-value storage slots so the measured call
-      // sees only the "delta" SSTORE costs, not first-write penalties.
-      // We measure the SECOND swap so the bound reflects steady-state
-      // worst case, not the one-off cold-init bonus.
+      expect(await poolEmaLogWad(fx.poolAddress), "genesis log at price 1:1").to.equal(0n);
       await pumpEmaWithBigSwap(router, trader, token0, token1);
-      await time.increase(1200 * 5); // EMA catches up
+      expect(await poolEmaLogWad(fx.poolAddress), "first swap samples pre-swap price 1:1").to.equal(0n);
+      expect((await pool.getProtocolFees())[0], "protocol fees already accrued").to.be.gt(0n);
+      expect((await pool.getLpValueState()).growthWad, "LP growth already accrued").to.be.gt(0n);
+      return fx;
+    }
 
-      const anchorBefore = (await pool.getOracleState()).priceScaleWad;
-      const tx = await pumpEmaWithBigSwap(router, trader, token0, token1);
-      const rcpt = await tx.wait();
-      const anchorAfter = (await pool.getOracleState()).priceScaleWad;
+    for (const scenario of [
+      { label: "first nonzero log-EMA update", initializeEma: false, maxGas: 200_000n },
+      { label: "steady-state log-EMA update", initializeEma: true, maxGas: 185_000n },
+    ]) {
+      it(`${scenario.label} with repeg and protocol fees stays under ${scenario.maxGas / 1000n}k gas`, async function () {
+        // Coverage instruments statements and uses legacy codegen;
+        // gas envelopes apply only to the regular optimized build.
+        if (process.env.SOLIDITY_COVERAGE === "true") this.skip();
+        const { pool, router, trader, token0, token1, poolAddress } = await loadFixture(gasFixture);
+        await time.increase(1200 * 5);
+        if (scenario.initializeEma) {
+          await pumpEmaWithBigSwap(router, trader, token0, token1);
+          await time.increase(1200 * 5);
+        }
 
-      // Sanity: the repeg must have fired (otherwise we measured the
-      // wrong path).
-      expect(anchorAfter).to.not.equal(anchorBefore);
+        const logBefore = await poolEmaLogWad(poolAddress);
+        expect(logBefore === 0n, "expected persistent EMA state before measured swap").to.equal(
+          !scenario.initializeEma
+        );
+        const anchorBefore = await pool.getPriceScale();
+        const tx = await pumpEmaWithBigSwap(router, trader, token0, token1);
+        const rcpt = await tx.wait();
+        const logAfter = await poolEmaLogWad(poolAddress);
 
-      // The router → pool call also incurs router overhead; the assertion
-      // is on the **whole tx** gas so it captures the entire user-facing
-      // cost. The bound (~185k) is sized for the steady-state warm path
-      // where all storage slots have already been touched once. Cold-
-      // init swaps (first call of a freshly-deployed pool, no prior
-      // protocol-fee buckets or LP-growth slots written) can run higher
-      // — those are measured implicitly by the gas-reporter aggregate
-      // across the rest of the suite.
-      const gasUsed = BigInt(rcpt!.gasUsed);
-      expect(gasUsed).to.be.lessThan(185_000n, `worst-case exactInputSingle gas: ${gasUsed}`);
-    });
+        // Neither a skipped oracle update nor a skipped repeg may pass
+        // merely because it makes the transaction cheaper.
+        expect(logAfter).to.not.equal(0n);
+        expect(logAfter).to.not.equal(logBefore);
+        expect(await pool.getPriceScale(), "measured swap must execute a repeg").to.not.equal(anchorBefore);
+        const gasUsed = BigInt(rcpt!.gasUsed);
+        expect(gasUsed).to.be.lessThan(scenario.maxGas, `${scenario.label} exactInputSingle gas: ${gasUsed}`);
+      });
+    }
   });
 });

@@ -1,3 +1,8 @@
+import {
+  exactOutputInvariantReferenceWithL,
+  exactOutputReferenceWithL,
+  assertExactOutputPrecision,
+} from "../helpers/continuousReference";
 // SPDX-License-Identifier: MIT
 //
 // EquilibraSwapMath exact-output path-additivity validator.
@@ -6,7 +11,8 @@
 //
 //   (a) Split exactOut: trader specifies total `dy_total` to receive,
 //       splits into N equal pieces of `dy_total / N`. Σ(dx_i) must
-//       equal single dx (within ceil-rounding noise per leg).
+//       not underpay the independent unadjusted curve. Per-swap output
+//       retention can make splitting cheaper than one enlarged-output quote.
 //
 //   (b) Round-trip exactIn → exactOut: trader buys with exact-input
 //       USDT, then sells the exact USDT amount they want back via
@@ -16,11 +22,11 @@
 //       amount, then sells that exact amount back via exact-input.
 //       Net PnL in USDT must be ≤ 0.
 //
-// All three exercise the inverse Newton iteration (`quoteExactOutForward`),
+// All three exercise the inverse secant iteration (`quoteExactOutForward`),
 // which is the symmetric twin of the exact-input solver but runs against
 // `xPost` as the unknown instead of `yPost`. K(x,y) symmetry under
-// (x ↔ y) guarantees the same convergence characteristics, so any leak
-// here would indicate a non-symmetric implementation defect.
+// (x ↔ y) preserves the invariant; integer roundings and enlarged-output
+// targets do not promise identical convergence or exact inverse quotes.
 
 import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
@@ -44,6 +50,7 @@ const PRESETS_UNDER_TEST: PresetName[] = ["WETH", "WBTC"];
 
 interface HarnessFixture {
   harness: any;
+  math: any;
   quoteIsToken0: boolean;
   initialQuoteRaw: bigint;
   initialBaseRaw: bigint;
@@ -71,7 +78,9 @@ async function deployHarness(presetName: PresetName): Promise<HarnessFixture> {
   const harness = await Harness.deploy(r0Wad, r1Wad, preset.aWad, preset.lambdaWad, d0, d1);
   await harness.waitForDeployment();
 
-  return { harness, quoteIsToken0, initialQuoteRaw, initialBaseRaw };
+  const math = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+  await math.waitForDeployment();
+  return { harness, math, quoteIsToken0, initialQuoteRaw, initialBaseRaw };
 }
 
 async function depleteHarness(fx: HarnessFixture, zeroForOne: boolean, targetDepletionBps: bigint): Promise<void> {
@@ -89,9 +98,10 @@ async function getSwapEvent(rc: any) {
 
 interface ExactOutSplitResult {
   singleIn: bigint;
+  independentIn: bigint;
   splitTotalIn: bigint;
   splits: bigint[];
-  delta: bigint; // splitTotalIn - singleIn (must be ≥ -dust, i.e. split never pays LESS)
+  delta: bigint; // diagnostic: splitTotalIn - singleIn; the independent curve is the lower bound
   gasSingle: bigint;
   gasSplitsAvg: bigint;
 }
@@ -102,6 +112,27 @@ async function compareSplitVsSingleExactOut(
   totalDyOut: bigint,
   splits: number
 ): Promise<ExactOutSplitResult> {
+  const W = 10n ** 18n;
+  const h = fx.harness;
+  const [r0, r1] = await h.getReserves();
+  const price = BigInt(await h.priceScaleWad());
+  const a = BigInt(await h.aWad()),
+    lambda = BigInt(await h.lambdaWad());
+  const quoteMath = (BigInt(r0) * W) / price;
+  const x = zeroForOne ? quoteMath : BigInt(r1),
+    y = zeroForOne ? BigInt(r1) : quoteMath;
+  const dIn = Number(await (zeroForOne ? h.decimals0() : h.decimals1()));
+  const dOut = Number(await (zeroForOne ? h.decimals1() : h.decimals0()));
+  const outWad = totalDyOut * 10n ** BigInt(18 - dOut);
+  const dy = zeroForOne ? outWad : (outWad * W + price - 1n) / price;
+  const depth = BigInt(await fx.math.solveLFromState(x, y, a, lambda));
+  const ref = exactOutputInvariantReferenceWithL(x, y, dy, a, lambda, depth);
+  const expandedRef = exactOutputReferenceWithL(x, y, dy, a, lambda, depth);
+  const [rawQuote, iters] = await fx.math.quoteExactOutForward(x, y, dy, a, lambda);
+  assertExactOutputPrecision(BigInt(rawQuote), expandedRef, BigInt(iters), 32n, "single exact-out before split");
+  const inputWad = zeroForOne ? (ref * price + W - 1n) / W : ref;
+  const inScale = 10n ** BigInt(18 - dIn);
+  const independentIn = (inputWad + inScale - 1n) / inScale;
   const snap = await hre.network.provider.send("evm_snapshot", []);
 
   const txSingle = await fx.harness.swapExactOut(zeroForOne, totalDyOut);
@@ -131,6 +162,7 @@ async function compareSplitVsSingleExactOut(
 
   return {
     singleIn,
+    independentIn,
     splitTotalIn: total,
     splits: splitIns,
     delta: total - singleIn,
@@ -159,7 +191,7 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
       // ----------------------------------------------------------------
       // (a) Split exactOut from balanced state
       // ----------------------------------------------------------------
-      it("ExactOut split from balanced state matches single (1..70% of BASE)", async function () {
+      it("ExactOut splits respect the independent input floor (1..70% of BASE)", async function () {
         const fx = await loadFixture(fixtureFor);
         const rows: any[] = [];
         const failures: string[] = [];
@@ -176,9 +208,8 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
           try {
             const totalBaseOut = (fx.initialBaseRaw * pct) / 10_000n;
             const r = await compareSplitVsSingleExactOut(fx, zeroForOne, totalBaseOut, SPLITS);
-            // For path-additive AMM with ceil-up dx, split should pay ≥ single
-            // by ≤ N×ceil-noise — never LESS.
-            const beat = r.delta < -dustBudget;
+            // Compare with the unadjusted curve, not a single larger retained margin.
+            const beat = r.splitTotalIn + dustBudget < r.independentIn;
             rows.push({
               pct: `${(Number(pct) / 100).toFixed(2)}%`,
               singleIn: fmtRaw(r.singleIn, QUOTE_DECIMALS),
@@ -189,7 +220,9 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
               leaked: beat ? "YES" : "no",
             });
             if (beat) {
-              failures.push(`pct=${pct}bps: split paid ${r.delta} less than single (budget=±${dustBudget})`);
+              failures.push(
+                `pct=${pct}bps: split paid ${r.splitTotalIn} below independent ${r.independentIn} (dust=${dustBudget})`
+              );
             }
           } finally {
             await hre.network.provider.send("evm_revert", [snap]);
@@ -232,7 +265,7 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
 
               const r = await compareSplitVsSingleExactOut(fx, zeroForOne, totalBaseOut, SPLITS);
 
-              const beat = r.delta < -dustBudget;
+              const beat = r.splitTotalIn + dustBudget < r.independentIn;
               rows.push({
                 preDep: `${(Number(preDep) / 100).toFixed(1)}%`,
                 fwdPct: `${(Number(fwdPct) / 100).toFixed(1)}%`,
@@ -243,7 +276,9 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
                 leaked: beat ? "YES" : "no",
               });
               if (beat) {
-                failures.push(`preDep=${preDep}bps fwd=${fwdPct}bps: split saved ${-r.delta} (budget=±${dustBudget})`);
+                failures.push(
+                  `preDep=${preDep}bps fwd=${fwdPct}bps: split paid ${r.splitTotalIn} below independent ${r.independentIn} (dust=${dustBudget})`
+                );
               }
             } finally {
               await hre.network.provider.send("evm_revert", [snap]);
@@ -380,7 +415,7 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
       // the structural arb guard, this test just sanity-checks that the
       // rounding loss stays within decimal granularity.
       // ----------------------------------------------------------------
-      it("Pricing parity: exactIn(dx) gives dy, then exactOut(dy) ≈ dx (within 1 ulp)", async function () {
+      it("Pricing parity stays within decimal quantisation without a second margin", async function () {
         const fx = await loadFixture(fixtureFor);
         const zeroForOne = fx.quoteIsToken0;
         const PCTS = [100n, 1_000n, 5_000n, 9_000n];
@@ -388,7 +423,7 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
         const failures: string[] = [];
 
         // Per-decimal quantisation budget (USDT-wei). For decimal-asymmetric
-        // pairs the dy_raw floor and the Newton residual compound: each
+        // pairs the dy_raw floor and the secant residual compound: each
         // satoshi of dy floor can blow up to ~`marginalPrice` of dx-equiv,
         // and the marginal price itself rises with depletion. Empirically
         // the envelope on WBTC sits at ~3 satoshi of dx, with a margin
@@ -407,18 +442,19 @@ describe("PathAdditivity ExactOut [state-only K, secant]", function () {
             const dxForExactOut = BigInt(await fx.harness.quoteExactOut(zeroForOne, dyForExactIn));
 
             const drift = dxForExactOut - usdtIn;
-            const inBudget = drift >= -quantisationBudget;
+            const budget = quantisationBudget;
+            const inBudget = drift >= -budget && drift <= budget;
             rows.push({
               pct: `${(Number(pct) / 100).toFixed(1)}%`,
               dxIn: fmtRaw(usdtIn, QUOTE_DECIMALS),
               dyOut: fmtRaw(dyForExactIn, BASE_DECIMALS[presetName]),
               dxRecovered: fmtRaw(dxForExactOut, QUOTE_DECIMALS),
               "Δ (USDT-wei)": `${drift >= 0n ? "+" : ""}${drift}`,
-              budget: `±${quantisationBudget}`,
+              budget: `±${budget}`,
               ok: inBudget ? "yes" : "NO",
             });
             if (!inBudget) {
-              failures.push(`pct=${pct}bps: drift=${drift} (budget=±${quantisationBudget})`);
+              failures.push(`pct=${pct}bps: drift=${drift} (budget=±${budget})`);
             }
           } finally {
             await hre.network.provider.send("evm_revert", [snap]);

@@ -104,7 +104,25 @@ describe("EquilibraFactory: views + parameter validation", function () {
       ).to.be.revertedWithCustomError(factory, "InvalidA");
     });
 
-    it("rejects aWad above A_MAX_WAD (9e17)", async function () {
+    it("accepts A_MAX_WAD = WAD - 1 without truncating its packed value", async function () {
+      const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
+      const aWad = 10n ** 18n - 1n;
+      await factory
+        .connect(creator)
+        .createPoolAndAddLiquidity(
+          await t0.getAddress(),
+          await t1.getAddress(),
+          makeConfig(aWad),
+          SEED,
+          SEED,
+          creator.address
+        );
+      const pool = await hre.ethers.getContractAt("EquilibraPool", await factory.allPools(0));
+      expect((await pool.getCurveParams()).aWad).to.equal(aWad);
+      expect(await pool.balanceOf(creator.address)).to.be.greaterThan(0n);
+    });
+
+    it("rejects aWad = WAD above the strict A_MAX_WAD = WAD - 1 boundary", async function () {
       const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
       await expect(
         factory
@@ -120,7 +138,25 @@ describe("EquilibraFactory: views + parameter validation", function () {
       ).to.be.revertedWithCustomError(factory, "InvalidA");
     });
 
-    it("rejects lambdaWad below LAMBDA_MIN_WAD (1e15)", async function () {
+    it("accepts LAMBDA_MIN_WAD = 1e12 without truncating its packed value", async function () {
+      const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
+      const lambdaWad = 10n ** 12n;
+      await factory
+        .connect(creator)
+        .createPoolAndAddLiquidity(
+          await t0.getAddress(),
+          await t1.getAddress(),
+          { ...makeConfig(), lambdaWad },
+          SEED,
+          SEED,
+          creator.address
+        );
+      const pool = await hre.ethers.getContractAt("EquilibraPool", await factory.allPools(0));
+      expect((await pool.getCurveParams()).lambdaWad).to.equal(lambdaWad);
+      expect(await pool.balanceOf(creator.address)).to.be.greaterThan(0n);
+    });
+
+    it("rejects one unit below LAMBDA_MIN_WAD (1e12)", async function () {
       const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
       await expect(
         factory
@@ -128,7 +164,7 @@ describe("EquilibraFactory: views + parameter validation", function () {
           .createPoolAndAddLiquidity(
             await t0.getAddress(),
             await t1.getAddress(),
-            { ...makeConfig(), lambdaWad: 1n },
+            { ...makeConfig(), lambdaWad: 10n ** 12n - 1n },
             SEED,
             SEED,
             creator.address
@@ -153,140 +189,60 @@ describe("EquilibraFactory: views + parameter validation", function () {
     });
   });
 
-  // -------------------------------------------------------------------------
-  // Repeg stall guard: with auto-repeg live, neither activation dead-band
-  // (`repegThresholdToken1UpWad` / `repegThresholdToken1DownWad`) may exceed
-  // the fee scale (`feeFloorBps · 1e14` with a live ramp, `baseFee · 1e14`
-  // flat). A dead-band pins the first permitted repeg attempt on its side at
-  // `deviation == threshold`; a band above the fee scale can never fund that
-  // first move from the pool's own flow. The per-block step cap
-  // `repegStepWad` carries no stall guard: only the [1, 1e18] range applies.
-  // -------------------------------------------------------------------------
-  describe("repeg stall guard (RepegThresholdExceedsFeeScale)", function () {
-    for (const side of ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] as const) {
-      it(`rejects ${side} above feeFloorBps·1e14 when the ramp is live`, async function () {
-        const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-        await expect(
-          factory.connect(creator).createPoolAndAddLiquidity(
-            await t0.getAddress(),
-            await t1.getAddress(),
-            {
+  describe("repeg thresholds are independent of swap fees", function () {
+    for (const mode of [
+      { name: "dynamic 1-2 bps", baseFee: 2, feeRampBps: 9500, feeFloorBps: 1 },
+      { name: "flat 1 bps", baseFee: 1, feeRampBps: 0, feeFloorBps: 1 },
+    ]) {
+      for (const side of ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] as const) {
+        for (const threshold of [1n, 10n ** 15n, 10n ** 18n - 1n]) {
+          it("accepts " + side + "=" + threshold + " with " + mode.name + " and live repegs", async function () {
+            const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
+            const config = {
               ...makeConfig(),
-              baseFee: 100,
-              feeRampBps: 1000,
-              feeFloorBps: 20, // cap = 20 · 1e14 = 2e15
-              [side]: 2n * 10n ** 15n + 1n,
-            },
-            SEED,
-            SEED,
-            creator.address
-          )
-        ).to.be.revertedWithCustomError(factory, "RepegThresholdExceedsFeeScale");
-      });
+              baseFee: mode.baseFee,
+              feeRampBps: mode.feeRampBps,
+              feeFloorBps: mode.feeFloorBps,
+              [side]: threshold,
+            };
+            await factory
+              .connect(creator)
+              .createPoolAndAddLiquidity(
+                await t0.getAddress(),
+                await t1.getAddress(),
+                config,
+                SEED,
+                SEED,
+                creator.address
+              );
+            const pool = await hre.ethers.getContractAt("EquilibraPool", await factory.allPools(0));
+            const stored = await pool.getFeeConfig();
+            expect(stored.repegThresholdToken1UpWad).to.equal(config.repegThresholdToken1UpWad);
+            expect(stored.repegThresholdToken1DownWad).to.equal(config.repegThresholdToken1DownWad);
+            expect(stored.repegStepWad).to.equal(config.repegStepWad);
+            expect(stored.repegShareBps).to.equal(5000);
+          });
+        }
+      }
     }
 
-    it("accepts threshold exactly at the ramp-floor cap (boundary inclusive)", async function () {
+    it("keeps disabled-repeg thresholds inert within the same absolute range", async function () {
       const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-      await expect(
-        factory.connect(creator).createPoolAndAddLiquidity(
-          await t0.getAddress(),
-          await t1.getAddress(),
-          {
-            ...makeConfig(),
-            baseFee: 100,
-            feeRampBps: 1000,
-            feeFloorBps: 20,
-            repegThresholdToken1UpWad: 2n * 10n ** 15n, // == cap
-            repegThresholdToken1DownWad: 2n * 10n ** 15n,
-          },
-          SEED,
-          SEED,
-          creator.address
-        )
-      ).to.not.be.reverted;
-    });
-
-    it("uses flat baseFee (not the floor) as the scale when the ramp is off", async function () {
-      const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-      // makeConfig: baseFee 30, feeRampBps 0, feeFloorBps 20. With the ramp
-      // off the cap is baseFee·1e14 = 3e15 — a threshold of 2.5e15 sits above
-      // the floor-derived 2e15 but below the flat cap, so it must be accepted:
-      // proves the `feeRampBps == 0 → baseFee` branch.
-      await expect(
-        factory.connect(creator).createPoolAndAddLiquidity(
-          await t0.getAddress(),
-          await t1.getAddress(),
-          {
-            ...makeConfig(),
-            repegThresholdToken1UpWad: 25n * 10n ** 14n,
-            repegThresholdToken1DownWad: 25n * 10n ** 14n,
-          },
-          SEED,
-          SEED,
-          creator.address
-        )
-      ).to.not.be.reverted;
-    });
-
-    for (const side of ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] as const) {
-      it(`rejects ${side} above baseFee·1e14 when the ramp is off`, async function () {
-        const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-        await expect(
-          factory
-            .connect(creator)
-            .createPoolAndAddLiquidity(
-              await t0.getAddress(),
-              await t1.getAddress(),
-              { ...makeConfig(), [side]: 3n * 10n ** 15n + 1n },
-              SEED,
-              SEED,
-              creator.address
-            )
-        ).to.be.revertedWithCustomError(factory, "RepegThresholdExceedsFeeScale");
-      });
-    }
-
-    it("does not stall-guard repegStepWad: a large step with a small threshold deploys", async function () {
-      const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-      // Step at half a WAD is wildly above the 3e15 fee scale, but the stall
-      // guard binds only the threshold (the dead-band pins the first repeg;
-      // the step cap merely widens the per-block ceiling and the damping
-      // `deviation/5` keeps individual moves proportional). With the default
-      // threshold (1e15 ≤ cap) the pool must deploy.
-      await expect(
-        factory
-          .connect(creator)
-          .createPoolAndAddLiquidity(
-            await t0.getAddress(),
-            await t1.getAddress(),
-            { ...makeConfig(), repegStepWad: 5n * 10n ** 17n },
-            SEED,
-            SEED,
-            creator.address
-          )
-      ).to.not.be.reverted;
-    });
-
-    it("skips the guard entirely when auto-repeg is disabled (repegShareBps = 0)", async function () {
-      const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-      // Thresholds at half a WAD with a 30 bps flat fee would be wildly above
-      // the cap — but with share = 0 the thresholds are inert (`_tryAutoRepeg`
-      // short-circuits before reading them), so any in-range values deploy.
-      await expect(
-        factory.connect(creator).createPoolAndAddLiquidity(
-          await t0.getAddress(),
-          await t1.getAddress(),
-          {
-            ...makeConfig(),
-            repegShareBps: 0,
-            repegThresholdToken1UpWad: 5n * 10n ** 17n,
-            repegThresholdToken1DownWad: 5n * 10n ** 17n,
-          },
-          SEED,
-          SEED,
-          creator.address
-        )
-      ).to.not.be.reverted;
+      await factory.connect(creator).createPoolAndAddLiquidity(
+        await t0.getAddress(),
+        await t1.getAddress(),
+        {
+          ...makeConfig(),
+          repegShareBps: 0,
+          repegThresholdToken1UpWad: 10n ** 18n - 1n,
+          repegThresholdToken1DownWad: 10n ** 18n - 1n,
+        },
+        SEED,
+        SEED,
+        creator.address
+      );
+      const pool = await hre.ethers.getContractAt("EquilibraPool", await factory.allPools(0));
+      expect((await pool.getFeeConfig()).repegShareBps).to.equal(0);
     });
   });
 
@@ -371,8 +327,7 @@ describe("EquilibraFactory: views + parameter validation", function () {
   });
 
   // -------------------------------------------------------------------------
-  // Repeg threshold range validation: both direction dead-bands share the
-  // [1, 1e18] range of the step and are rejected with their own error.
+  // Repeg threshold range validation: both direction dead-bands are in [1, 1e18).
   // -------------------------------------------------------------------------
   describe("repeg threshold range validation (InvalidRepegThreshold)", function () {
     for (const side of ["repegThresholdToken1UpWad", "repegThresholdToken1DownWad"] as const) {
@@ -392,22 +347,22 @@ describe("EquilibraFactory: views + parameter validation", function () {
         ).to.be.revertedWithCustomError(factory, "InvalidRepegThreshold");
       });
 
-      it(`rejects ${side} above 1e18 (WAD)`, async function () {
+      it(`rejects ${side} at or above 1e18 (WAD)`, async function () {
         const { creator, factory, t0, t1 } = await loadFixture(deployFixture);
-        // repegShareBps = 0 keeps the stall guard out of the picture, so the
-        // range check is the only clause that can revert here.
-        await expect(
-          factory
-            .connect(creator)
-            .createPoolAndAddLiquidity(
-              await t0.getAddress(),
-              await t1.getAddress(),
-              { ...makeConfig(), repegShareBps: 0, [side]: 10n ** 18n + 1n },
-              SEED,
-              SEED,
-              creator.address
-            )
-        ).to.be.revertedWithCustomError(factory, "InvalidRepegThreshold");
+        for (const threshold of [10n ** 18n, 10n ** 18n + 1n]) {
+          await expect(
+            factory
+              .connect(creator)
+              .createPoolAndAddLiquidity(
+                await t0.getAddress(),
+                await t1.getAddress(),
+                { ...makeConfig(), repegShareBps: 0, [side]: threshold },
+                SEED,
+                SEED,
+                creator.address
+              )
+          ).to.be.revertedWithCustomError(factory, "InvalidRepegThreshold");
+        }
       });
     }
   });

@@ -334,19 +334,12 @@ describe("ProportionalDeposit", function () {
       await expect(bootstrap(1n, 1n)).to.be.revertedWithCustomError(Pool, "MathInvariantViolation");
     });
 
-    it("rejects genesis seeds that clear the supply floor but under-resolve the kernel", async function () {
+    it("accurately resolves small balanced genesis seeds above the supply floor", async function () {
       const { bootstrap } = await loadFixture(deployFixture);
-      const Pool = await hre.ethers.getContractFactory("EquilibraPool");
-      // Both seeds clear the 1e6 supply floor yet sit in the region
-      // where the asymmetric-coord kernel cannot resolve the `2·WAD`
-      // genesis identity, so the precision gate (`GenesisVpImprecise`)
-      // rejects them. Without this gate the stored genesis floor would
-      // understate the LP principal the auto-repeg gate protects.
-      //   1e8 raw 18-dec: nWad = floor((1e8)² / 1e18) = 0 -> vp 0.
-      await expect(bootstrap(10n ** 8n, 10n ** 8n)).to.be.revertedWithCustomError(Pool, "GenesisVpImprecise");
-      //   1e9 raw 18-dec: nWad > 0 but L is materially understated
-      //   -> vp ~= 0.90961·WAD (live WETH preset a), ~1.09e18 off 2·WAD.
-      await expect(bootstrap(10n ** 9n, 10n ** 9n)).to.be.revertedWithCustomError(Pool, "GenesisVpImprecise");
+      for (const raw of [10n ** 8n, 10n ** 9n]) {
+        const pool = await hre.ethers.getContractAt("EquilibraPool", await bootstrap(raw, raw));
+        expect((await pool.getLpValueState()).genesisWad).to.equal(2n * WAD - 1n);
+      }
     });
 
     it("accepts a material genesis seed and stores vp within tolerance of 2·WAD", async function () {

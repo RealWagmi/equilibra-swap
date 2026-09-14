@@ -243,7 +243,7 @@ describe("FactoryIntegration", function () {
   // and the contract surfaces immediately as a failing assertion.
   const MAX_BASE_FEE = 2_000;
   const MAX_PROTOCOL_FEE = 25;
-  const MIN_EMA_PERIOD = 60;
+  const MIN_EMA_PERIOD = 600;
   // Largest accepted half-life input: the factory bounds the stored
   // internal tau = ceil(emaPeriod * 1000 / 694) by MAX_EMA_PERIOD
   // (604800 s), i.e. floor(604800 * 694 / 1000).
@@ -421,7 +421,7 @@ describe("FactoryIntegration", function () {
           await token0.getAddress(),
           await token1.getAddress(),
           {
-            ...makeConfig(4, 1200),
+            ...makeConfig(0, 1200),
             aWad: PRESET.aWad,
             lambdaWad: PRESET.lambdaWad,
           },
@@ -467,6 +467,32 @@ describe("FactoryIntegration", function () {
         )
       ).to.be.revertedWithCustomError(factory, "InvalidEmaPeriod");
     });
+
+    for (const isPrivate of [false, true]) {
+      it(`${isPrivate ? "private" : "public"} EMA floor is enforced at creation, before any seed transfer`, async function () {
+        const { creator, token0, token1, factory } = await loadFixture(deployFixture);
+        const create = isPrivate
+          ? factory.connect(creator).createPrivatePoolAndAddLiquidity
+          : factory.connect(creator).createPoolAndAddLiquidity;
+        const minimum = isPrivate ? 60 : 600;
+        for (const halfLife of isPrivate ? [0, 59] : [0, 59, 60, 300, 599]) {
+          await expect(
+            create(token0.target, token1.target, makeConfig(25, halfLife), SEED, SEED, creator.address)
+          ).to.be.revertedWithCustomError(factory, "InvalidEmaPeriod");
+        }
+        expect(await factory.allPoolsLength()).to.equal(0n);
+        expect(await token0.balanceOf(creator.address)).to.equal(SEED * 4n);
+        expect(await token1.balanceOf(creator.address)).to.equal(SEED * 4n);
+        await create(token0.target, token1.target, makeConfig(25, minimum), SEED, SEED, creator.address);
+        const address = await factory.allPools(0);
+        const pool = await hre.ethers.getContractAt("EquilibraPool", address);
+        expect((await pool.getFeeConfig()).emaPeriod).to.equal(minimum);
+        expect(await factory.isPrivatePool(address)).to.equal(isPrivate);
+        await expect(
+          create(token0.target, token1.target, makeConfig(25, MAX_EMA_HALF_LIFE + 1), SEED, SEED, creator.address)
+        ).to.be.revertedWithCustomError(factory, "InvalidEmaPeriod");
+      });
+    }
 
     it("reverts with InvalidEmaPeriod when the converted tau exceeds MAX_EMA_PERIOD", async function () {
       const { creator, token0, token1, factory } = await loadFixture(deployFixture);
@@ -514,11 +540,11 @@ describe("FactoryIntegration", function () {
     it("accepts the emaPeriod boundaries and rounding edges, returning the half-life bit-for-bit", async function () {
       const { creator, token0, token1, factory } = await loadFixture(deployFixture);
       // Beyond the two boundaries, the sampled half-lives hit every
-      // rounding class of the ceil conversion — the remainder
+      // rounding class of the ceil conversion (adding 694 preserves it) — the remainder
       // (h * 1000) % 694 is always even, so the edges are r = 0 (exact
       // division, 347 -> tau 500), r = 2 (minimal bump, 220 -> 318) and
       // r = 692 (maximal bump, 127 -> 183) — plus typical deploy values.
-      const samples = [MIN_EMA_PERIOD, 127, 220, 347, 600, 3600, 86_400, MAX_EMA_HALF_LIFE];
+      const samples = [MIN_EMA_PERIOD, 127 + 694, 220 + 694, 347 + 694, 3600, 86_400, MAX_EMA_HALF_LIFE];
       await token0.mint(creator.address, SEED * BigInt(samples.length));
       await token1.mint(creator.address, SEED * BigInt(samples.length));
       for (const halfLife of samples) {
@@ -642,6 +668,38 @@ describe("FactoryIntegration", function () {
       ).to.be.revertedWithCustomError(factory, "InvalidFeeFloor");
     });
 
+    it("reverts with InvalidFeeFloor when a live ramp has a zero floor", async function () {
+      const { creator, token0, token1, factory } = await loadFixture(deployFixture);
+      await expect(
+        factory
+          .connect(creator)
+          .createPoolAndAddLiquidity(
+            await token0.getAddress(),
+            await token1.getAddress(),
+            { ...makeConfig(1, 1200), feeRampBps: 9_500, feeFloorBps: 0 },
+            SEED,
+            SEED,
+            creator.address
+          )
+      ).to.be.revertedWithCustomError(factory, "InvalidFeeFloor");
+    });
+
+    it("rejects a one-bps ceiling for a live ramp", async function () {
+      const { creator, token0, token1, factory } = await loadFixture(deployFixture);
+      await expect(
+        factory
+          .connect(creator)
+          .createPoolAndAddLiquidity(
+            await token0.getAddress(),
+            await token1.getAddress(),
+            { ...makeConfig(1, 1200), feeRampBps: 9_500, feeFloorBps: 1 },
+            SEED,
+            SEED,
+            creator.address
+          )
+      ).to.be.revertedWithCustomError(factory, "InvalidFeeFloor");
+    });
+
     it("reverts with InvalidRepegShare when repegShareBps exceeds MAX_REPEG_SHARE_BPS", async function () {
       const { creator, token0, token1, factory } = await loadFixture(deployFixture);
       await expect(
@@ -667,7 +725,7 @@ describe("FactoryIntegration", function () {
       ).to.be.revertedWithCustomError(factory, "InvalidRepegShare");
     });
 
-    it("rejects feeFloorBps == baseFee with feeRampBps != 0 (FeeRampNoHeadroom)", async function () {
+    it("rejects feeFloorBps == baseFee with feeRampBps != 0", async function () {
       const { creator, token0, token1, factory } = await loadFixture(deployFixture);
       // Pairing a non-zero ramp with `baseFee == feeFloorBps` would
       // leave the smoothstep with no headroom to interpolate into —
@@ -693,13 +751,13 @@ describe("FactoryIntegration", function () {
           SEED,
           creator.address
         )
-      ).to.be.revertedWithCustomError(factory, "FeeRampNoHeadroom");
+      ).to.be.revertedWithCustomError(factory, "InvalidFeeFloor");
     });
 
-    it("accepts feeFloorBps == baseFee when feeRampBps == 0 (flat-fee mode)", async function () {
+    it("ignores feeFloorBps when feeRampBps == 0 (flat-fee mode)", async function () {
       const { creator, token0, token1, factory } = await loadFixture(deployFixture);
-      // Equality is fine in flat-fee mode (`feeRampBps == 0`): no
-      // ramp means no headroom is needed.
+      // The floor is not read in flat-fee mode, so it does not constrain
+      // the effective fee and may exceed the ceiling.
       await factory.connect(creator).createPoolAndAddLiquidity(
         await token0.getAddress(),
         await token1.getAddress(),
@@ -712,7 +770,7 @@ describe("FactoryIntegration", function () {
           repegThresholdToken1UpWad: WAD / 1_000n,
           repegThresholdToken1DownWad: WAD / 1_000n,
           feeRampBps: 0,
-          feeFloorBps: 50, // == baseFee
+          feeFloorBps: 51,
           repegShareBps: 5_000,
         },
         SEED,
@@ -723,7 +781,7 @@ describe("FactoryIntegration", function () {
       const pool = await hre.ethers.getContractAt("EquilibraPool", poolAddr);
       const fee = await pool.getFeeConfig();
       expect(fee.baseFee).to.equal(50n);
-      expect(fee.feeFloorBps).to.equal(50n);
+      expect(fee.feeFloorBps).to.equal(51n);
     });
   });
 
@@ -977,8 +1035,8 @@ describe("FactoryIntegration", function () {
       // asymmetric seed amounts. The factory must re-pair the amounts
       // to match the sorted slot order, so each token's pool reserve
       // is the one the caller asked for.
-      const reversedFirst = t0 > t1 ? t0 : t1;
-      const reversedSecond = t0 > t1 ? t1 : t0;
+      const reversedFirst = BigInt(t0) > BigInt(t1) ? t0 : t1;
+      const reversedSecond = BigInt(t0) > BigInt(t1) ? t1 : t0;
       const seedFirst = SEED;
       const seedSecond = SEED * 2n;
       await factory.connect(creator).createPoolAndAddLiquidity(
@@ -997,8 +1055,8 @@ describe("FactoryIntegration", function () {
       const pool = await hre.ethers.getContractAt("EquilibraPool", poolAddr);
       const meta = await pool.getPoolMetadata();
       // Sorted slots: token0 is the lower address, token1 is the higher.
-      const sorted0 = t0 < t1 ? t0 : t1;
-      const sorted1 = t0 < t1 ? t1 : t0;
+      const sorted0 = BigInt(t0) < BigInt(t1) ? t0 : t1;
+      const sorted1 = BigInt(t0) < BigInt(t1) ? t1 : t0;
       expect(meta.token0).to.equal(sorted0);
       expect(meta.token1).to.equal(sorted1);
       const [r0, r1] = await pool.getReserves();

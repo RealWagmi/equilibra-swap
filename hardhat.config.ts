@@ -1,5 +1,6 @@
 import { HardhatUserConfig, subtask } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
+import "hardhat-contract-sizer";
 import { TASK_COMPILE_SOLIDITY_CHECK_ERRORS } from "hardhat/builtin-tasks/task-names";
 import { config as dotEnvConfig } from "dotenv";
 
@@ -11,8 +12,9 @@ dotEnvConfig();
 // actionable in this repo. Filter the compiler diagnostics before
 // Hardhat prints them: drop warnings originating in solady sources,
 // plus solc's location-less ">256 warnings" cap notice (code 4591),
-// which only ever fires on that suppressed flood. Errors of any
-// severity and warnings from contracts/ pass through untouched.
+// which only ever fires on that suppressed flood. Errors and emitted
+// project warnings pass through. solc may already have truncated later
+// warnings; contract-sizer checks artifact sizes independently below.
 subtask(TASK_COMPILE_SOLIDITY_CHECK_ERRORS, async (args: any, _hre, runSuper) => {
   const errors = args?.output?.errors;
   if (Array.isArray(errors)) {
@@ -46,21 +48,17 @@ const config: HardhatUserConfig = {
       {
         version: "0.8.36",
         settings: {
-          // The pool bytecode hovers near the 24 KB Spurious Dragon
-          // limit. `runs = 2000` is the measured operating point: vs
-          // the historical 9999 it frees ~1.2 KB of EIP-170 headroom
-          // for +278 gas on an `exactInputSingle` (~0.2%) — headroom
-          // the donation parachute + active-share accounting spend.
-          // Coverage builds flip to `runs = 1`: coverage measures hit
-          // counts, not gas, and the size-optimised legacy build keeps
-          // the un-instrumented pool under the limit.
-          optimizer: { enabled: true, runs: isCoverage ? 1 : 2000 },
+          // Higher runs trade bytecode headroom for execution gas.
+          // contract-sizer reports the actual production artifact sizes.
+          // Coverage uses runs = 1 for hit counts, not deployment or gas.
+          optimizer: { enabled: true, runs: isCoverage ? 1 : 999 },
           // Keep the CBOR metadata tail (53 bytes: ipfs hash + solc
           // version): explorers and hardhat-verify infer the compiler
           // version from it, and Sourcify "perfect match" needs the
           // embedded hash. The pool's EIP-170 headroom absorbs the 53
           // bytes (see test/security/BytecodeSize.test.ts).
           metadata: { appendCBOR: true },
+          outputSelection: { "*": { "*": ["storageLayout"] } },
           evmVersion: "cancun",
           // Coverage flips to the legacy codegen (see `isCoverage`
           // above), so every contract must stay within the 16-slot
@@ -75,6 +73,13 @@ const config: HardhatUserConfig = {
     tests: "./test",
     artifacts: "./artifacts",
     cache: "./cache",
+  },
+  contractSizer: {
+    runOnCompile: !isCoverage,
+    strict: false,
+    alphaSort: true,
+    unit: "B",
+    only: [":Equilibra(Pool|Router|Factory|ParamTimelock)$"],
   },
   // Test-only access to internal pool helpers is provided by
   // `contracts/mocks/MockEquilibraPool.sol` instead of the broader

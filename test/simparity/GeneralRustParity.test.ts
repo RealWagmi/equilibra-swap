@@ -1,3 +1,4 @@
+import { poolEmaLogWad } from "../helpers/storageLayout";
 import { time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
 import hre from "hardhat";
@@ -121,6 +122,7 @@ type RecordedState = {
   anchorReserve0: bigint;
   anchorReserve1: bigint;
   equilibraEmaPrice: bigint;
+  equilibraEmaLogWad: bigint;
   equilibraLastTimestamp: bigint;
   equilibraLastRecenterTimestamp: bigint;
   equilibraAnchorPriceWad: bigint;
@@ -193,6 +195,7 @@ type RustTraceStateOut = {
   anchorReserve0: string;
   anchorReserve1: string;
   equilibraEmaPrice?: string;
+  equilibraEmaLogWad?: string;
   equilibraLastTimestamp?: string;
   equilibraLastRecenterTimestamp?: string;
   equilibraRepegStepWad?: string;
@@ -564,6 +567,7 @@ async function captureState(ctx: PoolContext): Promise<RecordedState> {
     anchorReserve0: anchor0,
     anchorReserve1: anchor1,
     equilibraEmaPrice: emaPrice,
+    equilibraEmaLogWad: await poolEmaLogWad(await ctx.pool.getAddress()),
     equilibraLastTimestamp: BigInt(ctx.trackedLastEmaTs),
     equilibraLastRecenterTimestamp: BigInt(ctx.trackedLastRepegTs),
     equilibraAnchorPriceWad: anchorPriceWad,
@@ -748,6 +752,16 @@ async function pushAdd(
   }
   expect(shares, "addLiquidity receipt missing LiquidityAdded event").to.be.greaterThan(0n);
 
+  // Integer payment rule: ceil token1 against token0, or floor token0 if token1 binds.
+  const matching1 = (amount0Desired * pre.reserve1 + pre.reserve0 - 1n) / pre.reserve0;
+  const expected1 = matching1 > amount1Desired ? amount1Desired : matching1;
+  const expected0 = matching1 > amount1Desired ? (amount1Desired * pre.reserve0) / pre.reserve1 : amount0Desired;
+  expect(amount0Used).to.equal(expected0);
+  expect(amount1Used).to.equal(expected1);
+  const activeBefore = pre.totalSupply - pre.donationShares;
+  expect(shares).to.equal((expected0 * activeBefore) / pre.reserve0);
+  expect(shares * pre.reserve1).to.be.at.most(expected1 * activeBefore);
+
   // `addLiquidity` (after genesis) does not update either timestamp.
   ctx.lastActionIsSwap = false;
 
@@ -862,6 +876,7 @@ function buildRustTraceInput(ctx: PoolContext, steps: RecordedStep[]): Record<st
     equilibraE0: firstPre.e0.toString(),
     equilibraE1: firstPre.e1.toString(),
     equilibraEmaPrice: firstPre.equilibraEmaPrice.toString(),
+    equilibraEmaLogWad: firstPre.equilibraEmaLogWad.toString(),
     equilibraLastTimestamp: firstPre.equilibraLastTimestamp.toString(),
     equilibraLastRecenterTimestamp: firstPre.equilibraLastRecenterTimestamp.toString(),
     equilibraAnchorPriceWad: firstPre.equilibraAnchorPriceWad.toString(),
@@ -937,6 +952,7 @@ function assertStateMatchesRust(
   expect(BigInt(actual.anchorReserve0), `${tag} anchorReserve0`).to.equal(expected.anchorReserve0);
   expect(BigInt(actual.anchorReserve1), `${tag} anchorReserve1`).to.equal(expected.anchorReserve1);
   expect(BigInt(actual.equilibraEmaPrice ?? "0"), `${tag} equilibraEmaPrice`).to.equal(expected.equilibraEmaPrice);
+  expect(BigInt(actual.equilibraEmaLogWad!), `${tag} equilibraEmaLogWad`).to.equal(expected.equilibraEmaLogWad);
   expect(BigInt(actual.equilibraLastTimestamp ?? "0"), `${tag} equilibraLastTimestamp`).to.equal(
     expected.equilibraLastTimestamp
   );
@@ -976,6 +992,7 @@ function assertRustStateChainContinuity(label: string, prevPost: RustTraceStateO
   }
   for (const key of [
     "equilibraEmaPrice",
+    "equilibraEmaLogWad",
     "equilibraLastTimestamp",
     "equilibraLastRecenterTimestamp",
     "equilibraAnchorPriceWad",
@@ -1052,8 +1069,7 @@ async function runScenario(infra: PoolInfra, baseSymbol: BaseSymbol): Promise<vo
   }
 
   // --- Phase 2: add liquidity mid-scenario (proportional LP-unit re-anchor). ---
-  // 5% of current reserves on both sides is proportional enough that the
-  // pool's min-ratio check accepts both amounts unchanged.
+  // Request about 5% of both reserves; integer rounding may trim the token0 leg.
   const add0 = (current.reserve0 * 500n) / 10_000n;
   const add1 = (current.reserve1 * 500n) / 10_000n;
   ts += 300;
@@ -1214,6 +1230,7 @@ async function assertInvariantsAndRustParity(ctx: PoolContext, steps: RecordedSt
     expect(cur.protocolFee1, `${tag} protocolFee1`).to.equal(prev.protocolFee1);
     expect(cur.equilibraAnchorPriceWad, `${tag} anchorPrice`).to.equal(prev.equilibraAnchorPriceWad);
     expect(cur.equilibraEmaPrice, `${tag} emaPrice`).to.equal(prev.equilibraEmaPrice);
+    expect(cur.equilibraEmaLogWad, `${tag} emaLog`).to.equal(prev.equilibraEmaLogWad);
     expect(cur.equilibraLpUnitValueGenesisWad, `${tag} lpUnitValueGenesisWad`).to.equal(
       prev.equilibraLpUnitValueGenesisWad
     );
@@ -1307,8 +1324,7 @@ async function assertInvariantsAndRustParity(ctx: PoolContext, steps: RecordedSt
 // test/security/DonationParachute.test.ts's `starvedFixture`: a 5 bps
 // flat fee crossed with a 1 bps repeg share keeps the pool's own
 // spendable growth surplus permanently under `REPEG_GAS_GUARD_WAD`, and
-// 1e14 dead-bands (inside the stall-guard cap `5 · 1e14`)
-// put the parachute activation at `K × 1e14` (0.3%
+// 1e14 dead-bands put the parachute activation at `K × 1e14` (0.3%
 // geometric anchor lag at the canonical creation seed K = 30, read from
 // the pool — never hardcoded). Drive a large anchor lag, park a
 // donation via the plain-LP-transfer primitive, then trigger: the

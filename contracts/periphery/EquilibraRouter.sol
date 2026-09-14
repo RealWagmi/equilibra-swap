@@ -26,9 +26,22 @@ import { EquilibraSwapMath } from "../libraries/EquilibraSwapMath.sol";
 import { PoolAddressCompute } from "../libraries/PoolAddressCompute.sol";
 import { SwapPath } from "../libraries/SwapPath.sol";
 
-/// @dev Minimal EIP-2612 surface used by {EquilibraRouter.selfPermit}.
-///      Every Equilibra LP token implements it (Solady ERC20 + permit).
+/**
+ * @title IERC20Permit
+ * @notice Minimal EIP-2612 surface used by {EquilibraRouter.selfPermit}.
+ * @dev Every Equilibra LP token implements it (Solady ERC20 with permit).
+ */
 interface IERC20Permit {
+    /**
+     * @notice Set `spender`'s allowance over `owner`'s tokens to `value` by signature.
+     * @param owner Token holder that signed the approval.
+     * @param spender Address being approved.
+     * @param value Allowance to set, raw token units.
+     * @param deadline Signature expiry, UNIX seconds.
+     * @param v Signature recovery id.
+     * @param r Signature `r` word.
+     * @param s Signature `s` word.
+     */
     function permit(
         address owner,
         address spender,
@@ -40,22 +53,16 @@ interface IERC20Permit {
     ) external;
 }
 
-/// @title EquilibraRouter
-/// @notice User-facing swap, liquidity and payment router for callback-based
-///         Equilibra pools.
-/// @dev Routes user-facing entrypoints through internal `*Internal`
-///      helpers, unifies WETH wrapping via `_pay`, supports batching
-///      via {multicall} and output capture via {sweepToken}/{unwrapWETH9}.
-///      Two callback encodings are supported: a compact 128-byte
-///      single-hop path (cheaper gas) and a dynamic {SwapPath}-encoded
-///      multi-hop path.
-///
-///      All ERC20/ETH movements go through Solady's {SafeTransferLib}.
-///
-///      Batching is inherited from Solady's {Multicallable}. The default
-///      implementation rejects `msg.value != 0` to prevent double-spending,
-///      so we override {multicall} to re-enable payable batches (required
-///      for native-ETH swaps chained with `refundETH`).
+/**
+ * @title EquilibraRouter
+ * @notice User-facing swap, liquidity, donation, zap and payment router for callback-based
+ * Equilibra pools.
+ * @dev Public entrypoints delegate to `*Internal` helpers. Every token and ETH movement goes
+ * through Solady's {SafeTransferLib}; {_pay} and {_pullOrWrap} unify WETH9 wrapping. Two
+ * swap-callback encodings exist: a compact 128-byte single-hop payload and the dynamic {SwapPath}
+ * multi-hop payload. {multicall} overrides Solady's {Multicallable} to accept `msg.value`, so
+ * native-ETH legs batch with {refundETH}.
+ */
 contract EquilibraRouter is
     IEquilibraRouter,
     IEquilibraSwapCallback,
@@ -69,6 +76,17 @@ contract EquilibraRouter is
     // Events (zap)
     // =====================================================================
 
+    /**
+     * @notice Emitted by both zap-in entrypoints after the mint and the residual refund.
+     * @param pool Pool that minted the shares.
+     * @param user Caller that funded the zap and received the residuals.
+     * @param tokenIn Deposited token, or `address(0)` for the imbalanced zap.
+     * @param amountIn Effective input: `params.amountIn`, the resolved staged balance on the
+     * sentinel path, or the sum of both raw deposits for the imbalanced zap.
+     * @param liquidity LP shares minted.
+     * @param dust0 Token0 residual refunded to `user`, raw units.
+     * @param dust1 Token1 residual refunded to `user`, raw units.
+     */
     event ZapIn(
         address indexed pool,
         address indexed user,
@@ -79,6 +97,14 @@ contract EquilibraRouter is
         uint256 dust1
     );
 
+    /**
+     * @notice Emitted by {zapOutSingleSided} after the burn, the off-side swap and the payout.
+     * @param pool Pool whose shares were burned.
+     * @param user Caller whose shares were burned.
+     * @param tokenOut Token paid out.
+     * @param liquidity LP shares burned.
+     * @param amountOut Total paid in `tokenOut`, raw units.
+     */
     event ZapOut(
         address indexed pool,
         address indexed user,
@@ -91,78 +117,100 @@ contract EquilibraRouter is
     // Immutables
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     address public immutable override factory;
+    /**
+     * @notice EIP-1167 implementation every pool of {factory} is cloned from.
+     */
     address public immutable poolImplementation;
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     address public immutable override WETH9;
+    /**
+     * @dev Clone init-code hash of `poolImplementation` for CREATE2 pool address derivation.
+     */
     bytes32 private immutable _initCodeHash;
 
-    /// @dev Size in bytes of the **compact** single-hop callback
-    ///      payload `abi.encode(tokenIn, tokenOut, poolIndex, payer)`.
-    ///      Four static fields, each padded to 32 bytes → `4 · 32 = 128`.
-    ///      The multi-hop encoding (`abi.encode(SwapCallbackData)`) is
-    ///      ≥ 160 bytes for any valid path (head: 64; tail: ≥ 32 length
-    ///      + ≥ 64 padded path), so dispatching on `_data.length == 128`
-    ///      cleanly discriminates the two cases.
+    /**
+     * @dev Byte size of the compact single-hop callback payload
+     * `abi.encode(tokenIn, tokenOut, poolIndex, payer)`: four static fields, each padded to 32
+     * bytes. The multi-hop encoding `abi.encode(SwapCallbackData)` is at least 160 bytes for any
+     * valid path (64-byte head, 32-byte length word, at least 64 bytes of padded path), so
+     * `_data.length == 128` discriminates the two.
+     */
     uint256 private constant _SINGLE_HOP_PAYLOAD_BYTES = 128;
 
-    /// @dev Exact-input amount sentinel: consume the router's ENTIRE
-    ///      live balance of the leg's input token — regardless of
-    ///      provenance — and pay the leg from it
-    ///      (`payer = address(this)`). Stage and consume atomically
-    ///      within one transaction: any pre-existing balance (a stray
-    ///      transfer, output staged by an earlier transaction) is
-    ///      included AND equally sweepable by anyone via the
-    ///      permissionless payment helpers, so pre-funding the router
-    ///      ahead of time is unsafe. A WETH9 leg reads the existing
-    ///      WETH balance only — attached native value is NOT wrapped
-    ///      by the sentinel and stays claimable via `refundETH`.
-    ///      Cannot collide with a real amount: every other value
-    ///      >= 2^255 still reverts in the checked int256 cast, and
-    ///      pool-side amounts are capped at uint128. The zap twin of
-    ///      this convention is `zapInSingleSided.amountIn == 0`.
+    /**
+     * @dev Exact-input amount sentinel: consume the router's entire live balance of the leg's
+     * input token, whatever its provenance, and pay the leg from it (`payer = address(this)`).
+     * Stage and consume within one transaction: any pre-existing balance is included and equally
+     * sweepable by anyone through the permissionless payment helpers. A WETH9 leg reads the
+     * existing WETH balance only; the sentinel wraps no attached native value (claimable via
+     * {refundETH}). Every other value >= 2^255 reverts in the checked int256 cast and pool-side
+     * amounts are capped at uint128, so the sentinel collides with no real amount. The zap twin
+     * is `zapInSingleSided.amountIn == 0`.
+     */
     uint256 private constant _CONTRACT_BALANCE = type(uint256).max;
 
     // =====================================================================
     // Transient storage (EIP-1153)
     // =====================================================================
 
-    /// @dev Slot used by exact-output multi-hop to relay the final-leg
-    ///      input cost from the swap callback up to the {exactOutput}
-    ///      entrypoint. Lives in EIP-1153 transient storage so it is
-    ///      automatically cleared at the end of every transaction —
-    ///      no constructor sentinel and no manual cleanup are required.
-    ///      Slot derived from `bytes9(keccak256("EQUILIBRA_AMOUNT_IN_CACHED_TSLOT"))`
-    ///      with the high bit set (Solady-style) to keep it well outside
-    ///      the linear storage layout.
+    /**
+     * @dev EIP-1153 transient slot through which the final-hop swap callback relays the
+     * exact-output multi-hop input cost up to {exactOutput}, which clears it after reading.
+     * Transient storage also clears at transaction end; no constructor sentinel is needed. Derived from
+     * `bytes9(keccak256("EQUILIBRA_AMOUNT_IN_CACHED_TSLOT"))` with the high bit set, keeping it
+     * outside the linear storage layout.
+     */
     uint256 private constant _AMOUNT_IN_CACHED_TSLOT = 0x80000000000a4b6c1f;
 
     // =====================================================================
     // Callback payloads
     // =====================================================================
 
+    /**
+     * @notice Multi-hop swap-callback payload.
+     */
     struct SwapCallbackData {
+        /// Remaining {SwapPath}; its first pool is the one issuing the callback.
         bytes path;
+        /// Address charged for the input leg; `address(this)` pays from router-staged funds.
         address payer;
     }
 
+    /**
+     * @notice Mint-callback payload.
+     */
     struct MintCallbackData {
+        /// Canonical `token0 < token1` of the pool.
         address token0;
         address token1;
+        /// Pair-local index of the pool under the factory.
         uint32 pairPoolIndex;
+        /// Address charged for both legs; `address(this)` pays from router-staged funds.
         address payer;
     }
 
-    /// @dev Reverts with `Errors.DeadlineExpired(overshoot)` when
-    ///      `block.timestamp > deadline`. `deadline` is UNIX-seconds;
-    ///      equality (`block.timestamp == deadline`) still passes —
-    ///      a swap that lands in the exact deadline-second succeeds.
+    /**
+     * @dev Reverts `DeadlineExpired(overshoot)` when `block.timestamp > deadline`; equality passes.
+     * @param deadline UNIX seconds.
+     */
     modifier checkDeadline(uint256 deadline) {
         if (block.timestamp > deadline) revert Errors.DeadlineExpired(block.timestamp - deadline);
         _;
     }
 
+    /**
+     * @dev Binds the router to one factory, pool implementation and WETH9 (a zero address reverts
+     * `ZeroAddress`) and caches the clone init-code hash used for CREATE2 pool resolution.
+     * @param _factory Factory whose pools this router serves.
+     * @param _poolImplementation EIP-1167 implementation the factory clones.
+     * @param _WETH9 Canonical wrapped-native token.
+     */
     constructor(address _factory, address _poolImplementation, address _WETH9) {
         if (_factory == address(0) || _poolImplementation == address(0) || _WETH9 == address(0))
             revert Errors.ZeroAddress();
@@ -172,9 +220,10 @@ contract EquilibraRouter is
         _initCodeHash = PoolAddressCompute.initCodeHash(_poolImplementation);
     }
 
-    /// @dev Accept ETH only from the canonical WETH9. Any other ETH would
-    ///      get stuck here (unless caller uses {refundETH} in a multicall),
-    ///      so we fail fast on unexpected deposits.
+    /**
+     * @dev Accepts ETH only from WETH9 (unwrap proceeds); any other deposit reverts `NotWETH9` so
+     * value cannot be stranded on the router by a plain transfer.
+     */
     receive() external payable {
         if (msg.sender != WETH9) revert Errors.NotWETH9();
     }
@@ -183,22 +232,14 @@ contract EquilibraRouter is
     // Multicall
     // =====================================================================
 
-    /// @inheritdoc IMulticall
-    /// @dev Overrides Solady's {Multicallable.multicall} to drop the
-    ///      default `msg.value != 0` guard. The router intentionally
-    ///      accepts ETH into a multicall so that an `exactInput*`
-    ///      call with `tokenIn == WETH9` can wrap native value inside
-    ///      the callback and subsequently be refunded via
-    ///      {refundETH}.
-    ///
-    ///      Security note: each sub-call in the batch is executed
-    ///      via `delegatecall` and observes the *full* `msg.value`
-    ///      as its own `callvalue`. The payment helpers (`_pay`,
-    ///      `_pullOrWrap`,
-    ///      `unwrapWETH9`, `refundETH`, `sweepToken`) compare against
-    ///      `address(this).balance` rather than `msg.value`, so the
-    ///      attached ETH cannot be spent twice within one
-    ///      transaction.
+    /**
+     * @inheritdoc IMulticall
+     * @dev Overrides Solady's {Multicallable.multicall} to drop its `msg.value != 0` guard, so an
+     * exact-input leg with `tokenIn == WETH9` can wrap attached value inside the callback and the
+     * remainder can be reclaimed with {refundETH}. Every sub-call runs via `delegatecall` and
+     * observes the full `msg.value` as its own `callvalue`; the payment helpers compare against
+     * `address(this).balance`, never `msg.value`, so attached ETH cannot be spent twice.
+     */
     function multicall(
         bytes[] calldata data
     ) public payable override(Multicallable, IMulticall) returns (bytes[] memory) {
@@ -209,7 +250,9 @@ contract EquilibraRouter is
     // Periphery payments
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function unwrapWETH9(uint256 amountMinimum, address recipient) external payable override {
         uint256 balance = SafeTransferLib.balanceOf(WETH9, address(this));
         if (balance < amountMinimum) revert Errors.InsufficientWETH9();
@@ -219,7 +262,9 @@ contract EquilibraRouter is
         }
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function sweepToken(
         address token,
         uint256 amountMinimum,
@@ -232,7 +277,9 @@ contract EquilibraRouter is
         }
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function refundETH() external payable override {
         if (address(this).balance > 0) {
             SafeTransferLib.safeTransferETH(msg.sender, address(this).balance);
@@ -243,17 +290,13 @@ contract EquilibraRouter is
     // Callbacks
     // =====================================================================
 
-    /// @inheritdoc IEquilibraMintCallback
-    /// @dev Two payer modes, both settled through {_pay}:
-    ///        - `payer == address(this)`: the router holds the tokens
-    ///          (zap flows stage funds on the router via an upfront
-    ///          {_pullOrWrap} and a swap-output capture), so push via
-    ///          `safeTransfer`.
-    ///        - any other address: the caller of the router entry-point.
-    ///          A WETH9 leg with enough attached native value is wrapped
-    ///          in place (the payable `addLiquidity` ETH path — {_pay}
-    ///          branch 2); anything else is pulled via
-    ///          `safeTransferFrom`.
+    /**
+     * @inheritdoc IEquilibraMintCallback
+     * @dev Verifies that the caller is the CREATE2-derived pool of the payload's pair, then
+     * settles each owed side through {_pay}: `payer == address(this)` pushes router-staged funds
+     * (zap flows); any other payer is charged via `transferFrom`, or has a WETH9 leg wrapped from
+     * attached native value (the payable {addLiquidity} path).
+     */
     function equilibraMintCallback(
         uint256 amount0Owed,
         uint256 amount1Owed,
@@ -270,7 +313,15 @@ contract EquilibraRouter is
         }
     }
 
-    /// @inheritdoc IEquilibraSwapCallback
+    /**
+     * @inheritdoc IEquilibraSwapCallback
+     * @dev Dispatches on payload length: 128 bytes is the compact single-hop encoding, anything
+     * else the {SwapPath} multi-hop one. Both verify `msg.sender` against the CREATE2-derived
+     * pool before paying. An exact-input leg pays the input side from `payer`. An exact-output
+     * leg with pools left recurses into {_exactOutputInternal} so the next hop's output pays this
+     * pool; the final exact-output hop records its input cost in `_AMOUNT_IN_CACHED_TSLOT` and
+     * pays it from `payer`. A callback owing nothing reverts `MathInvariantViolation`.
+     */
     function equilibraSwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
@@ -278,15 +329,13 @@ contract EquilibraRouter is
     ) external override {
         if (amount0Delta <= 0 && amount1Delta <= 0) revert Errors.MathInvariantViolation();
 
-        // Fast path for single-hop swaps (compact encoding).
+        // Fast path: compact single-hop encoding.
         if (_data.length == _SINGLE_HOP_PAYLOAD_BYTES) {
             (address tokenA, address tokenB, uint32 poolIdx, address payer) = abi.decode(
                 _data,
                 (address, address, uint32, address)
             );
-            _verifyCallback(tokenA, tokenB, poolIdx);
-
-            bool aIsToken0 = tokenA < tokenB;
+            bool aIsToken0 = _verifyCallback(tokenA, tokenB, poolIdx);
             if (amount0Delta > 0) {
                 _pay(aIsToken0 ? tokenA : tokenB, payer, msg.sender, uint256(amount0Delta));
             }
@@ -296,27 +345,24 @@ contract EquilibraRouter is
             return;
         }
 
-        // Slow path (multi-hop): dynamic {SwapPath}-encoded payload.
+        // Slow path: {SwapPath}-encoded multi-hop payload.
         SwapCallbackData memory data = abi.decode(_data, (SwapCallbackData));
         (address tokenIn, address tokenOut, uint32 poolIndex) = data.path.decodeFirstPool();
-        _verifyCallback(tokenIn, tokenOut, poolIndex);
+        bool inIsToken0 = _verifyCallback(tokenIn, tokenOut, poolIndex);
 
         (bool isExactInput, uint256 amountToPay) = amount0Delta > 0
-            ? (tokenIn < tokenOut, uint256(amount0Delta))
-            : (tokenOut < tokenIn, uint256(amount1Delta));
+            ? (inIsToken0, uint256(amount0Delta))
+            : (!inIsToken0, uint256(amount1Delta));
 
         if (isExactInput) {
             _pay(tokenIn, data.payer, msg.sender, amountToPay);
         } else if (data.path.hasMultiplePools()) {
-            // Chain the next hop: pay the current pool from the output of
-            // the subsequent hop (reverse-direction multi-hop).
+            // Pay this pool with the output of the next hop (exact-output paths run in reverse).
             data.path = data.path.skipToken();
             _exactOutputInternal(amountToPay, msg.sender, data);
         } else {
-            // Final hop of a multi-hop exact-output: relay the actual input
-            // amount up to {exactOutput} via transient storage instead of a
-            // persistent slot. EIP-1153 auto-clears the slot at tx end, so
-            // no sentinel reset is required.
+            // Final exact-output hop: relay the input cost to {exactOutput} through the transient
+            // slot; EIP-1153 clears it at transaction end.
             /// @solidity memory-safe-assembly
             assembly {
                 tstore(_AMOUNT_IN_CACHED_TSLOT, amountToPay)
@@ -329,13 +375,14 @@ contract EquilibraRouter is
     // Swap: single-hop
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function exactInputSingle(
         ExactInputSingleParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 amountOut) {
-        // No zero-amount short-circuit here: the pool's `swap()` already
-        // rejects `amountSpecified == 0`, surfacing the dedicated
-        // `InvalidAmountSpecified` error from there.
+        // No zero-amount short-circuit: the pool rejects `amountSpecified == 0` with
+        // `InvalidAmountSpecified`.
         amountOut = _exactInputSingleInternal(
             params.tokenIn,
             params.tokenOut,
@@ -347,11 +394,13 @@ contract EquilibraRouter is
         if (amountOut < params.amountOutMinimum) revert Errors.SlippageExceeded();
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function exactOutputSingle(
         ExactOutputSingleParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 amountIn) {
-        // Zero-amount guard lives in the pool — see {exactInputSingle}.
+        // Zero-amount guard lives in the pool.
         amountIn = _exactOutputSingleInternal(
             params.tokenIn,
             params.tokenOut,
@@ -367,7 +416,12 @@ contract EquilibraRouter is
     // Swap: multi-hop
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev The CONTRACT_BALANCE sentinel resolves the router's balance of the path's first token
+     * and makes the router the payer. Intermediate hops deliver to the router and the next hop
+     * pays from that balance; only the last hop pays `params.recipient`.
+     */
     function exactInput(
         ExactInputParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 amountOut) {
@@ -405,7 +459,12 @@ contract EquilibraRouter is
         if (amountOut < params.amountOutMinimum) revert Errors.SlippageExceeded();
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev The input actually paid is the final-hop callback's `amountToPay`, relayed through
+     * `_AMOUNT_IN_CACHED_TSLOT`; {_exactOutputInternal} itself only observes the cost of the first
+     * executed hop, which on a multi-hop route is an intermediate token.
+     */
     function exactOutput(
         ExactOutputParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 amountIn) {
@@ -415,17 +474,9 @@ contract EquilibraRouter is
             SwapCallbackData({ path: params.path, payer: msg.sender })
         );
 
-        // The swap callback for the final hop wrote `amountToPay` into the
-        // transient slot. A zero load here would mean the callback never
-        // ran (impossible without `_exactOutputInternal` reverting and
-        // unwinding the whole tx), so any non-zero value already implies
-        // the slippage check is meaningful.
-        //
-        // We clear the slot before returning so back-to-back
-        // invocations within the same tx — e.g. through {multicall}
-        // — must not see a stale value if a future edit ever drops
-        // the post-load slippage check. EIP-1153 only auto-clears at
-        // *tx* end.
+        // The final-hop callback stored its input cost in the transient slot (a revert would have
+        // unwound the whole call otherwise). Clear the slot so a later call in the same
+        // transaction cannot read a stale value: EIP-1153 clears only at transaction end.
         /// @solidity memory-safe-assembly
         assembly {
             amountIn := tload(_AMOUNT_IN_CACHED_TSLOT)
@@ -438,39 +489,40 @@ contract EquilibraRouter is
     // Liquidity
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Sorts the caller's pair and desired amounts into canonical order; the mint callback
+     * charges `msg.sender`, or wraps attached native value for a WETH9 leg.
+     */
     function addLiquidity(
         AddLiquidityParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 sharesOut) {
         if (params.recipient == address(0)) revert Errors.ZeroAddress();
         if (params.tokenA == params.tokenB) revert Errors.IdenticalTokens();
 
-        // Sort tokens **and** desired amounts in lockstep so the pool
-        // receives them in its canonical (`token0 < token1`) order. The
-        // callback payload encodes the sorted tokens too —
-        // `equilibraMintCallback` pulls `amount{0,1}Owed` of
-        // `cbData.token{0,1}` and the indices must match.
-        (address t0, address t1, uint256 a0, uint256 a1) = params.tokenA < params.tokenB
-            ? (params.tokenA, params.tokenB, params.amountADesired, params.amountBDesired)
-            : (params.tokenB, params.tokenA, params.amountBDesired, params.amountADesired);
-        // Zero-address rejected after the sort: `address(0)` is the
-        // smallest address, so a single check on `t0` covers both
-        // inputs.
+        (address pool, bool aIsToken0, address t0, address t1) = _resolvePool(
+            params.tokenA,
+            params.tokenB,
+            params.poolIndex
+        );
         if (t0 == address(0)) revert Errors.ZeroAddress();
 
-        sharesOut = _addLiquidityInternal(
+        sharesOut = _mintAtPool(
+            pool,
             t0,
             t1,
             params.poolIndex,
-            a0,
-            a1,
+            aIsToken0 ? params.amountADesired : params.amountBDesired,
+            aIsToken0 ? params.amountBDesired : params.amountADesired,
             params.minShares,
             params.recipient,
             msg.sender
         );
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function selfPermit(
         address token,
         uint256 value,
@@ -482,7 +534,9 @@ contract EquilibraRouter is
         IERC20Permit(token).permit(msg.sender, address(this), value, deadline, v, r, s);
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     */
     function selfPermitIfNecessary(
         address token,
         uint256 value,
@@ -495,12 +549,12 @@ contract EquilibraRouter is
             selfPermit(token, value, deadline, v, r, s);
     }
 
-    /// @inheritdoc IEquilibraRouter
-    /// @dev Pulls the LP shares onto the router first (the pool's
-    ///      `removeLiquidity` burns from `msg.sender`), then burns and
-    ///      routes both legs. `recipient == address(0)` stages the
-    ///      outputs in the router for {unwrapWETH9} / {sweepToken}
-    ///      chaining — same convention as the swap entrypoints.
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Pulls the shares onto the router first because the pool burns from `msg.sender`; a
+     * zero `recipient` maps to the router so both legs stay staged for {unwrapWETH9} /
+     * {sweepToken}.
+     */
     function removeLiquidity(
         RemoveLiquidityParams calldata params
     )
@@ -513,23 +567,12 @@ contract EquilibraRouter is
         if (params.shares == 0) revert Errors.ZeroAmount();
         if (params.tokenA == params.tokenB) revert Errors.IdenticalTokens();
 
-        bool aIsToken0 = params.tokenA < params.tokenB;
-        address pool;
-        {
-            // Scoped: keeps the frame within the 16-slot legacy-codegen
-            // stack limit (coverage builds compile without viaIR).
-            (address token0, address token1) = aIsToken0
-                ? (params.tokenA, params.tokenB)
-                : (params.tokenB, params.tokenA);
-            if (token0 == address(0)) revert Errors.ZeroAddress();
-            pool = PoolAddressCompute.computeAddress(
-                factory,
-                _initCodeHash,
-                token0,
-                token1,
-                params.poolIndex
-            );
-        }
+        (address pool, bool aIsToken0, address token0, ) = _resolvePool(
+            params.tokenA,
+            params.tokenB,
+            params.poolIndex
+        );
+        if (token0 == address(0)) revert Errors.ZeroAddress();
         SafeTransferLib.safeTransferFrom(pool, msg.sender, address(this), params.shares);
         (uint256 amount0, uint256 amount1) = IEquilibraPool(pool).removeLiquidity(
             params.shares,
@@ -540,25 +583,12 @@ contract EquilibraRouter is
         (amountA, amountB) = aIsToken0 ? (amount0, amount1) : (amount1, amount0);
     }
 
-    /// @inheritdoc IEquilibraRouter
-    /// @dev Donation = parking LP shares on the pool's own address,
-    ///      where they carry no claim on reserves and only the pool's
-    ///      donation parachute may burn them. Irreversible. A plain LP
-    ///      `transfer` to the pool address is equivalent and unguarded;
-    ///      this entrypoint exists for donors that need the donation
-    ///      atomic against the state they quoted:
-    ///      - `maxSupply` pins the pool's `totalSupply()`: any mint
-    ///        landing first raises it and reverts the call, so a
-    ///        zero-capital sandwich cannot join to divert part of the
-    ///        lift the donation gives the active float. A holder
-    ///        already in the pool still receives its pro-rata slice —
-    ///        the pin bounds who may JOIN, not who is already there.
-    ///      - `deadline` bounds how long the signed intent stays live.
-    ///      The caller must have approved this router for the pool's LP
-    ///      token — chain {selfPermitIfNecessary} in the same
-    ///      `multicall` to sign the approval atomically. The
-    ///      `totalSupply()` staticcall doubles as an existence check —
-    ///      it reverts on a not-yet-deployed pool address.
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev The `totalSupply()` staticcall doubles as the existence check: an undeployed pool
+     * address reverts there. The pin bounds who may join between quote and execution; a holder
+     * already in the pool still receives its pro-rata slice of the lift.
+     */
     function donate(
         address tokenA,
         address tokenB,
@@ -569,14 +599,7 @@ contract EquilibraRouter is
     ) external override checkDeadline(deadline) {
         if (shares == 0) revert Errors.ZeroAmount();
         if (tokenA == tokenB) revert Errors.IdenticalTokens();
-        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            poolIndex
-        );
+        (address pool, , , ) = _resolvePool(tokenA, tokenB, poolIndex);
         if (IERC20Metadata(pool).totalSupply() > maxSupply) revert Errors.SlippageExceeded();
         SafeTransferLib.safeTransferFrom(pool, msg.sender, pool, shares);
     }
@@ -585,45 +608,30 @@ contract EquilibraRouter is
     // Zap: single-sided / imbalanced liquidity
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
-    /// @dev Flow:
-    ///        1. Fund the input: pull `amountIn` from the caller via
-    ///           {_pullOrWrap} (wrapping attached native ETH for a WETH9
-    ///           leg), or — on the `amountIn == 0` CONTRACT_BALANCE
-    ///           sentinel — consume the router's whole staged `tokenIn`
-    ///           balance. All subsequent leg payments happen out of the
-    ///           router's balance.
-    ///        2. CP-zap heuristic computes `swapAmount` from current
-    ///           reserves.
-    ///        3. `_exactInputSingleInternal` runs the swap with the router
-    ///           as both `recipient` and `payer` (swap callback pays from
-    ///           self via branch 1 of {_pay}).
-    ///        4. `_mintAtPool` mints LP straight to
-    ///           `params.recipient`, with router as payer (mint callback
-    ///           pays from self via branch 1 of {_pay}).
-    ///        5. Any residual on either side (proportional cap) is swept
-    ///           back to the caller.
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Flow: fund `tokenIn` onto the router ({_pullOrWrap}, or the staged balance on the zero
+     * sentinel); {_zapSingleSidedSwap} swaps the constant-product split with the router as payer
+     * and recipient; {_zapInFinalize} mints to `params.recipient` with the router as payer and
+     * sweeps both residuals to the caller. Both legs pay from the router's balance through the
+     * router-as-payer branch of {_pay}.
+     */
     function zapInSingleSided(
         ZapInSingleSidedParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 liquidity) {
         if (params.recipient == address(0)) revert Errors.ZeroAddress();
         if (params.tokenIn == params.tokenOut) revert Errors.IdenticalTokens();
 
-        // Sort pair into canonical order; remember which side is the
-        // input side so we can place `amountIn / amountOut` correctly
-        // later.
-        bool inIsToken0 = params.tokenIn < params.tokenOut;
-        (address token0, address token1) = inIsToken0
-            ? (params.tokenIn, params.tokenOut)
-            : (params.tokenOut, params.tokenIn);
+        (address pool, bool inIsToken0, address token0, address token1) = _resolvePool(
+            params.tokenIn,
+            params.tokenOut,
+            params.poolIndex
+        );
         if (token0 == address(0)) revert Errors.ZeroAddress();
 
-        // Fund the input onto the router first; both subsequent legs
-        // (swap + mint) pay from this staging balance. `amountIn == 0`
-        // is the CONTRACT_BALANCE sentinel: consume the whole `tokenIn`
-        // balance already staged here by an earlier multicall step (an
-        // `exactInput` with `recipient == address(0)`), skipping the
-        // pull entirely.
+        // Fund the input onto the router; the swap and the mint both pay from this staging
+        // balance. `amountIn == 0` consumes the `tokenIn` balance staged by an earlier batch step
+        // instead of pulling.
         uint256 amountIn = params.amountIn;
         if (amountIn == 0) {
             amountIn = SafeTransferLib.balanceOf(params.tokenIn, address(this));
@@ -632,16 +640,6 @@ contract EquilibraRouter is
             _pullOrWrap(params.tokenIn, amountIn);
         }
 
-        // Reserves drive both the optimal-swap heuristic and the pool
-        // address (the latter via CREATE2 — keep it inline so the
-        // staticcall is reused).
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            params.poolIndex
-        );
         (uint256 amount0, uint256 amount1) = _zapSingleSidedSwap(
             pool,
             params.tokenIn,
@@ -654,7 +652,12 @@ contract EquilibraRouter is
         liquidity = _zapInFinalize(params, amountIn, pool, token0, token1, amount0, amount1);
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Pulls each non-zero side onto the router ({_pullOrWrap}), rebalances through
+     * {_zapImbalancedRebalance} and mints through {_zapInImbalancedFinalize} with the router as
+     * payer.
+     */
     function zapInImbalanced(
         ZapInImbalancedParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 liquidity) {
@@ -662,12 +665,15 @@ contract EquilibraRouter is
         if (params.recipient == address(0)) revert Errors.ZeroAddress();
         if (params.tokenA == params.tokenB) revert Errors.IdenticalTokens();
 
-        // Sort pair + amounts into canonical order.
-        (address token0, address token1, uint256 amount0, uint256 amount1) = params.tokenA <
-            params.tokenB
-            ? (params.tokenA, params.tokenB, params.amountA, params.amountB)
-            : (params.tokenB, params.tokenA, params.amountB, params.amountA);
+        (address pool, bool aIsToken0, address token0, address token1) = _resolvePool(
+            params.tokenA,
+            params.tokenB,
+            params.poolIndex
+        );
         if (token0 == address(0)) revert Errors.ZeroAddress();
+        (uint256 amount0, uint256 amount1) = aIsToken0
+            ? (params.amountA, params.amountB)
+            : (params.amountB, params.amountA);
 
         if (amount0 > 0) {
             _pullOrWrap(token0, amount0);
@@ -675,14 +681,6 @@ contract EquilibraRouter is
         if (amount1 > 0) {
             _pullOrWrap(token1, amount1);
         }
-
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            params.poolIndex
-        );
 
         (amount0, amount1) = _zapImbalancedRebalance(
             pool,
@@ -696,35 +694,31 @@ contract EquilibraRouter is
         liquidity = _zapInImbalancedFinalize(params, pool, token0, token1, amount0, amount1);
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Pulls the shares onto the router, burns them with both legs delivered to the router
+     * (no pool-side minimums), then {_zapOutSingleSidedFinalize} swaps the off-side leg and pays
+     * out.
+     */
     function zapOutSingleSided(
         ZapOutSingleSidedParams calldata params
     ) external payable override checkDeadline(params.deadline) returns (uint256 amountOut) {
         if (params.liquidity == 0) revert Errors.ZeroAmount();
         if (params.tokenA == params.tokenB) revert Errors.IdenticalTokens();
 
-        (address token0, address token1) = params.tokenA < params.tokenB
-            ? (params.tokenA, params.tokenB)
-            : (params.tokenB, params.tokenA);
+        (address pool, , address token0, address token1) = _resolvePool(
+            params.tokenA,
+            params.tokenB,
+            params.poolIndex
+        );
         if (token0 == address(0)) revert Errors.ZeroAddress();
 
-        // `tokenOut` must be one of the pair's two tokens. Validate
-        // membership once, then derive `zeroForOne` from a single
-        // comparison (`true` ⇒ swap token0 → token1).
+        // `tokenOut` must be a pair token; `zeroForOne` (swap token0 -> token1) holds when the
+        // off-side token is token0.
         if (params.tokenOut != token0 && params.tokenOut != token1)
             revert Errors.UnsupportedToken();
         bool zeroForOne = params.tokenOut == token1;
 
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            params.poolIndex
-        );
-
-        // Pull LP shares from caller, burn at pool to receive both
-        // underlying tokens onto the router.
         SafeTransferLib.safeTransferFrom(pool, msg.sender, address(this), params.liquidity);
         (uint256 amount0, uint256 amount1) = IEquilibraPool(pool).removeLiquidity(
             params.liquidity,
@@ -748,7 +742,12 @@ contract EquilibraRouter is
     // Zap: previews (off-chain estimates)
     // =====================================================================
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev The swap leg is the pool's own `quoteExactIn`; {_previewSwapProtocolCut} projects the
+     * protocol slice the pool withholds from its reserve and {_previewZapInLiquidity} mirrors the
+     * proportional-cap mint at the projected post-swap reserves.
+     */
     function previewZapIn(
         address tokenIn,
         address tokenOut,
@@ -756,14 +755,9 @@ contract EquilibraRouter is
         uint256 amountIn
     ) external view override returns (uint256 liquidity, uint256 swapAmount) {
         if (tokenIn == tokenOut) revert Errors.IdenticalTokens();
-        bool inIsToken0 = tokenIn < tokenOut;
-
-        (address token0, address token1) = inIsToken0 ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
+        (address pool, bool inIsToken0, address token0, address token1) = _resolvePool(
+            tokenIn,
+            tokenOut,
             poolIndex
         );
 
@@ -772,26 +766,19 @@ contract EquilibraRouter is
         if (swapAmount == 0) return (0, 0);
 
         uint256 amountOut = IEquilibraPool(pool).quoteExactIn(inIsToken0, swapAmount);
-        // A zero swap quote means the executed zap's swap leg would
-        // revert in the pool's zero-raw-output dust guard — mirror that
-        // execution outcome instead of returning an unexecutable
-        // (0, swapAmount) pair (same rule as previewZapOut's off-side
-        // leg).
+        // The pool's quote already rejects native dust; the zero-output guard stays so a sentinel
+        // return cannot advertise a zap whose swap leg cannot execute.
         if (amountOut == 0) revert Errors.AmountTooSmallAfterNormalization();
 
-        // On commit the pool adds only `gross − protocolCut` of the swap
-        // input to its reserve; the mint below prices against exactly
-        // that state, so the projection must subtract the cut. The
-        // context load (several staticcalls) is skipped entirely when
-        // no protocol fee is configured — the cut is zero then.
-        uint256 protocolCut;
-        if (IEquilibraPool(pool).getFeeConfig().protocolFeePercent != 0) {
-            protocolCut = _swapProtocolCut(
-                _loadQuoteCtx(pool, token0, token1, r0, r1),
-                inIsToken0,
-                swapAmount
-            );
-        }
+        uint256 protocolCut = _previewSwapProtocolCut(
+            pool,
+            token0,
+            token1,
+            r0,
+            r1,
+            inIsToken0,
+            swapAmount
+        );
 
         liquidity = _previewZapInLiquidity(
             pool,
@@ -805,7 +792,12 @@ contract EquilibraRouter is
         );
     }
 
-    /// @inheritdoc IEquilibraRouter
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Mirrors execution order: the burn is projected first against the active float
+     * (`totalSupply - balanceOf(pool)`), then the off-side leg is quoted with {_quoteExactInAt}
+     * against the reduced reserves, including the pool's dust and LP-depth guards.
+     */
     function previewZapOut(
         address tokenA,
         address tokenB,
@@ -814,16 +806,9 @@ contract EquilibraRouter is
         address tokenOut
     ) external view override returns (uint256 amountOut) {
         if (tokenA == tokenB) revert Errors.IdenticalTokens();
-        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        (address pool, , address token0, address token1) = _resolvePool(tokenA, tokenB, poolIndex);
         if (tokenOut != token0 && tokenOut != token1) revert Errors.UnsupportedToken();
 
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            poolIndex
-        );
         IEquilibraPool poolI = IEquilibraPool(pool);
 
         if (liquidity == 0) return 0;
@@ -833,8 +818,7 @@ contract EquilibraRouter is
 
         uint256 amount0 = liquidity.fullMulDiv(r0, supply);
         uint256 amount1 = liquidity.fullMulDiv(r1, supply);
-        // Mirror the burn's dust guard: a position whose BOTH payouts
-        // floor to zero reverts in `removeLiquidity`.
+        // Mirror the burn's dust guard: both payouts flooring to zero reverts in `removeLiquidity`.
         if (amount0 == 0 && amount1 == 0) revert Errors.AmountTooSmallAfterNormalization();
 
         bool zeroForOne = tokenOut == token1;
@@ -842,15 +826,10 @@ contract EquilibraRouter is
         uint256 keepSide = zeroForOne ? amount1 : amount0;
         if (amountToSwap == 0) return keepSide;
 
-        // Execution burns FIRST and only then swaps the off-side amount
-        // against the reduced reserves — mirror that state AND the swap
-        // path's guards: a dust off-side swap whose raw output floors
-        // to zero reverts in execution, so the preview reverts
-        // identically instead of quoting an unexecutable amount. The
-        // zero-reserve check is defensive only: the genesis burn keeps
-        // the active float above any executable `liquidity`, so a
-        // fully drained post-burn state is reachable here solely
-        // through share amounts no holder can actually burn.
+        // Execution burns first and swaps the off-side leg against the reduced reserves; mirror
+        // that state and the swap path's guards so a dust swap reverts here as it would there.
+        // The zero-reserve check is defensive: the genesis burn keeps the active float above any
+        // burnable `liquidity`, so a fully drained post-burn state needs shares no holder owns.
         (r0, r1) = (r0 - amount0, r1 - amount1);
         if (r0 == 0 || r1 == 0) revert Errors.InsufficientLiquidity();
         uint256 swapOut = _quoteExactInAt(
@@ -862,10 +841,19 @@ contract EquilibraRouter is
         amountOut = keepSide + swapOut;
     }
 
-    /// @dev Swap-off-side + combine + slippage-check + transfer + emit
-    ///      tail of {zapOutSingleSided}. Extracted as a private helper
-    ///      to keep the entry-point's stack under the EVM 16-slot limit
-    ///      on legacy (non-viaIR) builds.
+    /**
+     * @dev Off-side swap, combine, slippage check, transfer and event tail of
+     * {zapOutSingleSided}; split out so the entrypoint fits the 16-slot stack on legacy
+     * (non-viaIR) builds. Reverts `InsufficientOutputAmount` below `params.minAmountOut`.
+     * @param params Caller's zap parameters.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param zeroForOne Whether the off-side leg is token0 (swapped into `tokenOut == token1`).
+     * @param amount0 Token0 received from the burn, raw units.
+     * @param amount1 Token1 received from the burn, raw units.
+     * @return amountOut Total paid in `params.tokenOut`, raw units.
+     */
     function _zapOutSingleSidedFinalize(
         ZapOutSingleSidedParams calldata params,
         address pool,
@@ -892,11 +880,8 @@ contract EquilibraRouter is
         amountOut = keepSide + swapOut;
         if (amountOut < params.minAmountOut) revert Errors.InsufficientOutputAmount();
 
-        // `recipient == address(0)` stages the output in the router for
-        // {unwrapWETH9} / {sweepToken} chaining — same convention as
-        // the swap entrypoints. The output already sits on the router,
-        // so staging skips the transfer entirely instead of paying for
-        // a self-transfer.
+        // A zero `recipient` stages the output on the router; it already sits here, so no
+        // self-transfer is paid for.
         if (params.recipient != address(0)) {
             SafeTransferLib.safeTransfer(params.tokenOut, params.recipient, amountOut);
         }
@@ -904,13 +889,21 @@ contract EquilibraRouter is
         emit ZapOut(pool, msg.sender, params.tokenOut, params.liquidity, amountOut);
     }
 
-    /// @dev Project the post-swap pool state and the LP shares the
-    ///      proportional-cap deposit would mint. Extracted from
-    ///      {previewZapIn} so that the entry-point's stack stays under
-    ///      the EVM 16-slot limit on non-viaIR builds. `swapAmountNet`
-    ///      (= gross − protocolCut) is what the pool's reserve actually
-    ///      gains from the swap; the gross amount still prices the
-    ///      user's deposit split.
+    /**
+     * @dev Projects the post-swap reserves and the shares the proportional-cap deposit mints,
+     * mirroring the pool: token1 is rounded up against the token0-priced shares, a leg that
+     * floors to zero reverts `AmountTooSmallAfterNormalization`, and shares are priced on the
+     * active float. Split out of {previewZapIn} for the legacy 16-slot stack.
+     * @param pool Resolved pool address.
+     * @param inIsToken0 Whether the deposited token is token0.
+     * @param amountIn Raw deposit.
+     * @param swapAmount Gross part of `amountIn` swapped; prices the deposit split.
+     * @param swapAmountNet `swapAmount` minus the protocol cut: what the pool's reserve gains.
+     * @param amountOut Quoted swap output, raw units of the other token.
+     * @param r0 Pre-swap token0 reserve, raw units.
+     * @param r1 Pre-swap token1 reserve, raw units.
+     * @return liquidity Shares the mint would produce; zero when a projected reserve is empty.
+     */
     function _previewZapInLiquidity(
         address pool,
         bool inIsToken0,
@@ -921,12 +914,8 @@ contract EquilibraRouter is
         uint256 r0,
         uint256 r1
     ) private view returns (uint256 liquidity) {
-        // ACTIVE-float supply read hoisted to the frame's top: down by
-        // `used0` the legacy (non-viaIR) codegen frame is at the
-        // 16-slot stack limit and the two staticcalls of this
-        // expression no longer fit — up here only the params live and
-        // the coverage pipeline compiles. The value is invariant
-        // across this view, so the hoist is semantics-preserving.
+        // Read the active float first: lower in the frame the legacy codegen has no stack room
+        // for these two staticcalls.
         uint256 supply = IERC20Metadata(pool).totalSupply() - IERC20Metadata(pool).balanceOf(pool);
 
         (uint256 newR0, uint256 newR1) = inIsToken0
@@ -938,55 +927,32 @@ contract EquilibraRouter is
             ? (amountIn - swapAmount, amountOut)
             : (amountOut, amountIn - swapAmount);
 
-        // Mirror the pool's proportional cap (smaller side wins).
+        // Mirror the pool's cap: token1 rounds up against the token0-priced shares.
         uint256 used0 = dep0;
-        uint256 used1 = dep0.fullMulDiv(newR1, newR0);
+        uint256 used1 = dep0.fullMulDivUp(newR1, newR0);
         if (used1 > dep1) {
+            used1 = dep1;
             used0 = dep1.fullMulDiv(newR0, newR1);
         }
+        if (used0 == 0 || used1 == 0) revert Errors.AmountTooSmallAfterNormalization();
         liquidity = used0.fullMulDiv(supply, newR0);
     }
 
-    /// @dev Pre-sorted internal `addLiquidity`. Reused by the external
-    ///      entry point; the zap flows skip this wrapper and call
-    ///      {_mintAtPool} directly because they already have the pool
-    ///      address from their own CREATE2 derive (avoids a redundant
-    ///      hash). The `(token0, token1)` pair **must** already be in
-    ///      canonical sort order — the caller is responsible.
-    function _addLiquidityInternal(
-        address token0,
-        address token1,
-        uint32 poolIndex,
-        uint256 amount0,
-        uint256 amount1,
-        uint256 minShares,
-        address recipient,
-        address payer
-    ) private returns (uint256 sharesOut) {
-        address pool = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            token0,
-            token1,
-            poolIndex
-        );
-        sharesOut = _mintAtPool(
-            pool,
-            token0,
-            token1,
-            poolIndex,
-            amount0,
-            amount1,
-            minShares,
-            recipient,
-            payer
-        );
-    }
-
-    /// @dev Execute `pool.addLiquidity` against a **pre-resolved** pool
-    ///      address. `(token0, token1)` must be in canonical sort order
-    ///      since the callback payload encodes them as-is and the pool
-    ///      pulls `amount{0,1}Owed` of `cbData.token{0,1}`.
+    /**
+     * @dev Calls `pool.addLiquidity` on a pre-resolved pool. `(token0, token1)` must be canonical:
+     * the callback payload encodes them as-is and the pool pulls `amount{0,1}Owed` of
+     * `cbData.token{0,1}` from `payer`.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param amount0 Token0 offered, raw units.
+     * @param amount1 Token1 offered, raw units.
+     * @param minShares Pool-side minimum; fewer shares revert `SlippageExceeded`.
+     * @param recipient LP share recipient.
+     * @param payer Address the mint callback charges; `address(this)` pays from staged funds.
+     * @return sharesOut LP shares minted.
+     */
     function _mintAtPool(
         address pool,
         address token0,
@@ -1016,31 +982,324 @@ contract EquilibraRouter is
     }
 
     // =====================================================================
-    // Zap: at-reserves quote mirror
+    // Off-chain price-target quotes
     // =====================================================================
 
-    /// @dev Snapshot of everything `EquilibraPool.quoteExactIn` reads,
-    ///      rebindable to hypothetical reserves. Token scales are
-    ///      recomputed with the factory's `10**(18 - decimals)` formula,
-    ///      so they equal the pool's stored scales; the fee bounds are
-    ///      widened from the config bps exactly like the pool's hot path
-    ///      (`uint16 · 1e14`). Assumes standard-behaving tokens whose
-    ///      `decimals()` is constant after pool creation.
+    /**
+     * @inheritdoc IEquilibraRouter
+     * @dev Sentinel exits: zero target, empty reserve, zero price scale, target decoding to a zero
+     * math-space price, target not strictly beyond the start price in the swap direction, or a
+     * search that finds no candidate. `crossesAnchor` is set when the start and target math-space
+     * prices lie on opposite sides of the anchor (`WAD`), neither being exactly on it.
+     */
+    function quoteSwapToPrice(
+        address tokenIn,
+        address tokenOut,
+        uint32 poolIndex,
+        uint160 sqrtPriceTargetX96
+    ) external view override returns (uint256 amountIn, uint256 amountOut, bool crossesAnchor) {
+        if (tokenIn == tokenOut) revert Errors.IdenticalTokens();
+        if (sqrtPriceTargetX96 == 0) return (0, 0, false);
+
+        (address pool, bool zeroForOne, address token0, address token1) = _resolvePool(
+            tokenIn,
+            tokenOut,
+            poolIndex
+        );
+        (uint256 reserve0, uint256 reserve1) = IEquilibraPool(pool).getReserves();
+        if (reserve0 == 0 || reserve1 == 0) return (0, 0, false);
+
+        PoolQuoteCtx memory cs = _loadQuoteCtx(pool, token0, token1, reserve0, reserve1);
+        if (cs.priceScaleWad == 0) return (0, 0, false);
+
+        uint256 pTargetMath = EquilibraSwapMath.sqrtPriceX96ToMathPriceWad(
+            sqrtPriceTargetX96,
+            cs.priceScaleWad,
+            cs.token0Scale,
+            cs.token1Scale
+        );
+        if (pTargetMath == 0) return (0, 0, false);
+
+        _liftQuoteCtx(cs);
+        uint256 pStartMath = EquilibraSwapMath.marginalPriceFromState(
+            cs.xMath,
+            cs.yMath,
+            cs.aWad,
+            cs.lambdaWad
+        );
+
+        if (zeroForOne) {
+            if (pTargetMath <= pStartMath) return (0, 0, false);
+        } else {
+            if (pTargetMath >= pStartMath) return (0, 0, false);
+        }
+
+        crossesAnchor =
+            (pStartMath != Constants.WAD) &&
+            (pTargetMath != Constants.WAD) &&
+            ((pStartMath < Constants.WAD) != (pTargetMath < Constants.WAD));
+
+        QuoteBisectCtx memory ctx = QuoteBisectCtx({
+            pool: pool,
+            zeroForOne: zeroForOne,
+            pTargetMath: pTargetMath,
+            state: cs,
+            inputReserve: zeroForOne ? reserve0 : reserve1
+        });
+
+        (amountIn, amountOut) = _bisectAmountInForTarget(ctx);
+        if (amountIn == 0 || amountOut == 0) return (0, 0, false);
+    }
+
+    /**
+     * @notice Search context of {_bisectAmountInForTarget}.
+     */
+    struct QuoteBisectCtx {
+        address pool;
+        bool zeroForOne;
+        /// Target marginal price in math space, WAD.
+        uint256 pTargetMath;
+        /// Lifted pre-swap snapshot (reserves, scales, fee config, curve knobs).
+        PoolQuoteCtx state;
+        /// Raw reserve of the input token; bounds the probed input.
+        uint256 inputReserve;
+    }
+
+    /**
+     * @notice Outcome class of one price-target probe: `Valid` (quote and post-price computed),
+     * `TooSmall` (dust; search larger inputs), `Rejected` (solver, LP-guard, liquidity or range
+     * refusal; search smaller inputs).
+     */
+    enum PriceProbeStatus {
+        Valid,
+        TooSmall,
+        Rejected
+    }
+
+    /**
+     * @dev Two-phase search over the gross input. Expansion starts at `inputReserve / 1024` (at
+     * least 1) and doubles up to the cap `inputReserve - inputReserve / 100`; every valid
+     * non-crossing probe becomes the current answer, and a rejected or crossing probe brackets
+     * `[lo, hi]`. Without a bracket the best sweep is returned as is. Refinement bisects the
+     * bracket for at most 50 probes: rejected or crossing probes lower `hi`, dust probes raise
+     * `lo` without recording an answer, and a valid non-crossing probe records the answer and
+     * ends the search once its post-price is within `tolerance` of the target. The tolerance is
+     * `max(pTarget / 1e8, pTarget · protocolFeePercent / 1e6, 1)`; the protocol-fee term is the
+     * fee-quantization noise floor, because a fee-rate step drops the net curve input by the
+     * protocol slice of the fee jump and steps the post-price backward, so searching below that
+     * amplitude flips the crossing classification. The tolerance exit is one-sided: only a
+     * not-crossed `mid`, which is itself the recorded answer, may end the loop, so the returned
+     * amount's evaluated post-price never crosses the target.
+     * @param ctx Search context.
+     * @return amountIn Best checked non-crossing gross input, raw units, or zero.
+     * @return amountOut Pool quote for `amountIn`, raw units, or zero.
+     */
+    function _bisectAmountInForTarget(
+        QuoteBisectCtx memory ctx
+    ) private view returns (uint256 amountIn, uint256 amountOut) {
+        uint256 lo = 0;
+        uint256 hi;
+        {
+            // Scoped for the legacy 16-slot stack.
+            uint256 hiCap = ctx.inputReserve - ctx.inputReserve / 100;
+            if (hiCap == 0) return (0, 0);
+
+            hi = ctx.inputReserve / 1024;
+            if (hi == 0) hi = 1;
+            if (hi > hiCap) hi = hiCap;
+
+            bool bracketed = false;
+
+            for (uint256 i; i < 40; ) {
+                (PriceProbeStatus status, uint256 out, uint256 pMargAfter) = _tryPriceTargetProbe(
+                    ctx,
+                    hi
+                );
+
+                bool crossed = ctx.zeroForOne
+                    ? pMargAfter >= ctx.pTargetMath
+                    : pMargAfter <= ctx.pTargetMath;
+                // A refused amount is a search ceiling, not evidence of crossing; refine toward
+                // the last usable amount.
+                if (
+                    status == PriceProbeStatus.Rejected ||
+                    (status == PriceProbeStatus.Valid && crossed)
+                ) {
+                    bracketed = true;
+                    break;
+                }
+
+                if (status == PriceProbeStatus.Valid) {
+                    amountOut = out;
+                    amountIn = hi;
+                }
+
+                if (hi >= hiCap) break;
+                lo = hi;
+                unchecked {
+                    hi = hi * 2;
+                    if (hi > hiCap) hi = hiCap;
+                    ++i;
+                }
+            }
+
+            if (!bracketed) {
+                return (amountIn, amountOut);
+            }
+        }
+
+        uint256 tolerance = ctx.pTargetMath / 1e8;
+        {
+            // Fee-quantization noise floor, sized for the coarsest one-bps rate step (conservative
+            // under the WAD-precision rate); a no-op when `protocolFeePercent == 0`. Scoped for
+            // the legacy 16-slot stack.
+            uint256 qNoise = FixedPointMathLib.fullMulDiv(
+                ctx.pTargetMath,
+                ctx.state.protocolFeePercent,
+                1e6
+            );
+            if (tolerance < qNoise) tolerance = qNoise;
+        }
+        if (tolerance == 0) tolerance = 1;
+
+        for (uint256 j; j < 50; ) {
+            if (hi - lo <= 1) break;
+            uint256 mid;
+            unchecked {
+                mid = (lo + hi) / 2;
+            }
+            (PriceProbeStatus status, uint256 out, uint256 pMargAfter) = _tryPriceTargetProbe(
+                ctx,
+                mid
+            );
+
+            bool crossed = ctx.zeroForOne
+                ? pMargAfter >= ctx.pTargetMath
+                : pMargAfter <= ctx.pTargetMath;
+            if (
+                status == PriceProbeStatus.Rejected || (status == PriceProbeStatus.Valid && crossed)
+            ) {
+                hi = mid;
+            } else {
+                lo = mid;
+                if (status == PriceProbeStatus.TooSmall) {
+                    unchecked {
+                        ++j;
+                    }
+                    continue;
+                }
+                amountOut = out;
+                amountIn = mid;
+                // One-sided tolerance exit: only this not-crossed `mid`, the recorded answer, may
+                // end the search; a crossed mid within tolerance keeps narrowing instead.
+                uint256 diff = pMargAfter > ctx.pTargetMath
+                    ? pMargAfter - ctx.pTargetMath
+                    : ctx.pTargetMath - pMargAfter;
+                if (diff <= tolerance) break;
+            }
+
+            unchecked {
+                ++j;
+            }
+        }
+    }
+
+    /**
+     * @dev Runs the pool's checked `quoteExactIn` for `amountIn` and classifies the outcome:
+     * `AmountTooSmallAfterNormalization` or a zero quote is `TooSmall`; `SolverDidNotConverge`,
+     * `LpValueDecreased`, `InsufficientLiquidity` and `MathOutOfRange` are `Rejected`; any other
+     * revert is re-raised verbatim. A valid probe also returns the marginal math-space price of
+     * the settled native reserves (input net of the protocol cut added, output removed).
+     * @param ctx Search context.
+     * @param amountIn Gross input to probe, raw units.
+     * @return status Outcome class.
+     * @return amountOut Pool quote, raw units; zero unless `Valid`.
+     * @return priceAfter Post-swap marginal price in math space, WAD; zero unless `Valid`.
+     */
+    function _tryPriceTargetProbe(
+        QuoteBisectCtx memory ctx,
+        uint256 amountIn
+    ) private view returns (PriceProbeStatus status, uint256 amountOut, uint256 priceAfter) {
+        try IEquilibraPool(ctx.pool).quoteExactIn(ctx.zeroForOne, amountIn) returns (uint256 out) {
+            amountOut = out;
+        } catch (bytes memory reason) {
+            if (reason.length == 4) {
+                bytes4 selector = bytes4(reason);
+                if (selector == Errors.AmountTooSmallAfterNormalization.selector)
+                    return (PriceProbeStatus.TooSmall, 0, 0);
+                if (
+                    selector == Errors.SolverDidNotConverge.selector ||
+                    selector == Errors.LpValueDecreased.selector ||
+                    selector == Errors.InsufficientLiquidity.selector ||
+                    selector == Errors.MathOutOfRange.selector
+                ) return (PriceProbeStatus.Rejected, 0, 0);
+            }
+            assembly ("memory-safe") {
+                revert(add(reason, 32), mload(reason))
+            }
+        }
+        if (amountOut == 0) return (PriceProbeStatus.TooSmall, 0, 0);
+
+        PoolQuoteCtx memory cs = ctx.state;
+        uint256 netIn = amountIn - _swapProtocolCut(cs, ctx.zeroForOne, amountIn);
+        uint256 r0 = cs.reserve0;
+        uint256 r1 = cs.reserve1;
+        if (ctx.zeroForOne) {
+            r0 += netIn;
+            r1 -= amountOut;
+        } else {
+            r1 += netIn;
+            r0 -= amountOut;
+        }
+        priceAfter = EquilibraSwapMath.marginalPriceFromState(
+            r1 * cs.token1Scale,
+            FixedPointMathLib.divWad(r0 * cs.token0Scale, cs.priceScaleWad),
+            cs.aWad,
+            cs.lambdaWad
+        );
+    }
+
+    /**
+     * @notice Pool snapshot shared by the price-target and zap quotes; the reserves can be bound
+     * to a hypothetical state before lifting.
+     */
     struct PoolQuoteCtx {
         uint256 aWad;
         uint256 lambdaWad;
         uint256 priceScaleWad;
+        /// `10^(18 - decimals)` of token0.
         uint256 token0Scale;
+        /// `10^(18 - decimals)` of token1.
         uint256 token1Scale;
+        /// Fee ceiling as a WAD rate (`baseFee · 1e14`).
         uint256 baseFeeWad;
+        /// Fee floor as a WAD rate (`feeFloorBps · 1e14`).
         uint256 floorWad;
+        /// Ramp width as a WAD distance (`feeRampBps · 1e14`); zero disables the ramp.
         uint256 rampDistWad;
+        /// Protocol slice of every fee, percent.
         uint256 protocolFeePercent;
+        uint256 reserve0;
+        uint256 reserve1;
+        /// Lifted base-side coordinate `reserve1 · token1Scale`.
         uint256 xMath;
+        /// Lifted quote-side coordinate `divWad(reserve0 · token0Scale, priceScaleWad)`.
         uint256 yMath;
-        uint256 lPreWad;
+        /// Pre-swap depth `solveLFromState(xMath, yMath)`, Q128.
+        uint256 lPreQ128;
     }
 
+    /**
+     * @dev Loads the typed pool state (fee config, price scale, decimal scales, curve knobs) and
+     * binds the given reserves without lifting or solving L. Token decimals must equal the scales
+     * the pool was initialized with.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param reserve0 Token0 reserve to bind, raw units.
+     * @param reserve1 Token1 reserve to bind, raw units.
+     * @return ctx Unlifted snapshot.
+     */
     function _loadQuoteCtx(
         address pool,
         address token0,
@@ -1048,45 +1307,110 @@ contract EquilibraRouter is
         uint256 reserve0,
         uint256 reserve1
     ) private view returns (PoolQuoteCtx memory ctx) {
+        ctx = _feeQuoteCtx(IEquilibraPool(pool).getFeeConfig());
+        _loadQuoteScales(ctx, pool, token0, token1);
+        ctx.reserve0 = reserve0;
+        ctx.reserve1 = reserve1;
         {
             IEquilibraPool.CurveParams memory cp = IEquilibraPool(pool).getCurveParams();
             ctx.aWad = cp.aWad;
             ctx.lambdaWad = cp.lambdaWad;
         }
-        ctx.priceScaleWad = IEquilibraPool(pool).getOracleState().priceScaleWad;
-        {
-            IEquilibraPool.FeeConfig memory fc = IEquilibraPool(pool).getFeeConfig();
-            unchecked {
-                // uint16 · 1e14 ≤ 6.55e18 — overflow-free.
-                ctx.baseFeeWad = uint256(fc.baseFee) * 1e14;
-                ctx.floorWad = uint256(fc.feeFloorBps) * 1e14;
-                ctx.rampDistWad = uint256(fc.feeRampBps) * 1e14;
-            }
-            ctx.protocolFeePercent = fc.protocolFeePercent;
+    }
+
+    /**
+     * @dev Widens the pool's bps fee triple to WAD rates (`bps · 1e14`) and copies the protocol
+     * percent into a fresh context.
+     * @param fc Pool fee configuration.
+     * @return ctx Context with only the fee fields populated.
+     */
+    function _feeQuoteCtx(
+        IEquilibraPool.FeeConfig memory fc
+    ) private pure returns (PoolQuoteCtx memory ctx) {
+        unchecked {
+            // uint16 · 1e14 ≤ 6.55e18 — overflow-free.
+            ctx.baseFeeWad = uint256(fc.baseFee) * 1e14;
+            ctx.floorWad = uint256(fc.feeFloorBps) * 1e14;
+            ctx.rampDistWad = uint256(fc.feeRampBps) * 1e14;
         }
+        ctx.protocolFeePercent = fc.protocolFeePercent;
+    }
+
+    /**
+     * @dev Reads the price scale and derives `10^(18 - decimals)` for both tokens.
+     * @param ctx Context to fill.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     */
+    function _loadQuoteScales(
+        PoolQuoteCtx memory ctx,
+        address pool,
+        address token0,
+        address token1
+    ) private view {
+        ctx.priceScaleWad = IEquilibraPool(pool).getPriceScale();
         ctx.token0Scale = 10 ** (18 - IERC20Metadata(token0).decimals());
         ctx.token1Scale = 10 ** (18 - IERC20Metadata(token1).decimals());
+    }
 
-        // Asymmetric lift, same order as the pool: `xMath = base wad`
-        // (identity), `yMath = quote wad / priceScale`; both stay zero
-        // when either wad side is zero.
-        uint256 xWad = reserve1 * ctx.token1Scale;
-        uint256 yWad = reserve0 * ctx.token0Scale;
+    /**
+     * @dev Asymmetric lift in the pool's order: `xMath = reserve1 · token1Scale` (identity) and
+     * `yMath = divWad(reserve0 · token0Scale, priceScaleWad)`; both stay zero when either wad
+     * side is zero.
+     * @param ctx Context whose reserves and scales are already bound.
+     */
+    function _liftQuoteCtx(PoolQuoteCtx memory ctx) private pure {
+        uint256 xWad = ctx.reserve1 * ctx.token1Scale;
+        uint256 yWad = ctx.reserve0 * ctx.token0Scale;
         if (xWad != 0 && yWad != 0) {
             ctx.xMath = xWad;
             ctx.yMath = FixedPointMathLib.divWad(yWad, ctx.priceScaleWad);
         }
-        ctx.lPreWad = EquilibraSwapMath.solveLFromState(
-            ctx.xMath,
-            ctx.yMath,
-            ctx.aWad,
-            ctx.lambdaWad
-        );
     }
 
-    /// @dev Mirror of the pool's CP-proxy dynamic-fee resolver,
-    ///      evaluated at the context's state. Returns the WAD fee rate
-    ///      for a gross exact-in amount.
+    /**
+     * @dev Projects the protocol cut of an exact-in swap without loading curve parameters or
+     * solving L; the lift is skipped when the cut is zero or the ramp is off (flat fee).
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param reserve0 Pre-swap token0 reserve, raw units.
+     * @param reserve1 Pre-swap token1 reserve, raw units.
+     * @param zeroForOne Swap direction.
+     * @param amountIn Gross input, raw units.
+     * @return Protocol cut in raw input units.
+     */
+    function _previewSwapProtocolCut(
+        address pool,
+        address token0,
+        address token1,
+        uint256 reserve0,
+        uint256 reserve1,
+        bool zeroForOne,
+        uint256 amountIn
+    ) private view returns (uint256) {
+        IEquilibraPool.FeeConfig memory fc = IEquilibraPool(pool).getFeeConfig();
+        if (fc.protocolFeePercent == 0) return 0;
+        PoolQuoteCtx memory ctx = _feeQuoteCtx(fc);
+        if (ctx.rampDistWad != 0) {
+            _loadQuoteScales(ctx, pool, token0, token1);
+            ctx.reserve0 = reserve0;
+            ctx.reserve1 = reserve1;
+            _liftQuoteCtx(ctx);
+        }
+        return _swapProtocolCut(ctx, zeroForOne, amountIn);
+    }
+
+    /**
+     * @dev Mirror of the pool's CP-proxy dynamic-fee resolver at the context's state: the flat
+     * `baseFeeWad` when the ramp is off, the state is unlifted or the input normalizes to zero;
+     * otherwise `smoothstepFeeWad` of the constant-product post-distance of the gross input.
+     * @param ctx Lifted context.
+     * @param zeroForOne Swap direction.
+     * @param amountInRaw Gross input, raw units.
+     * @return feeWad Fee rate, WAD.
+     */
     function _resolveFeeWadAt(
         PoolQuoteCtx memory ctx,
         bool zeroForOne,
@@ -1113,9 +1437,16 @@ contract EquilibraRouter is
         );
     }
 
-    /// @dev Protocol slice of the fee an exact-in swap of `grossIn`
-    ///      would pay at the context's state — the part the pool does
-    ///      NOT add back to its reserves on commit.
+    /**
+     * @dev Protocol slice of the fee an exact-in swap of `grossIn` pays at the context's state:
+     * the part the pool does not add back to its reserve on commit. Mirrors the pool's minimum
+     * raw fee (`max(1, floor(grossIn · feeWad / WAD))` at a positive rate) and its floor
+     * division by 100.
+     * @param ctx Lifted context.
+     * @param zeroForOne Swap direction.
+     * @param grossIn Gross input, raw units.
+     * @return cut Protocol cut, raw input units.
+     */
     function _swapProtocolCut(
         PoolQuoteCtx memory ctx,
         bool zeroForOne,
@@ -1126,74 +1457,185 @@ contract EquilibraRouter is
         unchecked {
             // grossIn ≤ uint128.max and feeWad < WAD — overflow-free.
             uint256 feeAmount = (grossIn * feeWad) / Constants.WAD;
+            if (feeAmount == 0 && feeWad != 0) feeAmount = 1;
             cut = (feeAmount * ctx.protocolFeePercent) / 100;
         }
     }
 
-    /// @dev Mirror of `EquilibraPool.quoteExactIn` evaluated at the
-    ///      context's (possibly hypothetical) reserves: same library
-    ///      kernel, same rounding order, same guard outcomes — reverts
-    ///      where the pool's quote would revert.
+    /**
+     * @dev Mirror of `EquilibraPool.quoteExactIn` at the context's (possibly hypothetical)
+     * reserves: same library kernel, rounding order and guard outcomes, reverting where the pool's
+     * quote reverts. Returns zero for a zero or over-uint128 input and for an empty reserve.
+     * @param ctx Context with reserves bound; lifted and depth-solved here.
+     * @param zeroForOne Swap direction.
+     * @param amountIn Gross input, raw units.
+     * @return amountOut Checked output, raw units.
+     */
     function _quoteExactInAt(
         PoolQuoteCtx memory ctx,
         bool zeroForOne,
         uint256 amountIn
     ) private pure returns (uint256 amountOut) {
         if (amountIn == 0 || amountIn > type(uint128).max) return 0;
-        if (ctx.xMath == 0 || ctx.yMath == 0) return 0;
+        if (ctx.reserve0 == 0 || ctx.reserve1 == 0) return 0;
 
-        uint256 feeWad = _resolveFeeWadAt(ctx, zeroForOne, amountIn);
+        _liftQuoteCtx(ctx);
+        ctx.lPreQ128 = EquilibraSwapMath.solveLFromState(
+            ctx.xMath,
+            ctx.yMath,
+            ctx.aWad,
+            ctx.lambdaWad
+        );
+        SwapQuoteResult memory result = _quoteExactInMathAt(ctx, zeroForOne, amountIn);
+        amountOut = result.amountOutWad / (zeroForOne ? ctx.token1Scale : ctx.token0Scale);
+        amountOut = _checkedQuotedAmountOut(ctx, zeroForOne, amountIn, amountOut, result.feeAmount);
+    }
+
+    /**
+     * @notice Math-space exact-in quote: the output in wad units of the output token and the raw
+     * fee charged on the input.
+     */
+    struct SwapQuoteResult {
+        uint256 amountOutWad;
+        uint256 feeAmount;
+    }
+
+    /**
+     * @dev Fee, normalization and kernel stage of {_quoteExactInAt}. The fee is
+     * `max(1, floor(amountIn · feeWad / WAD))` at a positive rate; the clean input is scaled to
+     * wad and, for token0 input, divided by the price scale, a zero at either step reverting
+     * `AmountTooSmallAfterNormalization`. A forward-kernel output at or above the output-side math
+     * reserve reverts `InsufficientLiquidity`; a token0 output is multiplied back by the price
+     * scale, rounded down.
+     * @param ctx Lifted context with `lPreQ128` solved.
+     * @param zeroForOne Swap direction.
+     * @param amountIn Gross input, raw units.
+     * @return result Output in wad units and the raw fee.
+     */
+    function _quoteExactInMathAt(
+        PoolQuoteCtx memory ctx,
+        bool zeroForOne,
+        uint256 amountIn
+    ) private pure returns (SwapQuoteResult memory result) {
         uint256 cleanWad;
         unchecked {
-            // amountIn ≤ uint128.max and feeWad < WAD — overflow-free.
+            // amountIn <= uint128.max and feeWad < WAD.
+            uint256 feeWad = _resolveFeeWadAt(ctx, zeroForOne, amountIn);
+            result.feeAmount = (amountIn * feeWad) / Constants.WAD;
+            if (result.feeAmount == 0 && feeWad != 0) result.feeAmount = 1;
             cleanWad =
-                (amountIn - (amountIn * feeWad) / Constants.WAD) *
-                (zeroForOne ? ctx.token0Scale : ctx.token1Scale);
+                (amountIn - result.feeAmount) * (zeroForOne ? ctx.token0Scale : ctx.token1Scale);
         }
         if (cleanWad == 0) revert Errors.AmountTooSmallAfterNormalization();
-
         uint256 amountInMath = zeroForOne
             ? FixedPointMathLib.divWad(cleanWad, ctx.priceScaleWad)
             : cleanWad;
         if (amountInMath == 0) revert Errors.AmountTooSmallAfterNormalization();
-
-        uint256 outDeltaMath;
+        uint256 delta;
         if (zeroForOne) {
-            (outDeltaMath, ) = EquilibraSwapMath.quoteExactInForward(
+            (delta, ) = EquilibraSwapMath.quoteExactInForward(
                 ctx.yMath,
                 ctx.xMath,
                 amountInMath,
                 ctx.aWad,
                 ctx.lambdaWad,
-                ctx.lPreWad
+                ctx.lPreQ128
             );
-            if (outDeltaMath >= ctx.xMath) revert Errors.InsufficientLiquidity();
-            // xMath output → token1 base wad: identity.
-            amountOut = outDeltaMath / ctx.token1Scale;
+            if (delta >= ctx.xMath) revert Errors.InsufficientLiquidity();
+            result.amountOutWad = delta;
         } else {
-            (outDeltaMath, ) = EquilibraSwapMath.quoteExactInForward(
+            (delta, ) = EquilibraSwapMath.quoteExactInForward(
                 ctx.xMath,
                 ctx.yMath,
                 amountInMath,
                 ctx.aWad,
                 ctx.lambdaWad,
-                ctx.lPreWad
+                ctx.lPreQ128
             );
-            if (outDeltaMath >= ctx.yMath) revert Errors.InsufficientLiquidity();
-            // yMath output → token0 quote wad (floor).
-            amountOut = FixedPointMathLib.mulWad(outDeltaMath, ctx.priceScaleWad) / ctx.token0Scale;
+            if (delta >= ctx.yMath) revert Errors.InsufficientLiquidity();
+            result.amountOutWad = FixedPointMathLib.mulWad(delta, ctx.priceScaleWad);
         }
+    }
+
+    /**
+     * @dev Applies the pool's native-unit commit checks before repeg: a zero output reverts
+     * `AmountTooSmallAfterNormalization`, an output at or above the output reserve
+     * `InsufficientLiquidity`, settled reserves (input net of the protocol cut added, output
+     * removed) beyond uint128 `MathInvariantViolation`, and a settled Q128 depth below the
+     * pre-swap `lPreQ128` `LpValueDecreased`. Works on the raw reserves: reversing the math-space
+     * lift would lose quote-side rounding at a non-unit price scale.
+     * @param ctx Lifted context with `lPreQ128` solved.
+     * @param zeroForOne Swap direction.
+     * @param amountIn Gross input, raw units.
+     * @param amountOut Candidate output, raw units.
+     * @param feeAmount Raw fee charged on `amountIn`.
+     * @return The unchanged `amountOut`.
+     */
+    function _checkedQuotedAmountOut(
+        PoolQuoteCtx memory ctx,
+        bool zeroForOne,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 feeAmount
+    ) private pure returns (uint256) {
+        if (amountOut == 0) revert Errors.AmountTooSmallAfterNormalization();
+        uint256 r0 = ctx.reserve0;
+        uint256 r1 = ctx.reserve1;
+        uint256 reserveOut = zeroForOne ? r1 : r0;
+        if (amountOut >= reserveOut) revert Errors.InsufficientLiquidity();
+        uint256 protocolCut = (feeAmount * ctx.protocolFeePercent) / 100;
+        if (zeroForOne) {
+            r0 += amountIn - protocolCut;
+            r1 -= amountOut;
+        } else {
+            r1 += amountIn - protocolCut;
+            r0 -= amountOut;
+        }
+        if (r0 > type(uint128).max || r1 > type(uint128).max)
+            revert Errors.MathInvariantViolation();
+        if (_lpDepthAt(ctx, r0, r1) < ctx.lPreQ128) revert Errors.LpValueDecreased();
+        return amountOut;
+    }
+
+    /**
+     * @dev Q128 depth of the raw reserves `(r0, r1)` under the context's anchor and curve knobs.
+     * @param ctx Context supplying scales, price scale and curve knobs.
+     * @param r0 Token0 reserve, raw units.
+     * @param r1 Token1 reserve, raw units.
+     * @return `solveLFromState` of the lifted pair, Q128.
+     */
+    function _lpDepthAt(
+        PoolQuoteCtx memory ctx,
+        uint256 r0,
+        uint256 r1
+    ) private pure returns (uint256) {
+        return
+            EquilibraSwapMath.solveLFromState(
+                r1 * ctx.token1Scale,
+                FixedPointMathLib.divWad(r0 * ctx.token0Scale, ctx.priceScaleWad),
+                ctx.aWad,
+                ctx.lambdaWad
+            );
     }
 
     // =====================================================================
     // Zap: math helpers
     // =====================================================================
 
-    /// @dev Rebalance leg of {zapInImbalanced}: derives the direction
-    ///      and magnitude of the in-pool swap that aligns the
-    ///      `(amount0, amount1)` deposit pair with the current pool
-    ///      ratio, executes the swap (router pays from self / receives
-    ///      to self), and returns the updated deposit amounts.
+    /**
+     * @dev Rebalance leg of {zapInImbalanced}: derives the direction and size of the in-pool swap
+     * that aligns `(amount0, amount1)` with the current reserve ratio, executes it with the
+     * router as payer and recipient, and returns the updated deposit pair (unchanged when no swap
+     * is needed).
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param amount0 Token0 staged on the router, raw units.
+     * @param amount1 Token1 staged on the router, raw units.
+     * @return Rebalanced token0 deposit, raw units.
+     * @return Rebalanced token1 deposit, raw units.
+     */
     function _zapImbalancedRebalance(
         address pool,
         address token0,
@@ -1224,9 +1666,17 @@ contract EquilibraRouter is
         return (amount0 + swapOut, amount1 - swapAmount);
     }
 
-    /// @dev Inner swap leg of {_zapOutSingleSidedFinalize}, factored
-    ///      out so the parent's stack stays under the EVM 16-slot
-    ///      limit on legacy (non-viaIR) builds.
+    /**
+     * @dev Swap leg of {_zapOutSingleSidedFinalize} with the router as payer and recipient; split
+     * out so the parent fits the 16-slot stack on legacy (non-viaIR) builds.
+     * @param pool Resolved pool address.
+     * @param tokenIn Off-side token being sold.
+     * @param tokenOut Token being bought.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param zeroForOne Swap direction.
+     * @param amountToSwap Gross input, raw units.
+     * @return swapOut Output delivered to the router, raw units.
+     */
     function _zapOutExecuteSwap(
         address pool,
         address tokenIn,
@@ -1244,10 +1694,18 @@ contract EquilibraRouter is
         );
     }
 
-    /// @dev Inner swap leg of {_zapImbalancedRebalance}, factored out
-    ///      so the parent's stack stays under the EVM 16-slot limit on
-    ///      legacy (non-viaIR) builds. Resolves the `(in, out)` token
-    ///      pair from `zeroForOne` and forwards to {_swapInputAtPool}.
+    /**
+     * @dev Swap leg of {_zapImbalancedRebalance}: resolves the `(in, out)` pair from `zeroForOne`
+     * and forwards to {_swapInputAtPool} with the router as payer and recipient; split out so the
+     * parent fits the 16-slot stack on legacy (non-viaIR) builds.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param zeroForOne Swap direction.
+     * @param swapAmount Gross input, raw units.
+     * @return swapOut Output delivered to the router, raw units.
+     */
     function _zapRebalanceExecuteSwap(
         address pool,
         address token0,
@@ -1266,10 +1724,18 @@ contract EquilibraRouter is
         );
     }
 
-    /// @dev Mint + slippage-check + dust-sweep tail of
-    ///      {zapInImbalanced}. Same shape as {_zapInFinalize} but emits
-    ///      `ZapIn` with `tokenIn = address(0)` because there is no
-    ///      single user-facing input token.
+    /**
+     * @dev Mint, slippage check and residual sweep tail of {zapInImbalanced}. Emits `ZapIn` with
+     * `tokenIn = address(0)` and `amountIn = amountA + amountB` because there is no single input
+     * token.
+     * @param params Caller's zap parameters.
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param amount0 Rebalanced token0 deposit, raw units.
+     * @param amount1 Rebalanced token1 deposit, raw units.
+     * @return liquidity LP shares minted to `params.recipient`.
+     */
     function _zapInImbalancedFinalize(
         ZapInImbalancedParams calldata params,
         address pool,
@@ -1278,8 +1744,7 @@ contract EquilibraRouter is
         uint256 amount0,
         uint256 amount1
     ) private returns (uint256 liquidity) {
-        // Pool requires both sides > 0 — fail upstream with a clearer
-        // error than the pool-side `ZeroAmount`.
+        // The pool rejects a zero side with `ZeroAmount`; fail before the external call.
         if (amount0 == 0 || amount1 == 0) revert Errors.ZeroAmount();
 
         liquidity = _mintAtPool(
@@ -1306,10 +1771,18 @@ contract EquilibraRouter is
         );
     }
 
-    /// @dev Mint + slippage-check + dust-sweep tail of
-    ///      {zapInSingleSided}. Extracted as a private helper to keep
-    ///      the entry-point's stack under the EVM 16-slot limit on
-    ///      legacy (non-viaIR) builds.
+    /**
+     * @dev Mint, slippage check and residual sweep tail of {zapInSingleSided}; split out so the
+     * entrypoint fits the 16-slot stack on legacy (non-viaIR) builds.
+     * @param params Caller's zap parameters.
+     * @param amountIn Effective input (the resolved staged balance on the sentinel path).
+     * @param pool Resolved pool address.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     * @param amount0 Token0 deposit after the swap, raw units.
+     * @param amount1 Token1 deposit after the swap, raw units.
+     * @return liquidity LP shares minted to `params.recipient`.
+     */
     function _zapInFinalize(
         ZapInSingleSidedParams calldata params,
         uint256 amountIn,
@@ -1332,20 +1805,25 @@ contract EquilibraRouter is
         );
         if (liquidity < params.minLiquidity) revert Errors.SlippageExceeded();
 
-        // `amountIn` is the EFFECTIVE input (the resolved staged balance
-        // on the CONTRACT_BALANCE sentinel path), never the raw
-        // `params.amountIn` — a zero sentinel must not be logged as a
-        // zero-sized zap.
+        // Log the effective input, never the raw `params.amountIn`: a zero sentinel must not read
+        // as a zero-sized zap.
         _emitZapInWithDust(pool, msg.sender, params.tokenIn, amountIn, liquidity, token0, token1);
     }
 
-    /// @dev Internal swap leg of {zapInSingleSided}: derives the optimal
-    ///      `swapAmount` from the current reserves, executes the swap
-    ///      with the router as both `recipient` and `payer`, and
-    ///      returns the canonical `(amount0, amount1)` deposit pair.
-    ///      Extracted as a private helper so the entry-point's stack
-    ///      stays under the EVM 16-slot limit on legacy (non-viaIR)
-    ///      builds.
+    /**
+     * @dev Swap leg of {zapInSingleSided}: derives the constant-product split from the current
+     * reserves (zero reverts `ZeroAmount`), swaps it with the router as payer and recipient, and
+     * returns the canonical `(amount0, amount1)` deposit pair; split out so the entrypoint fits
+     * the 16-slot stack on legacy (non-viaIR) builds.
+     * @param pool Resolved pool address.
+     * @param tokenIn Deposited token.
+     * @param tokenOut The other pair token.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param amountIn Effective raw deposit staged on the router.
+     * @param inIsToken0 Whether `tokenIn` is token0.
+     * @return amount0 Token0 deposit after the swap, raw units.
+     * @return amount1 Token1 deposit after the swap, raw units.
+     */
     function _zapSingleSidedSwap(
         address pool,
         address tokenIn,
@@ -1371,28 +1849,33 @@ contract EquilibraRouter is
             : (amountOut, amountIn - swapAmount);
     }
 
-    /// @dev Constant-product closed form for the swap leg of a single-
-    ///      sided zap. The exact formula is
-    ///      `x = √(rIn · (rIn + amountIn)) − rIn`. We compute it as
-    ///      `√rIn · √(rIn + amountIn) − rIn` to dodge a potential
-    ///      `rIn · (rIn + amountIn)` overflow on extreme user inputs
-    ///      (reserves are uint128-bounded by the pool, but `amountIn`
-    ///      is not capped). The factored form is `≤` the exact form
-    ///      (per-sqrt floor rounding compounds); the 0.5 % safety
-    ///      margin absorbs the bias and biases residual dust onto the
-    ///      output side rather than under-funding the input side.
+    /**
+     * @dev Constant-product closed form for the swap leg of a single-sided zap,
+     * `x = sqrt(rIn · (rIn + amountIn)) - rIn`. The product is rooted once when it fits uint256;
+     * otherwise the conservative `sqrt(rIn) · sqrt(rIn + amountIn)` is used (the factored product
+     * fits uint192 for uint128 reserves). The result is reduced by 0.5% and capped at half the
+     * input. Reverts `MathOutOfRange` when `rIn + amountIn` overflows; an empty input reserve
+     * yields zero.
+     * @param zeroForOne Swap direction (`true` sells token0).
+     * @param amountIn Raw deposit.
+     * @param r0 Token0 reserve, raw units.
+     * @param r1 Token1 reserve, raw units.
+     * @return swapAmount Part of `amountIn` to swap, raw units.
+     */
     function _calculateOptimalSwap(
         bool zeroForOne,
         uint256 amountIn,
         uint256 r0,
         uint256 r1
-    ) private pure returns (uint256 swapAmount) {
+    ) internal pure returns (uint256 swapAmount) {
         uint256 rIn = zeroForOne ? r0 : r1;
         if (rIn == 0) return 0;
 
-        uint256 sqrtRIn = FixedPointMathLib.sqrt(rIn);
-        uint256 sqrtSum = FixedPointMathLib.sqrt(rIn + amountIn);
-        uint256 sqrtProduct = sqrtRIn * sqrtSum;
+        if (amountIn > type(uint256).max - rIn) revert Errors.MathOutOfRange();
+        uint256 sum = rIn + amountIn;
+        uint256 sqrtProduct = rIn <= type(uint256).max / sum
+            ? FixedPointMathLib.sqrt(rIn * sum)
+            : FixedPointMathLib.sqrt(rIn) * FixedPointMathLib.sqrt(sum);
         swapAmount = sqrtProduct > rIn ? sqrtProduct - rIn : 0;
 
         swapAmount = (swapAmount * 995) / 1000;
@@ -1401,13 +1884,19 @@ contract EquilibraRouter is
         if (swapAmount > cap) swapAmount = cap;
     }
 
-    /// @dev Direction + magnitude of the rebalance swap for the
-    ///      imbalanced zap. Returns `swapAmount == 0` when the deposit
-    ///      already matches the pool ratio (within floor rounding) —
-    ///      caller short-circuits the swap in that case.
-    ///      Cross-product comparisons use {fullMulDiv} so they stay
-    ///      correct on extreme inputs (`amount · reserve` may overflow
-    ///      raw uint256).
+    /**
+     * @dev Direction and size of the rebalance swap for the imbalanced zap. A single-sided
+     * deposit reduces to {_calculateOptimalSwap}; otherwise the side in excess of the pool ratio
+     * is partially swapped. Returns `swapAmount == 0` when the deposit already matches the ratio
+     * within floor rounding. Cross products use `fullMulDiv`, so `amount · reserve` beyond
+     * uint256 stays exact.
+     * @param amount0 Token0 deposit, raw units.
+     * @param amount1 Token1 deposit, raw units.
+     * @param r0 Token0 reserve, raw units.
+     * @param r1 Token1 reserve, raw units.
+     * @return zeroForOne Swap direction (`true` sells token0).
+     * @return swapAmount Gross input of the rebalance swap, raw units; zero when balanced.
+     */
     function _calculateRebalanceSwap(
         uint256 amount0,
         uint256 amount1,
@@ -1421,8 +1910,8 @@ contract EquilibraRouter is
             return (true, _calculateOptimalSwap(true, amount0, r0, r1));
         }
 
-        // balanced1 = amount0 · r1 / r0 — the amount of token1 that
-        // would pair perfectly with `amount0` at the pool ratio.
+        // balanced1 = amount0 · r1 / r0: the token1 amount that pairs with `amount0` at the pool
+        // ratio.
         uint256 balanced1 = amount0.fullMulDiv(r1, r0);
         if (amount1 > balanced1) {
             uint256 excess = amount1 - balanced1;
@@ -1438,9 +1927,16 @@ contract EquilibraRouter is
         // amount1 == balanced1 (within floor rounding): already balanced.
     }
 
-    /// @dev Sweep both pool-side balances back to the caller and emit
-    ///      `ZapIn`. Combines dust-refund and event emission into a
-    ///      single helper so the two zap-in entry points stay short.
+    /**
+     * @dev Sweeps the router's whole balance of both pool tokens back to `user` and emits `ZapIn`.
+     * @param pool Resolved pool address.
+     * @param user Residual recipient (the zap caller).
+     * @param tokenIn Deposited token, or `address(0)` for the imbalanced zap.
+     * @param amountIn Effective input logged in the event.
+     * @param liquidity LP shares minted.
+     * @param token0 Canonical token0.
+     * @param token1 Canonical token1.
+     */
     function _emitZapInWithDust(
         address pool,
         address user,
@@ -1462,6 +1958,18 @@ contract EquilibraRouter is
     // Internal: single-hop (fast-path callback)
     // =====================================================================
 
+    /**
+     * @dev Single-hop exact-input leg with the compact callback payload. A zero `recipient` maps
+     * to the router (staging); the CONTRACT_BALANCE sentinel resolves the router's `tokenIn`
+     * balance and makes the router the payer.
+     * @param tokenIn Input token.
+     * @param tokenOut Output token.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param amountIn Gross input, raw units, or the sentinel.
+     * @param recipient Output receiver, or `address(0)` to stage on the router.
+     * @param payer Address the callback charges.
+     * @return amountOut Output delivered, raw units.
+     */
     function _exactInputSingleInternal(
         address tokenIn,
         address tokenOut,
@@ -1470,15 +1978,13 @@ contract EquilibraRouter is
         address recipient,
         address payer
     ) private returns (uint256 amountOut) {
-        // Opt-in: recipient=0 captures output on the router so the
-        // caller can chain with sweepToken / unwrapWETH9 via multicall.
         if (recipient == address(0)) recipient = address(this);
         if (amountIn == _CONTRACT_BALANCE) {
             amountIn = IERC20Metadata(tokenIn).balanceOf(address(this));
             payer = address(this);
         }
 
-        (address pool, bool zeroForOne) = _resolvePool(tokenIn, tokenOut, poolIndex);
+        (address pool, bool zeroForOne, , ) = _resolvePool(tokenIn, tokenOut, poolIndex);
 
         amountOut = _swapInputAtPool(
             pool,
@@ -1489,11 +1995,17 @@ contract EquilibraRouter is
         );
     }
 
-    /// @dev Execute an exact-input `pool.swap` against a **pre-resolved**
-    ///      pool address and return the receiver-side delta. Used by
-    ///      every exact-input path (single-hop entry, multi-hop entry,
-    ///      and the zap flows) so the CREATE2 resolve never runs twice
-    ///      on the same pair within one call.
+    /**
+     * @dev Executes an exact-input `pool.swap` on a pre-resolved pool and returns the
+     * receiver-side delta. Shared by every exact-input path (single-hop, multi-hop and the zaps),
+     * so the CREATE2 resolve never runs twice for one pair within a call.
+     * @param pool Resolved pool address.
+     * @param zeroForOne Swap direction.
+     * @param amountIn Gross input, raw units; above `int256.max` reverts in the checked cast.
+     * @param recipient Output receiver.
+     * @param callbackData Payload forwarded to {equilibraSwapCallback}.
+     * @return amountOut Output delivered, raw units.
+     */
     function _swapInputAtPool(
         address pool,
         bool zeroForOne,
@@ -1510,6 +2022,18 @@ contract EquilibraRouter is
         amountOut = uint256(-(zeroForOne ? amount1 : amount0));
     }
 
+    /**
+     * @dev Single-hop exact-output leg with the compact callback payload: a negative
+     * `amountSpecified` requests `amountOut`, and {_assertExactOutDeltas} checks the delivered
+     * output and extracts the input paid. A zero `recipient` maps to the router.
+     * @param tokenIn Input token.
+     * @param tokenOut Output token.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @param amountOut Exact output, raw units.
+     * @param recipient Output receiver, or `address(0)` to stage on the router.
+     * @param payer Address the callback charges.
+     * @return amountIn Input paid, raw units.
+     */
     function _exactOutputSingleInternal(
         address tokenIn,
         address tokenOut,
@@ -1520,7 +2044,7 @@ contract EquilibraRouter is
     ) private returns (uint256 amountIn) {
         if (recipient == address(0)) recipient = address(this);
 
-        (address pool, bool zeroForOne) = _resolvePool(tokenIn, tokenOut, poolIndex);
+        (address pool, bool zeroForOne, , ) = _resolvePool(tokenIn, tokenOut, poolIndex);
 
         (int256 amount0Delta, int256 amount1Delta) = IEquilibraPool(pool).swap(
             recipient,
@@ -1536,6 +2060,14 @@ contract EquilibraRouter is
     // Internal: multi-hop (path-encoded callback)
     // =====================================================================
 
+    /**
+     * @dev One exact-input hop of a multi-hop route with the {SwapPath} callback payload; a zero
+     * `recipient` maps to the router.
+     * @param amountIn Gross input of this hop, raw units.
+     * @param recipient Output receiver, or `address(0)` to stage on the router.
+     * @param data Callback payload holding this hop's path and the payer.
+     * @return amountOut Output delivered, raw units.
+     */
     function _exactInputInternal(
         uint256 amountIn,
         address recipient,
@@ -1544,17 +2076,21 @@ contract EquilibraRouter is
         if (recipient == address(0)) recipient = address(this);
 
         (address tokenIn, address tokenOut, uint32 poolIndex) = data.path.decodeFirstPool();
-        (address pool, bool zeroForOne) = _resolvePool(tokenIn, tokenOut, poolIndex);
+        (address pool, bool zeroForOne, , ) = _resolvePool(tokenIn, tokenOut, poolIndex);
 
         amountOut = _swapInputAtPool(pool, zeroForOne, amountIn, recipient, abi.encode(data));
     }
 
-    /// @dev Multi-hop exact-output leg. The return value is intentionally
-    ///      void: the canonical input cost is relayed up to {exactOutput}
-    ///      through `_AMOUNT_IN_CACHED_TSLOT` (written by the innermost
-    ///      callback). The outer call's local `amountIn` would only
-    ///      describe the **intermediate** token quote — the wrong
-    ///      quantity to slippage-check against `amountInMaximum`.
+    /**
+     * @dev Multi-hop exact-output leg. Returns nothing on purpose: the input cost reaches
+     * {exactOutput} through `_AMOUNT_IN_CACHED_TSLOT`, written by the innermost callback, while
+     * this frame's delta describes the token paid to its own hop, an intermediate token on a
+     * multi-hop route and the wrong quantity to check against `amountInMaximum`. A zero
+     * `recipient` maps to the router.
+     * @param amountOut Exact output of this hop, raw units.
+     * @param recipient Output receiver, or `address(0)` to stage on the router.
+     * @param data Callback payload holding the remaining reversed path and the payer.
+     */
     function _exactOutputInternal(
         uint256 amountOut,
         address recipient,
@@ -1562,11 +2098,10 @@ contract EquilibraRouter is
     ) private {
         if (recipient == address(0)) recipient = address(this);
 
-        // Exact-output paths are reversed: the first 20 bytes encode the
-        // **output** token of this hop, the next 20 bytes the **input**
-        // token. Decode and rename accordingly.
+        // Exact-output paths are reversed: the first 20 bytes are this hop's output token, the
+        // next 20 its input token.
         (address tokenOut, address tokenIn, uint32 poolIndex) = data.path.decodeFirstPool();
-        (address pool, bool zeroForOne) = _resolvePool(tokenIn, tokenOut, poolIndex);
+        (address pool, bool zeroForOne, , ) = _resolvePool(tokenIn, tokenOut, poolIndex);
 
         (int256 amount0Delta, int256 amount1Delta) = IEquilibraPool(pool).swap(
             recipient,
@@ -1582,40 +2117,56 @@ contract EquilibraRouter is
     // Internal: callback verification + payment routing
     // =====================================================================
 
-    function _verifyCallback(address tokenA, address tokenB, uint32 poolIndex) private view {
-        (address t0, address t1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        address expected = PoolAddressCompute.computeAddress(
-            factory,
-            _initCodeHash,
-            t0,
-            t1,
-            poolIndex
-        );
+    /**
+     * @dev Reverts `InvalidCallbackSender` unless `msg.sender` is the CREATE2-derived pool of
+     * `(tokenA, tokenB, poolIndex)`.
+     * @param tokenA One pair token as encoded in the payload.
+     * @param tokenB The other pair token.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @return zeroForOne Whether `tokenA` is the pool's token0.
+     */
+    function _verifyCallback(
+        address tokenA,
+        address tokenB,
+        uint32 poolIndex
+    ) private view returns (bool zeroForOne) {
+        address expected;
+        (expected, zeroForOne, , ) = _resolvePool(tokenA, tokenB, poolIndex);
         if (msg.sender != expected) revert Errors.InvalidCallbackSender();
     }
 
-    /// @dev Sort `(tokenIn, tokenOut)` into the pool's canonical
-    ///      `(token0, token1)` order and CREATE2-derive the pool
-    ///      address. Returns the `zeroForOne` flag so callers can pass
-    ///      it straight into {IEquilibraPool.swap}. Pure arithmetic —
-    ///      no external call, no codesize check; passing a pair without
-    ///      a deployed pool surfaces as a plain revert from the
-    ///      subsequent `pool.swap()`.
+    /**
+     * @dev Sorts `(tokenIn, tokenOut)` into the pool's canonical `(token0, token1)` order and
+     * CREATE2-derives the pool address; pure arithmetic with no external call or existence check,
+     * so an undeployed pool fails when the caller reads or calls it.
+     * @param tokenIn Input token.
+     * @param tokenOut Output token.
+     * @param poolIndex Pair-local index of the pool under the factory.
+     * @return pool Derived pool address.
+     * @return zeroForOne Whether `tokenIn` is token0.
+     * @return token0 Lower-sorted token.
+     * @return token1 Higher-sorted token.
+     */
     function _resolvePool(
         address tokenIn,
         address tokenOut,
         uint32 poolIndex
-    ) private view returns (address pool, bool zeroForOne) {
+    ) private view returns (address pool, bool zeroForOne, address token0, address token1) {
         zeroForOne = tokenIn < tokenOut;
-        (address t0, address t1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
-        pool = PoolAddressCompute.computeAddress(factory, _initCodeHash, t0, t1, poolIndex);
+        (token0, token1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
+        pool = PoolAddressCompute.computeAddress(factory, _initCodeHash, token0, token1, poolIndex);
     }
 
-    /// @dev Decode the signed `(amount0Delta, amount1Delta)` returned
-    ///      by an exact-output `pool.swap`, enforce that the pool
-    ///      delivered exactly `amountOut` of the output side, and
-    ///      return the matching input cost. Used by both the single-
-    ///      and multi-hop exact-output paths.
+    /**
+     * @dev Decodes the signed deltas of an exact-output `pool.swap`, reverting
+     * `InsufficientOutputAmount` unless the pool delivered exactly `amountOut`, and returns the
+     * input paid. Shared by the single- and multi-hop exact-output paths.
+     * @param zeroForOne Swap direction.
+     * @param amount0Delta Token0 delta returned by the pool (positive = paid in).
+     * @param amount1Delta Token1 delta returned by the pool (positive = paid in).
+     * @param amountOut Requested exact output, raw units.
+     * @return amountIn Input paid, raw units.
+     */
     function _assertExactOutDeltas(
         bool zeroForOne,
         int256 amount0Delta,
@@ -1629,23 +2180,15 @@ contract EquilibraRouter is
         if (amountOutReceived != amountOut) revert Errors.InsufficientOutputAmount();
     }
 
-    /// @dev Fund a zap input onto the router: wrap attached native ETH
-    ///      in place when the input leg is WETH9 and the router carries
-    ///      enough value, otherwise `transferFrom` the caller.
-    ///
-    ///      Funding modes, all three permitted:
-    ///        1. attached value ≥ `amount` for a WETH9 leg — wraps
-    ///           EXACTLY `amount`; any over-attachment stays on the
-    ///           router and MUST be reclaimed with {refundETH} in the
-    ///           same batch;
-    ///        2. attached value < `amount` for a WETH9 leg — falls
-    ///           through to the ERC20 pull for the FULL amount, so the
-    ///           partial native value stays on the router and needs the
-    ///           same {refundETH} tail;
-    ///        3. non-WETH9 leg — plain ERC20 pull; any attached value is
-    ///           untouched (and again reclaimable only via {refundETH}).
-    ///      Router-held value is permissionless: never end a transaction
-    ///      with a native balance left behind.
+    /**
+     * @dev Funds a zap input onto the router. A WETH9 `token` with attached value of at least
+     * `amount` wraps exactly `amount`; a WETH9 leg with less attached value, or any other token,
+     * is pulled in full from `msg.sender` via `transferFrom`. Attached value not consumed here
+     * stays on the router as a permissionless balance and must be reclaimed with {refundETH} in
+     * the same batch.
+     * @param token Input token.
+     * @param amount Raw amount to fund.
+     */
     function _pullOrWrap(address token, uint256 amount) private {
         if (token == WETH9 && address(this).balance >= amount) {
             IWETH9(WETH9).deposit{ value: amount }();
@@ -1654,36 +2197,27 @@ contract EquilibraRouter is
         }
     }
 
-    /// @dev Unified payer handling for both swap callbacks and mint
-    ///      callback fan-outs. Branch order (payer-first is
-    ///      SAFETY-CRITICAL — see the router-as-payer branch):
-    ///        1. **Router as payer** (`payer == address(this)`) —
-    ///           `transfer` from the router's own `token` balance,
-    ///           UNCONDITIONALLY. Staged funds (a multi-hop intermediate
-    ///           output, or a zap swap-output capture) are held as
-    ///           `token` in the router; this branch must run before any
-    ///           native-wrap so ambient `msg.value` is never spent to
-    ///           re-fund a hop already funded in kind.
-    ///        2. **WETH9 from attached ETH** — external payer only:
-    ///           `token == WETH9` and the router holds enough native
-    ///           value, so wrap exactly what this hop owes and pay.
-    ///        3. **External payer** — `transferFrom` the declared
-    ///           `payer` (the original user for swaps, the mint caller
-    ///           for liquidity adds).
+    /**
+     * @dev Payment routing for the swap and mint callbacks, in a safety-critical branch order.
+     * (1) Router as payer (`payer == address(this)`): transfer from the router's own `token`
+     * balance unconditionally; staged funds (a multi-hop intermediate output, a zap swap-output
+     * capture) are held as `token`, and consulting `address(this).balance` first would, on a
+     * `... -> WETH -> ...` route carrying excess `msg.value`, wrap attached ETH for the hop and
+     * strand the staged WETH beside the leftover ETH, both claimable through the permissionless
+     * helpers. (2) External payer with `token == WETH9` and enough router-held native value: wrap
+     * exactly the amount owed and pay it. (3) External payer otherwise: `transferFrom` the
+     * declared `payer`.
+     * @param token Token owed.
+     * @param payer Address charged; `address(this)` selects the staged-funds branch.
+     * @param recipient Pool receiving the payment.
+     * @param value Raw amount owed.
+     */
     function _pay(address token, address payer, address recipient, uint256 value) private {
         if (payer == address(this)) {
-            // Router-staged funds (an intermediate exact-input hop output,
-            // or a zap swap-output capture) are already held as `token` in
-            // the router. Pay from that balance UNCONDITIONALLY — never wrap
-            // ambient native value here. Consulting `address(this).balance`
-            // first would, on a `... -> WETH -> ...` route carrying excess
-            // `msg.value`, wrap the attached ETH for this hop and strand the
-            // staged WETH alongside the leftover ETH, both then claimable via
-            // the permissionless `sweepToken` / `refundETH` helpers.
+            // Staged funds: pay from the router's `token` balance and never wrap native value here.
             SafeTransferLib.safeTransfer(token, recipient, value);
         } else if (token == WETH9 && address(this).balance >= value) {
-            // External payer supplied native ETH for a WETH input leg: wrap
-            // only what this hop owes, then forward to the pool.
+            // External payer supplied native ETH for a WETH9 leg: wrap only what this hop owes.
             IWETH9(WETH9).deposit{ value: value }();
             SafeTransferLib.safeTransfer(WETH9, recipient, value);
         } else {

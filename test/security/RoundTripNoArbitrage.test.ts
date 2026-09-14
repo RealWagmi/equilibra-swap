@@ -9,7 +9,7 @@
 // deposited.
 //
 // The fixture turns off every operational fee and recentering knob:
-//   * `baseFee = 5`        (factory minimum, then collapsed by ramp = 0)
+//   * `baseFee = 5`        (deliberate static-fee control, then collapsed by ramp = 0)
 //   * `feeRampBps = 0`     (dynamic fee saturates to 5 bps)
 //   * `feeFloorBps = 0`
 //   * `repegShareBps = 0`  (anchor never auto-drifts)

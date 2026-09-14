@@ -1,0 +1,24 @@
+{
+  "aWad": "990000000000000000",
+  "lambdaWad": "1000000000000000",
+  "largeMarginalPrice": {
+    "xMath": "100100000000000000000000000000000000000",
+    "yWad": "499500264889000000000000",
+    "priceScaleWad": "5000",
+    "expected": "999960407293136856"
+  },
+  "minimumEma": {
+    "oldEmaWad": ["2", "3", "4", "5", "10"],
+    "spotWad": "1",
+    "priceScaleWad": "2",
+    "tauSeconds": [87, 865, 604800],
+    "elapsedTauMultiples": 100,
+    "expected": "1"
+  },
+  "fullWidthEma": {
+    "anchorCoefficient": 3,
+    "anchorExponent": 59,
+    "upFactorWad": "1999999999999999999",
+    "downFactorWad": "499999999999999999"
+  }
+}

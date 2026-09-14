@@ -43,6 +43,19 @@ describe("EquilibraSwapMath helpers (decimal lift / state distance / K-and-L)", 
       const { h } = await loadFixture(deployHarness);
       await expect(h.toWad(1n, 19)).to.be.revertedWithCustomError(h, "TokenDecimalsTooLarge");
     });
+
+    it("rejects decimal-lift overflow instead of silently wrapping", async function () {
+      const { h } = await loadFixture(deployHarness);
+      const max = (1n << 256n) - 1n;
+      for (const decimals of [0, 6, 17]) {
+        const scale = 10n ** BigInt(18 - decimals);
+        const lastValid = max / scale;
+        expect(await h.toWad(lastValid, decimals)).to.equal(lastValid * scale);
+        await expect(h.toWad(lastValid + 1n, decimals)).to.be.revertedWithPanic(0x11);
+      }
+      await expect(h.toWad(1n << 255n, 17)).to.be.revertedWithPanic(0x11);
+      expect(await h.toWad(max, 18)).to.equal(max);
+    });
   });
 
   describe("fromWadDown", function () {
@@ -128,7 +141,7 @@ describe("EquilibraSwapMath helpers (decimal lift / state distance / K-and-L)", 
       expect(k).to.be.greaterThan(0n);
       expect(l).to.be.greaterThan(0n);
       // At the anchor `K = W · L²` ⇒ `K_stored = mulWad(L, L)`.
-      const expectedK = (l * l) / WAD;
+      const expectedK = (l * l * WAD) / (1n << 256n);
       const diff = expectedK > k ? expectedK - k : k - expectedK;
       expect(diff).to.be.lessThan(10n);
     });
@@ -169,7 +182,7 @@ describe("EquilibraSwapMath helpers (decimal lift / state distance / K-and-L)", 
       // does not perturb anchor depth.
       const { h } = await loadFixture(deployHarness);
       const reserve = 100n * WAD;
-      const lambdas = [10n ** 15n, 10n ** 16n, 10n ** 17n, 10n ** 18n];
+      const lambdas = [10n ** 12n, 10n ** 15n, 10n ** 16n, 10n ** 17n, 10n ** 18n];
       let prev: bigint | null = null;
       for (const lambda of lambdas) {
         const [, lRaw] = await h.computeKAndL(reserve, reserve, A_WAD, lambda);
@@ -181,7 +194,7 @@ describe("EquilibraSwapMath helpers (decimal lift / state distance / K-and-L)", 
       }
       // The shared L equals the anchor reserve exactly (no sqrt rounding
       // at the diagonal, the formula simplifies to `L = x`).
-      expect(prev).to.equal(reserve);
+      expect(prev).to.equal((reserve * (1n << 128n)) / WAD);
     });
 
     it("(a, λ) decoupling: at the anchor, L is independent of a", async function () {
@@ -197,7 +210,7 @@ describe("EquilibraSwapMath helpers (decimal lift / state distance / K-and-L)", 
         }
         prev = l;
       }
-      expect(prev).to.equal(reserve);
+      expect(prev).to.equal((reserve * (1n << 128n)) / WAD);
     });
   });
 });

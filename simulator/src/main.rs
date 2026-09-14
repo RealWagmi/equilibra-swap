@@ -6,10 +6,10 @@ use clap::Parser;
 use equilibra_offchain_simulator::app::config as app_config;
 use equilibra_offchain_simulator::app::provenance::{
     binary_digest, execution_manifest_path, hash_report_assets_dir, load_execution_provenance,
-    oracle_snapshot_from_bytes, parent_dir_or_current, persist_json_durable,
-    resolve_effective_window, verify_binary_artifact, EffectiveExecutionOptions,
-    ExecutionProvenance, ExecutionProvenanceMaterial, OracleSnapshot, EXECUTION_PROVENANCE_VERSION,
-    REPORT_ALGORITHM_VERSION,
+    oracle_file_names_for_bases, oracle_snapshot_from_bytes, parent_dir_or_current,
+    persist_json_durable, resolve_effective_window, verify_binary_artifact,
+    EffectiveExecutionOptions, ExecutionProvenance, ExecutionProvenanceMaterial, OracleSnapshot,
+    EXECUTION_PROVENANCE_VERSION, REPORT_ALGORITHM_VERSION,
 };
 use equilibra_offchain_simulator::common::{
     self as common, build_slippage_bucket_edges_bps, RecenterGateBasePeriods, RecenterGateCounts,
@@ -170,11 +170,10 @@ struct SlippageSweepCfg {
 struct ArbitrageurCfg {
     minProfitUsd: f64,
     minProfitBps: f64,
-    gasPriceGwei: f64,
     maxSearchIterations: usize,
     probeUsd: f64,
+    probeTriggerBps: f64,
     minTradeUsd: f64,
-    gasUsedEstimates: HashMap<String, String>,
     postArbExternalSwaps: PostArbExternalSwapsCfg,
 }
 
@@ -346,11 +345,10 @@ fn runtime_run_config_from_app(cfg: app_config::BenchmarkRunConfig) -> Result<Ru
             arbitrageur: ArbitrageurCfg {
                 minProfitUsd: cfg.actors.arbitrageur.min_profit_usd,
                 minProfitBps: cfg.actors.arbitrageur.min_profit_bps,
-                gasPriceGwei: cfg.actors.arbitrageur.gas_price_gwei,
                 maxSearchIterations: max_search_iterations,
                 probeUsd: cfg.actors.arbitrageur.probe_usd,
                 minTradeUsd: cfg.actors.arbitrageur.min_trade_usd,
-                gasUsedEstimates: cfg.actors.arbitrageur.gas_used_estimates,
+                probeTriggerBps: cfg.actors.arbitrageur.probe_trigger_bps,
                 postArbExternalSwaps: PostArbExternalSwapsCfg {
                     count: cfg.actors.arbitrageur.post_arb_external_swaps.count,
                     shareBps: cfg.actors.arbitrageur.post_arb_external_swaps.share_bps,
@@ -410,35 +408,35 @@ struct PriceOracle {
 }
 
 impl PriceOracle {
-    fn load(data_dir: &Path) -> Result<(Self, OracleSnapshot)> {
-        let eth_path = data_dir.join("eth-usd.json");
-        let btc_path = data_dir.join("btc-usd.json");
-
-        let eth_raw =
-            fs::read(&eth_path).with_context(|| format!("read {}", eth_path.display()))?;
-        let btc_raw =
-            fs::read(&btc_path).with_context(|| format!("read {}", btc_path.display()))?;
-        let raw_files = BTreeMap::from([
-            ("btc-usd.json".to_string(), btc_raw),
-            ("eth-usd.json".to_string(), eth_raw),
-        ]);
+    fn load(data_dir: &Path, selected_bases: &[String]) -> Result<(Self, OracleSnapshot)> {
+        let mut raw_files = BTreeMap::new();
+        for name in oracle_file_names_for_bases(selected_bases)? {
+            let path = data_dir.join(name);
+            raw_files.insert(
+                name.to_string(),
+                fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            );
+        }
         let snapshot = oracle_snapshot_from_bytes(&raw_files)?;
-
-        let mut eth: PriceData = serde_json::from_slice(&raw_files["eth-usd.json"])
-            .with_context(|| format!("parse {}", eth_path.display()))?;
-        let mut btc: PriceData = serde_json::from_slice(&raw_files["btc-usd.json"])
-            .with_context(|| format!("parse {}", btc_path.display()))?;
-
-        eth.points.sort_by_key(|p| p.t);
-        btc.points.sort_by_key(|p| p.t);
-
-        Ok((
-            Self {
-                eth: dedupe_points(eth.points),
-                btc: dedupe_points(btc.points),
-            },
-            snapshot,
-        ))
+        let mut oracle = Self {
+            eth: Vec::new(),
+            btc: Vec::new(),
+        };
+        for (name, raw) in raw_files {
+            let mut data: PriceData = serde_json::from_slice(&raw)
+                .with_context(|| format!("parse {}", data_dir.join(&name).display()))?;
+            if data.points.is_empty() {
+                return Err(anyhow!("empty oracle points in {name}"));
+            }
+            data.points.sort_by_key(|point| point.t);
+            let points = dedupe_points(data.points);
+            if name == "eth-usd.json" {
+                oracle.eth = points;
+            } else {
+                oracle.btc = points;
+            }
+        }
+        Ok((oracle, snapshot))
     }
 
     fn get_price_at(&self, symbol: &str, ts: u64) -> Result<f64> {
@@ -489,21 +487,12 @@ impl PriceOracle {
     }
 
     fn range_intersection(&self) -> Option<(u64, u64)> {
-        let eth_first = self.eth.first()?.t;
-        let eth_last = self.eth.last()?.t;
-        let btc_first = self.btc.first()?.t;
-        let btc_last = self.btc.last()?.t;
-        let start = if eth_first >= btc_first {
-            eth_first
-        } else {
-            btc_first
-        };
-        let end = if eth_last <= btc_last {
-            eth_last
-        } else {
-            btc_last
-        };
-        Some((start, end))
+        [&self.eth, &self.btc]
+            .into_iter()
+            .filter_map(|points| Some((points.first()?.t, points.last()?.t)))
+            .reduce(|(start, end), (next_start, next_end)| {
+                (start.max(next_start), end.min(next_end))
+            })
     }
 }
 
@@ -614,13 +603,13 @@ struct EquilibraParams {
     /// Depth-at-anchor knob `a` (WAD-scaled). At `D = 0` the
     /// amplification `A = a` — larger `aWad` deepens the central
     /// plateau. Bounded by `Constants.A_MIN_WAD..A_MAX_WAD`
-    /// (`1e17..99e16`, i.e. `0.1·W..0.99·W`). Decoupled from
+    /// (`1e17..WAD-1`, i.e. `0.1 <= a < 1`). Decoupled from
     /// `lambda_wad`.
     a_wad: u128,
     /// Plateau-width knob `λ` (WAD-scaled). At `λ·D = W` the
     /// amplification halves (`A = a/2`). Bounded by
     /// `Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD`
-    /// (`1e15..1e18`). Decoupled from `a_wad`.
+    /// (`1e12..1e18`). Decoupled from `a_wad`.
     lambda_wad: u128,
     protocol_fee_percent: u64,
     /// Price-EMA half-life in seconds. `EquilibraStatefulConfig::new`
@@ -761,7 +750,7 @@ struct PoolState {
 
     recentering_events: Vec<RecenteringEventOut>,
     last_recenter_ts: u64,
-    ema_price: u128,
+    ema_log_wad: i128,
     last_timestamp: u64,
     /// Curve-style LP-fee budget bucket — always 0 in the hybrid model
     /// (fees are inlined into reserves). Kept for CSV schema stability.
@@ -984,6 +973,7 @@ struct EquilibraExchangeStatefulOut {
     e0: u128,
     e1: u128,
     ema_price: u128,
+    ema_log_wad: i128,
     last_timestamp: u64,
     last_recenter_ts: u64,
     /// Vestigial — see `PoolState::budget_fee0`.
@@ -1124,13 +1114,51 @@ struct UniswapV2SwapStatefulOut {
 #[derive(Debug)]
 struct QuoterClient {
     inner: LocalQuoter,
-    // The legacy `equilibra_quote_cache` (single-knob
-    // stateless config) was retired — stateless quotes now use the
-    // stateful cfg cache below and call
-    // `equilibra_math::quote_exact_in_forward` directly.
+    // Pure quotes and executed swaps share the checked stateful resolvers.
     equilibra_stateful_cfg_cache: HashMap<String, EquilibraStatefulConfig>,
     curve_quote_cache: HashMap<String, CurveQuoteConfig>,
     uniswap_quote_cache: HashMap<String, uniswap_v2::UniswapV2QuoteConfig>,
+    // Observational only; populated on rejected calls, never on successful quotes.
+    quote_rejections: BTreeMap<String, BTreeMap<(&'static str, &'static str), u64>>,
+    #[cfg(test)]
+    quote_failures: std::collections::VecDeque<Option<&'static str>>,
+    #[cfg(test)]
+    swap_failures: std::collections::VecDeque<Option<&'static str>>,
+}
+
+/// The kernel exposes anyhow leaf messages, not a typed rejection API.
+/// Only these exact, AMM-specific trade failures are recoverable. Invariant
+/// reconstruction, invalid config/state, arithmetic and unknown errors stay fatal.
+fn quote_rejection_reason(pool: &PoolState, error: &anyhow::Error) -> Option<&'static str> {
+    if pool.reserve0 == 0 || pool.reserve1 == 0 {
+        return None;
+    }
+    let cause = error.root_cause().to_string();
+    match (pool.amm, cause.as_str()) {
+        (
+            AmmKind::Equilibra,
+            "equilibra_stateful: amountInMath zero"
+            | "equilibra_stateful: amountOutMath zero"
+            | "equilibra_stateful: amount_too_small_after_normalization",
+        )
+        | (AmmKind::Curve, "curve_exchange_dust")
+        | (AmmKind::UniswapV2, "uniswap_v2_insufficient_output") => Some("dust output"),
+        (
+            AmmKind::Equilibra,
+            "equilibra_swap_stateful_insufficient_liquidity"
+            | "equilibra_stateful: insufficient liquidity"
+            | "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity)",
+        ) => Some("insufficient output liquidity"),
+        (
+            AmmKind::Curve,
+            "StableswapMath get_y did not converge" | "newton_y_twocrypto did not converge",
+        )
+        | (AmmKind::Equilibra, "equilibra_math: SolverDidNotConverge") => {
+            Some("counterpart solver did not converge")
+        }
+        (AmmKind::Equilibra, "equilibra_stateful: LpValueDecreased") => Some("LP value decreased"),
+        _ => None,
+    }
 }
 
 impl QuoterClient {
@@ -1140,16 +1168,74 @@ impl QuoterClient {
             equilibra_stateful_cfg_cache: HashMap::new(),
             curve_quote_cache: HashMap::new(),
             uniswap_quote_cache: HashMap::new(),
+            quote_rejections: BTreeMap::new(),
+            #[cfg(test)]
+            quote_failures: Default::default(),
+            #[cfg(test)]
+            swap_failures: Default::default(),
         })
     }
 
-    /// The legacy `EquilibraQuoteConfig` (single-knob, fee-aware
-    /// stateless config) was retired. Stateless quotes now lift to
-    /// math-space and call `equilibra_math::quote_exact_in_forward`
-    /// directly — the stateful config cache
-    /// (`equilibra_stateful_cfg_cache`) already carries every
-    /// scaling factor we need (`a_wad`, `lambda_wad`, `token0_scale`,
-    /// `token1_scale`).
+    /// Simulator policy, deliberately outside the kernel and trace replay.
+    /// A rejected trial is unavailable, not a zero-price/zero-slippage quote.
+    fn recover_quote_result<T>(
+        &mut self,
+        pool: &PoolState,
+        stage: &'static str,
+        result: Result<T>,
+    ) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                let reason = quote_rejection_reason(pool, &error);
+                // Search probes may be unavailable. Executing the selected,
+                // checked quote on the same Equilibra state must not fail its
+                // solver or LP check. Unknown errors were already fatal; add the same
+                // context without recording either as a skipped trade.
+                if pool.amm == AmmKind::Equilibra
+                    && stage == "arbitrage execution"
+                    && (reason.is_none()
+                        || matches!(
+                            reason,
+                            Some("counterpart solver did not converge" | "LP value decreased")
+                        ))
+                {
+                    return Err(error.context(format!(
+                        "{}: Equilibra arbitrage execution failed after a successful checked quote on the same state",
+                        pool.context_name,
+                    )));
+                }
+                let Some(reason) = reason else {
+                    return Err(error);
+                };
+                let count = self
+                    .quote_rejections
+                    .entry(pool.context_name.clone())
+                    .or_default()
+                    .entry((stage, reason))
+                    .or_default();
+                *count = count.saturating_add(1);
+                if *count == 1 {
+                    eprintln!(
+                        "[simulator][warning] {}: {} rejected ({}); skipping this attempt. Repeats are counted in the final quote-rejection summary.",
+                        pool.context_name, stage, reason,
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn emit_quote_rejection_summary(&self) {
+        for (context, counts) in &self.quote_rejections {
+            for ((stage, reason), count) in counts {
+                eprintln!(
+                    "[simulator][warning] quote-rejection summary: {} / {} / {}: {} skipped attempts",
+                    context, stage, reason, count,
+                );
+            }
+        }
+    }
 
     fn curve_quote_config_from_pool(pool: &PoolState) -> Result<CurveQuoteConfig> {
         let curve = pool
@@ -1185,6 +1271,10 @@ impl QuoterClient {
         token_in: &str,
         amount_in: u128,
     ) -> Result<u128> {
+        #[cfg(test)]
+        if let Some(Some(reason)) = self.quote_failures.pop_front() {
+            return Err(anyhow!(reason));
+        }
         match pool.amm {
             AmmKind::Equilibra => {
                 self.ensure_equilibra_stateful_cfg(pool)?;
@@ -1638,6 +1728,7 @@ impl QuoterClient {
             e0: out.e0,
             e1: out.e1,
             ema_price: out.ema_price_wad,
+            ema_log_wad: out.ema_log_wad,
             last_timestamp: out.last_ema_ts,
             last_recenter_ts: out.last_repeg_ts,
             budget_fee0: 0,
@@ -1708,6 +1799,7 @@ impl QuoterClient {
                 e0: out.e0,
                 e1: out.e1,
                 ema_price: out.ema_price_wad,
+                ema_log_wad: out.ema_log_wad,
                 last_timestamp: out.last_ema_ts,
                 last_recenter_ts: out.last_repeg_ts,
                 budget_fee0: 0,
@@ -1803,7 +1895,6 @@ struct ArbTrade {
     amount_in: u128,
     amount_out: u128,
     gross_profit_usd: f64,
-    gas_cost_usd: f64,
     net_profit_usd: f64,
     actual_fee_bps: u64,
     fee_paid_usd: f64,
@@ -1817,7 +1908,6 @@ struct ArbState {
     trades: Vec<ArbTrade>,
     trade_count: u64,
     total_profit_usd: f64,
-    total_gas_usd: f64,
     net_profit_usd: f64,
 }
 
@@ -1928,7 +2018,6 @@ struct ArbStateOut {
     trades: Vec<ArbTradeOut>,
     tradeCount: u64,
     totalProfitUsd: f64,
-    totalGasCostUsd: f64,
     netProfitUsd: f64,
 }
 
@@ -1940,7 +2029,6 @@ struct ArbTradeOut {
     amountIn: String,
     amountOut: String,
     grossProfitUsd: f64,
-    gasCostUsd: f64,
     netProfitUsd: f64,
     actualFeeBps: u64,
     feePaidUsd: f64,
@@ -1990,7 +2078,6 @@ struct MetadataOut {
     endTimestamp: u64,
     durationDays: u64,
     initialLiquidityUsd: f64,
-    gasPriceGwei: f64,
     ammList: Vec<String>,
     poolList: Vec<String>,
     generatedAt: String,
@@ -2106,6 +2193,8 @@ struct TracePoolInput {
     equilibraE1: Option<String>,
     #[serde(default)]
     equilibraEmaPrice: Option<String>,
+    /// Signed, unbiased ln(EMA); required to resume without losing fractional precision.
+    equilibraEmaLogWad: Option<String>,
     #[serde(default)]
     equilibraLastTimestamp: Option<String>,
     #[serde(default)]
@@ -2242,6 +2331,8 @@ struct TraceStateOut {
     curveLpXcpProfit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     equilibraEmaPrice: Option<String>,
+    /// Signed, unbiased ln(EMA); required to resume without losing fractional precision.
+    equilibraEmaLogWad: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     equilibraLastTimestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2377,17 +2468,7 @@ fn bigint_pref(v: u128) -> String {
     format!("bigint:{}", v)
 }
 
-/// Compute informational "anchor balances" in raw token units for a pool that
-/// has reserves `(reserve0, reserve1)` and anchor price `anchor_price_wad`
-/// (price of 1 WAD-scaled token0 in WAD-scaled token1). These balances
-/// Stateless exact-in quoter — **fee-inclusive**, mirroring the
-/// stateful `equilibra_swap_stateful` output bit-for-bit. The
-/// arbitrageur model uses this to evaluate profitability; if the
-/// quote skipped the fee, every arb would over-estimate output by
-/// `feeWad / WAD` and over-trade on every cycle, driving the pool
-/// into a `priceScale` runaway (see the
-/// `stateless_quote_matches_stateful_output_after_fees` regression
-/// in `equilibra::ema_cap_tests`).
+/// Pure fee-inclusive quote using the same checked resolver as stateful execution.
 fn quote_equilibra_exact_in_stateless(
     cfg: &equilibra::EquilibraStatefulConfig,
     reserve0: u128,
@@ -2399,108 +2480,23 @@ fn quote_equilibra_exact_in_stateless(
     if amount_in == 0 {
         return Ok(0);
     }
-    let zero_for_one = if token_in.eq_ignore_ascii_case(cfg.token0()) {
-        true
-    } else if token_in.eq_ignore_ascii_case(cfg.token1()) {
-        false
-    } else {
+    if !token_in.eq_ignore_ascii_case(cfg.token0()) && !token_in.eq_ignore_ascii_case(cfg.token1())
+    {
         return Err(anyhow!("equilibra_quote: tokenIn not in pool"));
-    };
-    let price_scale = U256::from(price_scale_wad);
-    let x_wad = U256::from(reserve1) * cfg.token1_scale;
-    let y_wad = U256::from(reserve0) * cfg.token0_scale;
-    if x_wad.is_zero() || y_wad.is_zero() {
+    }
+    if reserve0 == 0 || reserve1 == 0 {
         return Ok(0);
     }
-    // Asymmetric coord change: xMath = xWad, yMath = yWad·WAD/priceScale.
-    let (x_math, y_math) = equilibra_math::to_math_space(x_wad, y_wad, price_scale)?;
-    let (in_scale, out_scale) = if zero_for_one {
-        (cfg.token0_scale, cfg.token1_scale)
-    } else {
-        (cfg.token1_scale, cfg.token0_scale)
-    };
-    // Apply the dynamic fee EXACTLY as the stateful executor does,
-    // before lifting input into math space. The on-chain pool
-    // subtracts `fee_amount = amount_in · feeWad / WAD` from
-    // `amount_in` and routes only `clean_amount_in` through the
-    // curve. Quoting without the fee gives the arb an inflated
-    // estimate equal to `1 / (1 − feeWad/WAD)` × the true output,
-    // which is the divergence pinned by
-    // `equilibra::stateless_quote_matches_stateful_output_after_fees`.
-    let stateless_state = equilibra::EquilibraStatefulState {
+    let state = equilibra::EquilibraStatefulState {
         reserve0,
         reserve1,
         price_scale_wad,
         ..equilibra::EquilibraStatefulState::empty()
     };
-    let fee_wad_effective =
-        equilibra::resolve_dynamic_fee_wad_from_cp(cfg, &stateless_state, zero_for_one, amount_in)?;
-    let fee_amount = equilibra_math::mul_div_floor(
-        U256::from(amount_in),
-        U256::from(fee_wad_effective),
-        U256::from(equilibra_math::WAD),
-    )?;
-    let amount_in_after_fee_u = U256::from(amount_in).saturating_sub(fee_amount);
-    let amount_in_after_fee: u128 = amount_in_after_fee_u
-        .try_into()
-        .map_err(|_| anyhow!("amountInPostFee exceeds u128"))?;
-    if amount_in_after_fee == 0 {
-        return Ok(0);
-    }
-    let amount_in_wad = U256::from(amount_in_after_fee) * in_scale;
-    if amount_in_wad.is_zero() {
-        return Ok(0);
-    }
-    // Asymmetric lift: zfo (quote) → yMath = divWad; !zfo (base) → xMath identity.
-    let amount_in_math = if zero_for_one {
-        equilibra_math::mul_div_floor(amount_in_wad, U256::from(equilibra_math::WAD), price_scale)?
-    } else {
-        amount_in_wad
-    };
-    if amount_in_math.is_zero() {
-        return Ok(0);
-    }
-    let amount_out_wad = if zero_for_one {
-        let (out_math, _) = equilibra_math::quote_exact_in_forward(
-            y_math,
-            x_math,
-            amount_in_math,
-            U256::from(cfg.a_wad),
-            U256::from(cfg.lambda_wad),
-        )?;
-        if out_math >= x_math {
-            return Ok(0);
-        }
-        // Output is xMath → token1 (base) wad identity.
-        out_math
-    } else {
-        let (out_math, _) = equilibra_math::quote_exact_in_forward(
-            x_math,
-            y_math,
-            amount_in_math,
-            U256::from(cfg.a_wad),
-            U256::from(cfg.lambda_wad),
-        )?;
-        if out_math >= y_math {
-            return Ok(0);
-        }
-        // Output is yMath → token0 (quote) wad: math · priceScale / WAD (floor).
-        equilibra_math::mul_wad(out_math, price_scale)?
-    };
-    let out_raw = amount_out_wad / out_scale;
-    out_raw
-        .try_into()
-        .map_err(|_| anyhow!("amountOut exceeds u128"))
+    Ok(equilibra::quote_exact_in_stateful(cfg, &state, token_in, amount_in)?.amount_out_raw)
 }
 
-/// Stateless exact-out quoter — **fee-inclusive**, mirrors the
-/// stateful `equilibra_swap_stateful_exact_out` output bit-for-bit.
-/// On-chain exact-out fee is grossed up on the input side:
-/// `amount_in = clean_in / (1 − feeWad/WAD)` (ceil), so a fee-free
-/// quote would tell the arbitrageur the trade needs LESS input than
-/// it actually does. The earlier fee-free version of this helper
-/// drove the simulator's `priceScale` runaway alongside the
-/// equally fee-free exact-in path.
+/// Pure fee-inclusive quote using the same checked resolver as stateful execution.
 fn quote_equilibra_exact_out_stateless(
     cfg: &equilibra::EquilibraStatefulConfig,
     reserve0: u128,
@@ -2512,98 +2508,24 @@ fn quote_equilibra_exact_out_stateless(
     if amount_out == 0 {
         return Ok(0);
     }
-    let zero_for_one = if token_in.eq_ignore_ascii_case(cfg.token0()) {
-        true
-    } else if token_in.eq_ignore_ascii_case(cfg.token1()) {
-        false
-    } else {
+    if !token_in.eq_ignore_ascii_case(cfg.token0()) && !token_in.eq_ignore_ascii_case(cfg.token1())
+    {
         return Err(anyhow!("equilibra_quote_out: tokenIn not in pool"));
-    };
-    let price_scale = U256::from(price_scale_wad);
-    let x_wad = U256::from(reserve1) * cfg.token1_scale;
-    let y_wad = U256::from(reserve0) * cfg.token0_scale;
-    if x_wad.is_zero() || y_wad.is_zero() {
+    }
+    if reserve0 == 0 || reserve1 == 0 {
         return Ok(0);
     }
-    // Asymmetric coord change: xMath = xWad, yMath = yWad·WAD/priceScale.
-    let (x_math, y_math) = equilibra_math::to_math_space(x_wad, y_wad, price_scale)?;
-    let (in_scale, out_scale) = if zero_for_one {
-        (cfg.token0_scale, cfg.token1_scale)
-    } else {
-        (cfg.token1_scale, cfg.token0_scale)
-    };
-    let amount_out_wad = U256::from(amount_out) * out_scale;
-    if amount_out_wad.is_zero() {
-        return Ok(0);
-    }
-    // Asymmetric output lift (ceil for pool-favourable rounding):
-    //   zfo: token1 (base) output → xMath identity.
-    //   !zfo: token0 (quote) output → yMath = mulDivUp(out, WAD, priceScale).
-    let amount_out_math = if zero_for_one {
-        amount_out_wad
-    } else {
-        equilibra_math::mul_div_ceil(amount_out_wad, U256::from(equilibra_math::WAD), price_scale)?
-    };
-    if amount_out_math.is_zero() {
-        return Ok(0);
-    }
-    let amount_in_wad = if zero_for_one {
-        let (in_math, _) = equilibra_math::quote_exact_out_forward(
-            y_math,
-            x_math,
-            amount_out_math,
-            U256::from(cfg.a_wad),
-            U256::from(cfg.lambda_wad),
-        )?;
-        // Input on yMath → token0 (quote) wad: math · priceScale / WAD (ceil).
-        equilibra_math::mul_div_ceil(in_math, price_scale, U256::from(equilibra_math::WAD))?
-    } else {
-        let (in_math, _) = equilibra_math::quote_exact_out_forward(
-            x_math,
-            y_math,
-            amount_out_math,
-            U256::from(cfg.a_wad),
-            U256::from(cfg.lambda_wad),
-        )?;
-        // Input on xMath → token1 (base) wad identity.
-        in_math
-    };
-    let clean_in_raw_u = amount_in_wad / in_scale;
-    let clean_in_raw: u128 = clean_in_raw_u
-        .try_into()
-        .map_err(|_| anyhow!("amountIn exceeds u128"))?;
-    if clean_in_raw == 0 {
-        return Ok(0);
-    }
-    // Gross up by the dynamic fee (resolved from the POST-swap state
-    // is what the stateful executor does — but for arb estimation we
-    // approximate with the PRE-swap state, same as exact-in). The
-    // ceil rounding matches the contract's pool-favourable bias:
-    // `amount_in = ceil(clean_in × WAD / (WAD − feeWad))`.
-    let stateless_state = equilibra::EquilibraStatefulState {
+    let state = equilibra::EquilibraStatefulState {
         reserve0,
         reserve1,
         price_scale_wad,
         ..equilibra::EquilibraStatefulState::empty()
     };
-    let fee_wad_effective = equilibra::resolve_dynamic_fee_wad_from_cp(
-        cfg,
-        &stateless_state,
-        zero_for_one,
-        clean_in_raw,
-    )?;
-    let wad_u = U256::from(equilibra_math::WAD);
-    let denom = wad_u - U256::from(fee_wad_effective);
-    if denom.is_zero() {
-        return Err(anyhow!("equilibra_quote_out: fee == WAD"));
-    }
-    let gross_in_u = equilibra_math::mul_div_ceil(U256::from(clean_in_raw), wad_u, denom)?;
-    gross_in_u
-        .try_into()
-        .map_err(|_| anyhow!("amountIn (gross) exceeds u128"))
+    Ok(equilibra::quote_exact_out_stateful(cfg, &state, token_in, amount_out)?.amount_in_raw)
 }
 
-/// describe the balanced-at-anchor composition holding the same total value
+/// Compute informational balanced-at-anchor balances in raw token units,
+/// holding the same total value
 /// as the current reserves and are only used for CSV/reporting backwards
 /// compatibility — the canonical anchor is now `anchor_price_wad` itself.
 fn derive_legacy_anchor_balances(
@@ -3099,8 +3021,14 @@ struct ProbeQuotePair {
     sell_out: u128,
 }
 
-/// Compute the dust-probe pair once. Returns `Ok(None)` when either
-/// probe amount rounds to zero (the callers' previous early-exit).
+enum ProbeQuotes {
+    RoundedToZero,
+    Rejected,
+    Available(ProbeQuotePair),
+}
+
+/// Compute the dust-probe pair once. Keep zero-sized inputs distinct from
+/// rejected quotes so diagnostic samples retain their existing zero-probe fallback.
 /// `ensure_curve_d` runs before the quotes so a dirty Curve invariant
 /// is settled exactly as it was when each site quoted independently.
 fn compute_probe_quote_pair(
@@ -3109,22 +3037,28 @@ fn compute_probe_quote_pair(
     base_symbol: &str,
     oracle_price_1e18: u128,
     probe_usd_1e18: u128,
-) -> Result<Option<ProbeQuotePair>> {
+) -> Result<ProbeQuotes> {
     if oracle_price_1e18 == 0 || probe_usd_1e18 == 0 {
-        return Ok(None);
+        return Ok(ProbeQuotes::RoundedToZero);
     }
     let probe_quote = usd_to_token_amount(probe_usd_1e18, "USDT", oracle_price_1e18);
     let probe_base = usd_to_token_amount(probe_usd_1e18, base_symbol, oracle_price_1e18);
     if probe_quote == 0 || probe_base == 0 {
-        return Ok(None);
+        return Ok(ProbeQuotes::RoundedToZero);
     }
     ensure_curve_d(pool, quoter)
         .with_context(|| format!("ensure curve D for {}", pool.context_name))?;
-    let buy_out = quote_exact_input(pool, quoter, "USDT", probe_quote)
-        .with_context(|| format!("probe buy quote failed for {}", pool.context_name))?;
-    let sell_out = quote_exact_input(pool, quoter, base_symbol, probe_base)
-        .with_context(|| format!("probe sell quote failed for {}", pool.context_name))?;
-    Ok(Some(ProbeQuotePair {
+    let buy_result = quote_exact_input(pool, quoter, "USDT", probe_quote)
+        .with_context(|| format!("probe buy quote failed for {}", pool.context_name));
+    let Some(buy_out) = quoter.recover_quote_result(pool, "buy probe", buy_result)? else {
+        return Ok(ProbeQuotes::Rejected);
+    };
+    let sell_result = quote_exact_input(pool, quoter, base_symbol, probe_base)
+        .with_context(|| format!("probe sell quote failed for {}", pool.context_name));
+    let Some(sell_out) = quoter.recover_quote_result(pool, "sell probe", sell_result)? else {
+        return Ok(ProbeQuotes::Rejected);
+    };
+    Ok(ProbeQuotes::Available(ProbeQuotePair {
         probe_quote,
         probe_base,
         buy_out,
@@ -3165,7 +3099,7 @@ fn execute_user_quote_plan_for_context(
     // probe fill and this quote (debug-asserted below), so the value is
     // bit-identical to an inline re-probe.
     spot_price_1e18_pre: u128,
-) -> Result<()> {
+) -> Result<bool> {
     let ctx_name = pool.context_name.clone();
     ensure_curve_d(pool, quoter).with_context(|| format!("ensure curve D for {}", ctx_name))?;
 
@@ -3174,8 +3108,11 @@ fn execute_user_quote_plan_for_context(
     let reserve0_pre = pool.reserve0;
     let reserve1_pre = pool.reserve1;
 
-    let amount_out = quote_exact_input(pool, quoter, &plan.token_in, plan.amount_in)
-        .with_context(|| format!("user quote failed for {}", pool.context_name))?;
+    let result = quote_exact_input(pool, quoter, &plan.token_in, plan.amount_in)
+        .with_context(|| format!("user quote failed for {}", pool.context_name));
+    let Some(amount_out) = quoter.recover_quote_result(pool, "slippage quote", result)? else {
+        return Ok(false);
+    };
 
     debug_assert_eq!(
         reserve0_pre, pool.reserve0,
@@ -3204,7 +3141,7 @@ fn execute_user_quote_plan_for_context(
         oracle_price_1e18,
     );
 
-    Ok(())
+    Ok(true)
 }
 
 fn integer_sqrt(n: u128) -> u128 {
@@ -3254,8 +3191,8 @@ fn parse_u32_opt_decimal(v: Option<&String>, field: &str) -> Result<Option<u32>>
     Ok(Some(parsed as u32))
 }
 
-fn trace_state_out(pool: &PoolState) -> TraceStateOut {
-    TraceStateOut {
+fn trace_state_out(pool: &PoolState) -> Result<TraceStateOut> {
+    Ok(TraceStateOut {
         reserve0: pool.reserve0.to_string(),
         reserve1: pool.reserve1.to_string(),
         totalSupply: pool.total_supply.to_string(),
@@ -3281,7 +3218,12 @@ fn trace_state_out(pool: &PoolState) -> TraceStateOut {
         curveXcpProfit: pool.curve.as_ref().map(|c| c.xcp_profit.to_string()),
         curveLpXcpProfit: pool.curve.as_ref().map(|c| c.lp_xcp_profit.to_string()),
         equilibraEmaPrice: if pool.amm == AmmKind::Equilibra {
-            Some(pool.ema_price.to_string())
+            Some(equilibra_math::ema_log_to_price(pool.ema_log_wad)?.to_string())
+        } else {
+            None
+        },
+        equilibraEmaLogWad: if pool.amm == AmmKind::Equilibra {
+            Some(pool.ema_log_wad.to_string())
         } else {
             None
         },
@@ -3338,7 +3280,7 @@ fn trace_state_out(pool: &PoolState) -> TraceStateOut {
         equilibraFeeRampBps: pool.eq.as_ref().map(|eq| eq.fee_ramp_bps),
         equilibraFeeFloorBps: pool.eq.as_ref().map(|eq| eq.fee_floor_bps),
         equilibraRepegShareBps: pool.eq.as_ref().map(|eq| eq.repeg_share_bps),
-    }
+    })
 }
 
 fn build_trace_pool(input: &TracePoolInput, start_ts: u64) -> Result<PoolState> {
@@ -3389,7 +3331,7 @@ fn build_trace_pool(input: &TracePoolInput, start_ts: u64) -> Result<PoolState> 
         fee_bps: input.feeBps,
         recentering_events: Vec::new(),
         last_recenter_ts: 0,
-        ema_price: 0,
+        ema_log_wad: 0,
         last_timestamp: 0,
         budget_fee0: 0,
         budget_fee1: 0,
@@ -3444,11 +3386,23 @@ fn build_trace_pool(input: &TracePoolInput, start_ts: u64) -> Result<PoolState> 
                 equilibra::MAX_REPEG_SHARE_BPS,
             ));
         }
-        let ema_price = parse_u128_opt_decimal(
+        let ema_log_wad: i128 = input
+            .equilibraEmaLogWad
+            .as_deref()
+            .ok_or_else(|| anyhow!("trace.pool.equilibraEmaLogWad missing for equilibra"))?
+            .parse()
+            .context("trace.pool.equilibraEmaLogWad: invalid signed integer")?;
+        let decoded_ema = equilibra_math::ema_log_to_price(ema_log_wad)?;
+        if let Some(price) = parse_u128_opt_decimal(
             input.equilibraEmaPrice.as_ref(),
             "trace.pool.equilibraEmaPrice",
-        )?
-        .unwrap_or(0);
+        )? {
+            if U256::from(price) != decoded_ema {
+                return Err(anyhow!(
+                    "trace.pool.equilibraEmaPrice does not match equilibraEmaLogWad"
+                ));
+            }
+        }
         let last_timestamp = parse_u64_opt_decimal(
             input.equilibraLastTimestamp.as_ref(),
             "trace.pool.equilibraLastTimestamp",
@@ -3562,7 +3516,7 @@ fn build_trace_pool(input: &TracePoolInput, start_ts: u64) -> Result<PoolState> 
         pool.protocol_fee1 = protocol_fee1;
         pool.e0 = e0;
         pool.e1 = e1;
-        pool.ema_price = ema_price;
+        pool.ema_log_wad = ema_log_wad;
         pool.last_timestamp = last_timestamp;
         pool.last_recenter_ts = last_recenter_ts;
         pool.budget_fee0 = 0;
@@ -3765,7 +3719,7 @@ fn run_trace_mode(cli: &Cli) -> Result<()> {
             .unwrap_or(base_ts.saturating_add((idx as u64) + 1));
 
         ensure_curve_d(&mut pool, &mut quoter)?;
-        let pre = trace_state_out(&pool);
+        let pre = trace_state_out(&pool)?;
 
         let mut token_in_out: Option<String> = None;
         let mut amount_in_out: Option<String> = None;
@@ -3973,7 +3927,7 @@ fn run_trace_mode(cli: &Cli) -> Result<()> {
         };
 
         ensure_curve_d(&mut pool, &mut quoter)?;
-        let post = trace_state_out(&pool);
+        let post = trace_state_out(&pool)?;
 
         steps.push(TraceStepOut {
             index: idx,
@@ -4001,7 +3955,7 @@ fn run_trace_mode(cli: &Cli) -> Result<()> {
         amm: pool.amm.as_str().to_string(),
         baseSymbol: pool.base_symbol.clone(),
         steps,
-        finalState: trace_state_out(&pool),
+        finalState: trace_state_out(&pool)?,
     };
 
     let out_path = cli
@@ -4163,7 +4117,7 @@ fn apply_equilibra_stateful_out(
     pool.protocol_fee1 = out.protocol_fee1;
     pool.e0 = out.e0;
     pool.e1 = out.e1;
-    pool.ema_price = out.ema_price;
+    pool.ema_log_wad = out.ema_log_wad;
     pool.last_timestamp = out.last_timestamp;
     pool.last_recenter_ts = out.last_recenter_ts;
     pool.budget_fee0 = out.budget_fee0;
@@ -4835,6 +4789,10 @@ fn execute_stateful_swap_for_context(
     // function runs for every executed swap, so the previous eager
     // clone-per-call pattern allocated 3-4 Strings even on paths that
     // discard the fee fields entirely.
+    #[cfg(test)]
+    if let Some(Some(reason)) = quoter.swap_failures.pop_front() {
+        return Err(anyhow!(reason));
+    }
     if opposite_pool_token_symbol(pool, token_in).is_none() {
         return Err(anyhow!(
             "execute_stateful_swap_for_context: token_in {} not in pool {}",
@@ -5103,31 +5061,32 @@ fn run_post_arb_external_round_trips(
     cfg: PostArbExternalSwapsCfg,
     gate_stats: &mut RecenterGateStatsBundle,
     post_arb_stats: &mut PostArbGateStatsByContext,
-) {
+) -> Result<()> {
     if !is_post_arb_external_swaps_enabled(pool, cli) {
-        return;
+        return Ok(());
     }
     let cycle_count = cfg.count.min(1_000);
     if cycle_count == 0 || cfg.shareBps == 0 || arb_amount_in == 0 {
-        return;
+        return Ok(());
     }
 
     let token_out_symbol = match opposite_pool_token_symbol(pool, arb_token_in_symbol) {
         Some(v) => v.to_string(),
         None => {
-            eprintln!(
-                "[simulator][warning] post-arb external swaps skipped for {}: token_in {} is not part of the pool pair {} / {}",
-                pool.context_name, arb_token_in_symbol, pool.token0_symbol, pool.token1_symbol
-            );
-            post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
-            return;
+            return Err(anyhow!(
+                "post-arb external swaps: token_in {} is not part of the pool {} pair {} / {}",
+                arb_token_in_symbol,
+                pool.context_name,
+                pool.token0_symbol,
+                pool.token1_symbol
+            ));
         }
     };
 
     let share_bps = cfg.shareBps.min(BPS_DENOM as u64) as u128;
     let share_amount_in = mul_div_floor(arb_amount_in, share_bps, BPS_DENOM);
     if share_amount_in == 0 {
-        return;
+        return Ok(());
     }
 
     let mut per_swap_amount_in = share_amount_in / (cycle_count as u128);
@@ -5140,7 +5099,7 @@ fn run_post_arb_external_round_trips(
         per_swap_amount_in = min_swap_amount_in;
     }
     if per_swap_amount_in == 0 {
-        return;
+        return Ok(());
     }
 
     // Adaptive gate: after the first probe cycle we compare the observed
@@ -5179,32 +5138,14 @@ fn run_post_arb_external_round_trips(
             cli,
             gate_stats,
         );
-        let forward_out = match forward_result {
-            Ok(ref out) if out.amount_out > 0 => Some(out.amount_out),
-            Ok(_) => {
-                eprintln!(
-                    "[simulator][warning] post-arb external forward swap returned zero for {} (cycle {}/{}) at ts {}",
-                    pool.context_name,
-                    cycle_i + 1,
-                    cycle_count,
-                    forward_ts
-                );
-                post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
-                None
-            }
-            Err(err) => {
-                eprintln!(
-                    "[simulator][warning] post-arb external forward swap failed for {} (cycle {}/{}) at ts {}: {}",
-                    pool.context_name,
-                    cycle_i + 1,
-                    cycle_count,
-                    forward_ts,
-                    err
-                );
-                post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
-                None
-            }
-        };
+        let forward_out =
+            match quoter.recover_quote_result(pool, "post-arb forward", forward_result)? {
+                Some(out) if out.amount_out > 0 => Some(out.amount_out),
+                Some(_) | None => {
+                    post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
+                    None
+                }
+            };
 
         let backward_ts = next_execution_timestamp(execution_ts_cursor, market_ts);
         let backward_out = if let Some(backward_amount_in) = forward_out {
@@ -5217,29 +5158,14 @@ fn run_post_arb_external_round_trips(
                 cli,
                 gate_stats,
             );
-            match backward_result {
-                Ok(out) => Some(out.amount_out),
-                Err(err) => {
-                    eprintln!(
-                        "[simulator][warning] post-arb external backward swap failed for {} (cycle {}/{}) at ts {}: {}",
-                        pool.context_name,
-                        cycle_i + 1,
-                        cycle_count,
-                        backward_ts,
-                        err
-                    );
+            match quoter.recover_quote_result(pool, "post-arb reverse", backward_result)? {
+                Some(out) => Some(out.amount_out),
+                None => {
                     post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
                     None
                 }
             }
         } else {
-            eprintln!(
-                "[simulator][warning] post-arb external backward swap skipped for {} (cycle {}/{}) at ts {} because forward leg failed",
-                pool.context_name,
-                cycle_i + 1,
-                cycle_count,
-                backward_ts
-            );
             post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
             None
         };
@@ -5280,6 +5206,7 @@ fn run_post_arb_external_round_trips(
             }
         }
     }
+    Ok(())
 }
 
 fn run_min_post_arb_external_round_trip_without_arb(
@@ -5292,12 +5219,12 @@ fn run_min_post_arb_external_round_trip_without_arb(
     cfg: PostArbExternalSwapsCfg,
     gate_stats: &mut RecenterGateStatsBundle,
     post_arb_stats: &mut PostArbGateStatsByContext,
-) {
+) -> Result<()> {
     if !is_post_arb_external_swaps_enabled(pool, cli) {
-        return;
+        return Ok(());
     }
     if cfg.count == 0 || cfg.minAmountUsd <= 0.0 {
-        return;
+        return Ok(());
     }
 
     let forward_token_in_symbol = if pool.token0_symbol == "USDT" {
@@ -5307,23 +5234,19 @@ fn run_min_post_arb_external_round_trip_without_arb(
     } else {
         pool.token0_symbol.clone()
     };
-    let backward_token_in_symbol = match opposite_pool_token_symbol(
-        pool,
-        forward_token_in_symbol.as_str(),
-    ) {
-        Some(v) => v.to_string(),
-        None => {
-            eprintln!(
-                    "[simulator][warning] post-arb minimal round-trip skipped for {}: token_in {} is not part of the pool pair {} / {}",
-                    pool.context_name,
+    let backward_token_in_symbol =
+        match opposite_pool_token_symbol(pool, forward_token_in_symbol.as_str()) {
+            Some(v) => v.to_string(),
+            None => {
+                return Err(anyhow!(
+                    "regular round-trip: token_in {} is not part of the pool {} pair {} / {}",
                     forward_token_in_symbol,
+                    pool.context_name,
                     pool.token0_symbol,
                     pool.token1_symbol
-                );
-            post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
-            return;
-        }
-    };
+                ));
+            }
+        };
 
     let min_swap_amount_in = usd_to_token_amount(
         usd18_from_f64(cfg.minAmountUsd),
@@ -5331,7 +5254,7 @@ fn run_min_post_arb_external_round_trip_without_arb(
         oracle_price_1e18,
     );
     if min_swap_amount_in == 0 {
-        return;
+        return Ok(());
     }
 
     let forward_ts = next_execution_timestamp(execution_ts_cursor, market_ts);
@@ -5344,21 +5267,9 @@ fn run_min_post_arb_external_round_trip_without_arb(
         cli,
         gate_stats,
     );
-    let forward_out = match forward_result {
-        Ok(ref out) if out.amount_out > 0 => Some(out.amount_out),
-        Ok(_) => {
-            eprintln!(
-                "[simulator][warning] post-arb minimal forward swap returned zero for {} at ts {}",
-                pool.context_name, forward_ts
-            );
-            post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
-            None
-        }
-        Err(err) => {
-            eprintln!(
-                "[simulator][warning] post-arb minimal forward swap failed for {} at ts {}: {}",
-                pool.context_name, forward_ts, err
-            );
+    let forward_out = match quoter.recover_quote_result(pool, "regular forward", forward_result)? {
+        Some(out) if out.amount_out > 0 => Some(out.amount_out),
+        Some(_) | None => {
             post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
             None
         }
@@ -5375,20 +5286,16 @@ fn run_min_post_arb_external_round_trip_without_arb(
             cli,
             gate_stats,
         );
-        if let Err(err) = backward_result {
-            eprintln!(
-                "[simulator][warning] post-arb minimal backward swap failed for {} at ts {}: {}",
-                pool.context_name, backward_ts, err
-            );
+        if quoter
+            .recover_quote_result(pool, "regular reverse", backward_result)?
+            .is_none()
+        {
             post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
         }
     } else {
-        eprintln!(
-            "[simulator][warning] post-arb minimal backward swap skipped for {} at ts {} because forward leg failed",
-            pool.context_name, backward_ts
-        );
         post_arb_stats.entry_mut(&pool.context_name).leg_warnings += 1;
     }
+    Ok(())
 }
 
 fn is_curve_rebalance_disabled(pool: &PoolState, disable_curve_rebalance: bool) -> bool {
@@ -5604,7 +5511,7 @@ fn equilibra_add_liquidity(
         pool.protocol_fee0 = 0;
         pool.protocol_fee1 = 0;
         pool.anchor_price_wad = genesis.price_scale_wad;
-        pool.ema_price = genesis.ema_price_wad;
+        pool.ema_log_wad = genesis.ema_log_wad;
         pool.last_timestamp = genesis.last_ema_ts;
         pool.last_recenter_ts = genesis.last_repeg_ts;
         pool.lp_unit_value_genesis_wad = genesis.lp_unit_value_genesis_wad;
@@ -5663,7 +5570,7 @@ fn equilibra_state_from_pool(pool: &PoolState) -> equilibra::EquilibraStatefulSt
         protocol_fee1: pool.protocol_fee1,
         e0: pool.e0,
         e1: pool.e1,
-        ema_price_wad: pool.ema_price,
+        ema_log_wad: pool.ema_log_wad,
         last_ema_ts: pool.last_timestamp,
         last_repeg_ts: pool.last_recenter_ts,
         lp_unit_value_genesis_wad: pool.lp_unit_value_genesis_wad,
@@ -5849,9 +5756,8 @@ fn calc_profit_usd(
     direction: &str,
     base_symbol: &str,
     oracle_price_1e18: u128,
-    gas_cost_usd: f64,
 ) -> f64 {
-    let gross = if direction == "buy" {
+    if direction == "buy" {
         let amount_in_usd = amount_in as f64 / 1e6;
         let base_dec = 10f64.powi(token_decimals(base_symbol) as i32);
         let base_units = amount_out as f64 / base_dec;
@@ -5863,8 +5769,7 @@ fn calc_profit_usd(
         let oracle = oracle_price_1e18 as f64 / 1e18;
         let out_usd = amount_out as f64 / 1e6;
         out_usd - base_units * oracle
-    };
-    gross - gas_cost_usd
+    }
 }
 
 fn estimate_trade_value_usd(
@@ -5937,23 +5842,24 @@ fn evaluate_profit_for_size(
     direction: &str,
     base_symbol: &str,
     oracle_price_1e18: u128,
-    gas_cost_usd: f64,
-) -> f64 {
+) -> Result<f64> {
     if size == 0 {
-        return f64::NEG_INFINITY;
+        return Ok(f64::NEG_INFINITY);
     }
-    let amount_out = match quote_exact_input(pool, quoter, token_in, size) {
-        Ok(v) if v > 0 => v,
-        _ => return f64::NEG_INFINITY,
+    let result = quote_exact_input(pool, quoter, token_in, size);
+    let Some(amount_out) = quoter.recover_quote_result(pool, "arbitrage search", result)? else {
+        return Ok(f64::NEG_INFINITY);
     };
-    calc_profit_usd(
+    if amount_out == 0 {
+        return Ok(f64::NEG_INFINITY);
+    }
+    Ok(calc_profit_usd(
         size,
         amount_out,
         direction,
         base_symbol,
         oracle_price_1e18,
-        gas_cost_usd,
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5976,13 +5882,13 @@ fn maximize_trade_size<F>(
     max_native: u128,
     max_search_iterations: usize,
     eval_profit: &mut F,
-) -> GoldenSearchOutcome
+) -> Result<GoldenSearchOutcome>
 where
-    F: FnMut(u128) -> f64,
+    F: FnMut(u128) -> Result<f64>,
 {
     debug_assert!(max_native > min_native);
-    let profit_at_min = eval_profit(min_native);
-    let profit_at_max = eval_profit(max_native);
+    let profit_at_min = eval_profit(min_native)?;
+    let profit_at_max = eval_profit(max_native)?;
 
     // No hidden clamp: the validator bounds the configured cap, and any
     // cap >= ~185 is inert for a u128 bracket (the interval shrinks below
@@ -6001,8 +5907,8 @@ where
         .checked_add(mul_div_floor(range, 618u128, 1000u128))
         .expect("maximize_trade_size overflow computing x2 at init");
 
-    let mut f1 = eval_profit(x1);
-    let mut f2 = eval_profit(x2);
+    let mut f1 = eval_profit(x1)?;
+    let mut f2 = eval_profit(x2)?;
     let mut refinements = 0usize;
 
     for _ in 0..max_iterations {
@@ -6026,7 +5932,7 @@ where
                     1000u128,
                 ))
                 .expect("maximize_trade_size overflow computing x2");
-            f2 = eval_profit(x2);
+            f2 = eval_profit(x2)?;
         } else {
             high = x2;
             x2 = x1;
@@ -6039,7 +5945,7 @@ where
                     1000u128,
                 ))
                 .expect("maximize_trade_size underflow computing x1");
-            f1 = eval_profit(x1);
+            f1 = eval_profit(x1)?;
         }
         refinements += 1;
     }
@@ -6052,7 +5958,7 @@ where
     } else {
         max_native
     };
-    if boundary_profit > search_profit {
+    Ok(if boundary_profit > search_profit {
         GoldenSearchOutcome {
             size: boundary_size,
             profit: boundary_profit,
@@ -6064,7 +5970,7 @@ where
             profit: search_profit,
             refinements,
         }
-    }
+    })
 }
 
 fn find_optimal_trade_size(
@@ -6074,18 +5980,17 @@ fn find_optimal_trade_size(
     direction: &str,
     base_symbol: &str,
     oracle_price_1e18: u128,
-    gas_cost_usd: f64,
     min_trade_usd: f64,
     max_search_iterations: usize,
-) -> Option<(u128, f64)> {
+) -> Result<Option<(u128, f64)>> {
     let min_usd_1e18 = usd18_from_f64(min_trade_usd);
     let min_native = usd_to_token_amount(min_usd_1e18, token_in, oracle_price_1e18);
     let max_native = get_max_trade_size(pool, direction, oracle_price_1e18);
     if min_native == 0 || max_native <= min_native {
-        return None;
+        return Ok(None);
     }
 
-    let mut eval_profit = |size: u128| -> f64 {
+    let mut eval_profit = |size: u128| -> Result<f64> {
         evaluate_profit_for_size(
             pool,
             quoter,
@@ -6094,7 +5999,6 @@ fn find_optimal_trade_size(
             direction,
             base_symbol,
             oracle_price_1e18,
-            gas_cost_usd,
         )
     };
     let outcome = maximize_trade_size(
@@ -6102,16 +6006,13 @@ fn find_optimal_trade_size(
         max_native,
         max_search_iterations,
         &mut eval_profit,
-    );
+    )?;
 
-    // Fixed gas commonly makes both interval boundaries unprofitable while
-    // an interior trade remains profitable. The search result itself is the
-    // acceptance criterion; gating on boundary signs silently discarded that
-    // valid optimum and changed the whole benchmark trajectory.
+    // Accept the best evaluated trade, not merely an interval boundary.
     if !(outcome.profit.is_finite()) || outcome.profit <= 0.0 {
-        return None;
+        return Ok(None);
     }
-    Some((outcome.size, outcome.profit))
+    Ok(Some((outcome.size, outcome.profit)))
 }
 
 /// Prepaid donation schedule. Returns the seconds this tick should
@@ -6333,7 +6234,7 @@ fn build_contexts(
                 fee_bps,
                 recentering_events: Vec::new(),
                 last_recenter_ts: 0,
-                ema_price: 0,
+                ema_log_wad: 0,
                 last_timestamp: 0,
                 budget_fee0: 0,
                 budget_fee1: 0,
@@ -6748,7 +6649,6 @@ fn run_simulation(
                 trades: Vec::new(),
                 trade_count: 0,
                 total_profit_usd: 0.0,
-                total_gas_usd: 0.0,
                 net_profit_usd: 0.0,
             },
         );
@@ -6801,7 +6701,8 @@ fn run_simulation(
     let t0 = Instant::now();
     let mut last_progress_emit_ts = 0u64;
 
-    let probe_trigger_usd = (cfg.actors.arbitrageur.probeUsd * 100f64) / 10000f64; // 1%
+    let probe_trigger_usd =
+        cfg.actors.arbitrageur.probeUsd * cfg.actors.arbitrageur.probeTriggerBps / 10000.0;
     if !cfg.actors.user.minTradeUsd.is_finite() || !cfg.actors.user.maxTradeUsd.is_finite() {
         return Err(anyhow!(
             "actors.user min/max trade USD must be finite numbers"
@@ -6857,25 +6758,7 @@ fn run_simulation(
     let usdt_string = "USDT".to_string();
     let user_key_weth = "user:WETH".to_string();
     let user_key_wbtc = "user:WBTC".to_string();
-    // Loop-invariant hoists. `std::env::var` takes a process-global lock on
-    // every call and the gas-used estimates arrive as decimal strings from
-    // config — resolving either inside the per-tick context loop repeats
-    // millions of redundant lookups/parses over a multi-year window. The
-    // gas pre-parse also moves the "missing/invalid gasUsedEstimates"
-    // failure from the first tick to startup (fail-fast, same error text).
     let probe_usd_1e18 = usd18_from_f64(cfg.actors.arbitrageur.probeUsd);
-    let gas_used_by_ctx: Vec<u128> = contexts
-        .iter()
-        .map(|c| {
-            cfg.actors
-                .arbitrageur
-                .gasUsedEstimates
-                .get(c.amm.as_str())
-                .ok_or_else(|| anyhow!("missing gasUsedEstimates entry for {}", c.amm.as_str()))?
-                .parse::<u128>()
-                .with_context(|| format!("invalid gasUsedEstimates value for {}", c.amm.as_str()))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let mut active_indices: Vec<usize> = Vec::with_capacity(contexts.len());
     // Per-tick shared user quote amounts, one slot per entry of
     // `SIM_BASES` (index-aligned). A fixed array instead of a
@@ -7108,19 +6991,14 @@ fn run_simulation(
                 (c.context_name.clone(), c.base_symbol.clone())
             };
             let base_oracle = oracle.get_price_at(oracle_symbol_for_base(&base_symbol), ts)?;
-            let eth_oracle = oracle.get_price_at("ETH", ts)?;
             let oracle_price_1e18 = (base_oracle * 1e18f64).floor() as u128;
 
-            let gas_used = gas_used_by_ctx[idx];
-            let gas_cost_usd =
-                gas_used as f64 * cfg.actors.arbitrageur.gasPriceGwei / 1e9f64 * eth_oracle;
-
-            // Per-(tick, context) dust-probe cache. Outer `None` = not yet
-            // evaluated; inner `None` = probe amounts rounded to zero (the
-            // historical early-exit). Filled lazily on first use so ticks
+            // Per-(tick, context) dust-probe cache. `None` = not yet evaluated;
+            // the outcome distinguishes zero probe amounts from rejected quotes.
+            // Filled lazily on first use so ticks
             // where neither the user plans nor the arbitrageur need probes
             // stay quote-free, exactly as before.
-            let mut probe_pair: Option<Option<ProbeQuotePair>> = None;
+            let mut probe_pair: Option<ProbeQuotes> = None;
 
             if let Some((_amount_usd, usd_amount_1e18)) = SIM_BASES
                 .iter()
@@ -7147,12 +7025,17 @@ fn run_simulation(
                                 probe_usd_1e18,
                             )?);
                         }
-                        let spot_price_1e18_pre = probe_pair
-                            .as_ref()
-                            .and_then(|p| p.as_ref())
-                            .map(|p| mid_spot_from_probe_pair(p, &base_symbol))
-                            .unwrap_or(0);
-                        execute_user_quote_plan_for_context(
+                        let spot_price_1e18_pre =
+                            match probe_pair.as_ref().expect("probe cache filled above") {
+                                ProbeQuotes::Available(pair) => {
+                                    mid_spot_from_probe_pair(pair, &base_symbol)
+                                }
+                                ProbeQuotes::RoundedToZero => 0,
+                                // A rejected quote is unavailable, not a substitute
+                                // oracle-based diagnostic sample.
+                                ProbeQuotes::Rejected => continue,
+                            };
+                        let recorded = execute_user_quote_plan_for_context(
                             &mut contexts[idx],
                             &mut quoter,
                             &mut user_slippage_states,
@@ -7161,7 +7044,9 @@ fn run_simulation(
                             oracle_price_1e18,
                             spot_price_1e18_pre,
                         )?;
-                        user_trade_event_count = user_trade_event_count.saturating_add(1);
+                        if recorded {
+                            user_trade_event_count = user_trade_event_count.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -7182,11 +7067,13 @@ fn run_simulation(
                         probe_usd_1e18,
                     )?);
                 }
-                let pair = match probe_pair.as_ref().and_then(|p| p.as_ref()) {
-                    Some(p) => p,
-                    // Probe amounts rounded to zero — the historical
-                    // `probe_quote == 0 || probe_base == 0` early exit.
-                    None => break 'arb_search_and_execute,
+                let pair = match probe_pair.as_ref().expect("probe cache filled above") {
+                    ProbeQuotes::Available(p) => p,
+                    // Zero-sized or rejected probes make this tick's
+                    // arbitrage opportunity unavailable, not the run invalid.
+                    ProbeQuotes::RoundedToZero | ProbeQuotes::Rejected => {
+                        break 'arb_search_and_execute
+                    }
                 };
                 let probe_quote = pair.probe_quote;
                 let probe_base = pair.probe_base;
@@ -7209,21 +7096,14 @@ fn run_simulation(
                     break 'arb_search_and_execute;
                 }
 
-                let probe_buy_gross = calc_profit_usd(
-                    probe_quote,
-                    buy_out,
-                    "buy",
-                    &base_symbol,
-                    oracle_price_1e18,
-                    0.0,
-                );
+                let probe_buy_gross =
+                    calc_profit_usd(probe_quote, buy_out, "buy", &base_symbol, oracle_price_1e18);
                 let probe_sell_gross = calc_profit_usd(
                     probe_base,
                     sell_out,
                     "sell",
                     &base_symbol,
                     oracle_price_1e18,
-                    0.0,
                 );
                 let probe_best = probe_buy_gross.max(probe_sell_gross);
                 if probe_best <= probe_trigger_usd {
@@ -7253,10 +7133,9 @@ fn run_simulation(
                     direction,
                     &base_symbol,
                     oracle_price_1e18,
-                    gas_cost_usd,
                     cfg.actors.arbitrageur.minTradeUsd,
                     cfg.actors.arbitrageur.maxSearchIterations,
-                );
+                )?;
                 let (best_size, best_profit) = match optimal {
                     Some(v) => v,
                     None => break 'arb_search_and_execute,
@@ -7285,21 +7164,22 @@ fn run_simulation(
                     cli,
                     &mut gate_stats,
                 );
-                let exec = exec_result?;
+                let Some(exec) = quoter.recover_quote_result(
+                    &contexts[idx],
+                    "arbitrage execution",
+                    exec_result,
+                )?
+                else {
+                    break 'arb_search_and_execute;
+                };
                 let out = exec.amount_out;
                 if out == 0 {
                     break 'arb_search_and_execute;
                 }
                 arb_trade_executed_on_tick = true;
 
-                let gross = calc_profit_usd(
-                    best_size,
-                    out,
-                    direction,
-                    &base_symbol,
-                    oracle_price_1e18,
-                    0.0,
-                );
+                let gross =
+                    calc_profit_usd(best_size, out, direction, &base_symbol, oracle_price_1e18);
                 // Use the dynamic fee that was *actually* applied by the
                 // pool — `ctx_fee_bps` only equals the static base fee
                 // (`pool.fee_bps`) and would mask both the Equilibra
@@ -7351,8 +7231,7 @@ fn run_simulation(
                         .ok_or_else(|| anyhow!("missing arb state for {}", context_name))?;
                     st.trade_count += 1;
                     st.total_profit_usd += gross;
-                    st.total_gas_usd += gas_cost_usd;
-                    st.net_profit_usd += gross - gas_cost_usd;
+                    st.net_profit_usd += gross;
                     st.trades.push(ArbTrade {
                         timestamp: arb_exec_ts,
                         context_name: context_name.clone(),
@@ -7360,8 +7239,7 @@ fn run_simulation(
                         amount_in: best_size,
                         amount_out: out,
                         gross_profit_usd: gross,
-                        gas_cost_usd,
-                        net_profit_usd: gross - gas_cost_usd,
+                        net_profit_usd: gross,
                         actual_fee_bps,
                         fee_paid_usd,
                         price_deviation,
@@ -7380,7 +7258,7 @@ fn run_simulation(
                     cfg.actors.arbitrageur.postArbExternalSwaps,
                     &mut gate_stats,
                     &mut post_arb_gate_stats,
-                );
+                )?;
             }
 
             if !arb_trade_executed_on_tick {
@@ -7394,7 +7272,7 @@ fn run_simulation(
                     cfg.actors.arbitrageur.postArbExternalSwaps,
                     &mut gate_stats,
                     &mut post_arb_gate_stats,
-                );
+                )?;
             }
         }
 
@@ -7688,7 +7566,6 @@ fn run_simulation(
             .expect("metadata durationDays underflow: sim_end < sim_start")
             / 86400,
         initialLiquidityUsd: cfg.liquidity.passiveLpInitialUsd,
-        gasPriceGwei: cfg.actors.arbitrageur.gasPriceGwei,
         ammList: selected_amms,
         poolList: selected_bases.clone(),
         generatedAt: now_iso_utc(),
@@ -7795,7 +7672,6 @@ fn run_simulation(
                     amountIn: bigint_pref(t.amount_in),
                     amountOut: bigint_pref(t.amount_out),
                     grossProfitUsd: t.gross_profit_usd,
-                    gasCostUsd: t.gas_cost_usd,
                     netProfitUsd: t.net_profit_usd,
                     actualFeeBps: t.actual_fee_bps,
                     feePaidUsd: t.fee_paid_usd,
@@ -7805,7 +7681,6 @@ fn run_simulation(
                 .collect(),
             tradeCount: s.trade_count,
             totalProfitUsd: s.total_profit_usd,
-            totalGasCostUsd: s.total_gas_usd,
             netProfitUsd: s.net_profit_usd,
         })
         .collect();
@@ -7830,6 +7705,7 @@ fn run_simulation(
     let curve_rebalance_gate_stats_export = build_recenter_gate_stats_export(&gate_stats.curve);
 
     emit_post_arb_gate_summary(&post_arb_gate_stats);
+    quoter.emit_quote_rejection_summary();
 
     for (context_name, (events, usd)) in &donation_totals {
         eprintln!(
@@ -7854,6 +7730,651 @@ fn run_simulation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn btc_only_oracle_does_not_read_or_clip_to_eth() {
+        let root =
+            std::env::temp_dir().join(format!("equilibra-btc-only-oracle-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("btc-usd.json"),
+            br#"{"points":[{"t":100,"p":60000},{"t":300,"p":61000}]}"#,
+        )
+        .unwrap();
+        // Malformed, unrelated ETH must not even be parsed.
+        fs::write(root.join("eth-usd.json"), "not JSON").unwrap();
+        let (oracle, snapshot) = PriceOracle::load(&root, &["WBTC".to_string()]).unwrap();
+        assert_eq!(oracle.range_intersection(), Some((100, 300)));
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].file_name, "btc-usd.json");
+        assert_eq!(oracle.get_price_at("BTC", 200).unwrap(), 60000.0);
+        assert!(oracle.get_price_at("ETH", 200).is_err());
+        assert!(PriceOracle::load(&root, &["WETH".to_string(), "WBTC".to_string()]).is_err());
+        fs::remove_file(root.join("btc-usd.json")).unwrap();
+        assert!(PriceOracle::load(&root, &["WBTC".to_string()]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn rejection_test_pool() -> PoolState {
+        let input: TracePoolInput = serde_json::from_value(json!({
+            "contextName": "uniswapV2:WETH", "amm": "uniswapV2", "baseSymbol": "WETH",
+            "token0": "USDT", "token1": "WETH", "token0Symbol": "USDT", "token1Symbol": "WETH",
+            "token0Decimals": 6, "token1Decimals": 18,
+            "reserve0": "500000000000", "reserve1": "250000000000000000000", "feeBps": 30
+        }))
+        .unwrap();
+        build_trace_pool(&input, 1).unwrap()
+    }
+
+    #[test]
+    fn exact_out_margin_boundary_is_liquidity_not_a_solver_failure() {
+        let reserve = U256::from(100_000u64) * U256::from(1_000_000_000_000_000_000u128);
+        let requested = reserve - reserve / U256::from(100_000_000u64);
+        assert!(requested < reserve);
+        let error =
+            equilibra_offchain_simulator::runtime_quoter::equilibra_math::quote_exact_out_forward(
+                reserve,
+                reserve,
+                requested,
+                U256::from(990_000_000_000_000_000u128),
+                U256::from(1_000_000_000_000u64),
+            )
+            .unwrap_err();
+        let mut pool = rejection_test_pool();
+        pool.amm = AmmKind::Equilibra;
+        assert_eq!(
+            quote_rejection_reason(&pool, &error),
+            Some("insufficient output liquidity")
+        );
+        let mut quoter = QuoterClient::new().unwrap();
+        assert!(quoter
+            .recover_quote_result::<u128>(&pool, "buy probe", Err(error))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            quoter.quote_rejections[&pool.context_name]
+                [&("buy probe", "insufficient output liquidity")],
+            1
+        );
+    }
+
+    #[test]
+    fn quote_rejections_require_exact_leaf_amm_and_nonempty_state() {
+        let mut pool = rejection_test_pool();
+        for (amm, reason) in [
+            (AmmKind::Equilibra, "equilibra_math: SolverDidNotConverge"),
+            (
+                AmmKind::Equilibra,
+                "equilibra_stateful: amount_too_small_after_normalization",
+            ),
+            (AmmKind::Equilibra, "equilibra_stateful: amountInMath zero"),
+            (AmmKind::Equilibra, "equilibra_stateful: amountOutMath zero"),
+            (
+                AmmKind::Equilibra,
+                "equilibra_swap_stateful_insufficient_liquidity",
+            ),
+            (
+                AmmKind::Equilibra,
+                "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity)",
+            ),
+            (AmmKind::Curve, "curve_exchange_dust"),
+            (AmmKind::Curve, "StableswapMath get_y did not converge"),
+            (AmmKind::Curve, "newton_y_twocrypto did not converge"),
+            (AmmKind::UniswapV2, "uniswap_v2_insufficient_output"),
+        ] {
+            pool.amm = amm;
+            let error = anyhow!(reason)
+                .context("inner quote")
+                .context("outer trial");
+            assert!(quote_rejection_reason(&pool, &error).is_some(), "{reason}");
+            pool.reserve0 = 0;
+            assert!(quote_rejection_reason(&pool, &error).is_none());
+            pool.reserve0 = 500_000_000_000;
+            pool.amm = if amm == AmmKind::Curve {
+                AmmKind::UniswapV2
+            } else {
+                AmmKind::Curve
+            };
+            assert!(quote_rejection_reason(&pool, &error).is_none());
+        }
+        pool.amm = AmmKind::Equilibra;
+        for cause in [
+            "overflow",
+            "missing pool config",
+            "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity): unexpected detail",
+            "equilibra_quote: tokenIn not in pool",
+            "equilibra_math: SolverDidNotConverge: unexpected detail",
+            "newton_d_stableswap did not converge",
+        ] {
+            // An outer context containing a known message must not hide a fatal cause.
+            let error = anyhow!(cause).context("equilibra_math: SolverDidNotConverge");
+            assert!(quote_rejection_reason(&pool, &error).is_none(), "{cause}");
+        }
+    }
+
+    #[test]
+    fn checked_equilibra_execution_failure_is_fatal_but_trials_remain_recoverable() {
+        let mut pool = rejection_test_pool();
+        pool.amm = AmmKind::Equilibra;
+        let mut quoter = QuoterClient::new().unwrap();
+        for stage in [
+            "buy probe",
+            "sell probe",
+            "slippage quote",
+            "arbitrage search",
+            "regular forward",
+            "regular reverse",
+            "post-arb forward",
+            "post-arb reverse",
+        ] {
+            for cause in [
+                "equilibra_math: SolverDidNotConverge",
+                "equilibra_stateful: LpValueDecreased",
+            ] {
+                assert!(quoter
+                    .recover_quote_result::<u128>(&pool, stage, Err(anyhow!(cause)))
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        let before = quoter.quote_rejections.clone();
+        for cause in [
+            "equilibra_math: SolverDidNotConverge",
+            "equilibra_stateful: LpValueDecreased",
+            "overflow",
+        ] {
+            let error = quoter
+                .recover_quote_result::<u128>(
+                    &pool,
+                    "arbitrage execution",
+                    Err(anyhow!(cause).context("swap execution")),
+                )
+                .unwrap_err();
+            assert_eq!(error.root_cause().to_string(), cause);
+            assert!(format!("{error:#}").contains("successful checked quote on the same state"));
+        }
+        assert_eq!(quoter.quote_rejections, before);
+        assert_eq!(
+            quoter
+                .recover_quote_result(&pool, "arbitrage execution", Ok(42))
+                .unwrap(),
+            Some(42)
+        );
+        // Do not broaden the new strict policy to unrelated native dust failures.
+        assert!(quoter
+            .recover_quote_result::<u128>(
+                &pool,
+                "arbitrage execution",
+                Err(anyhow!("equilibra_stateful: amountOutMath zero"))
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn equilibra_solver_limit_makes_search_and_probe_unavailable() {
+        let mut pool = rejection_test_pool();
+        pool.amm = AmmKind::Equilibra;
+        let before = serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap();
+        let mut quoter = QuoterClient::new().unwrap();
+        quoter
+            .quote_failures
+            .push_back(Some("equilibra_math: SolverDidNotConverge"));
+        assert_eq!(
+            evaluate_profit_for_size(
+                &pool,
+                &mut quoter,
+                "USDT",
+                100_000_000,
+                "buy",
+                "WETH",
+                2_000 * PRECISION,
+            )
+            .unwrap(),
+            f64::NEG_INFINITY
+        );
+        quoter
+            .quote_failures
+            .push_back(Some("equilibra_math: SolverDidNotConverge"));
+        assert!(matches!(
+            compute_probe_quote_pair(
+                &mut pool,
+                &mut quoter,
+                "WETH",
+                2_000 * PRECISION,
+                100 * PRECISION,
+            )
+            .unwrap(),
+            ProbeQuotes::Rejected
+        ));
+        assert_eq!(
+            serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap(),
+            before
+        );
+        quoter.quote_failures.push_back(Some("arithmetic overflow"));
+        assert_eq!(
+            evaluate_profit_for_size(
+                &pool,
+                &mut quoter,
+                "USDT",
+                100_000_000,
+                "buy",
+                "WETH",
+                2_000 * PRECISION,
+            )
+            .unwrap_err()
+            .root_cause()
+            .to_string(),
+            "arithmetic overflow"
+        );
+    }
+
+    #[test]
+    fn quote_rejection_counts_are_bounded_by_context_stage_reason_not_attempts() {
+        let pool = rejection_test_pool();
+        let mut quoter = QuoterClient::new().unwrap();
+        for _ in 0..100 {
+            let result: Result<u128> = Err(anyhow!("uniswap_v2_insufficient_output"));
+            assert!(quoter
+                .recover_quote_result(&pool, "buy probe", result)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(quoter.quote_rejections.len(), 1);
+        let counts = &quoter.quote_rejections[&pool.context_name];
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[&("buy probe", "dust output")], 100);
+        assert_eq!(
+            quoter
+                .recover_quote_result(&pool, "buy probe", Ok(42))
+                .unwrap(),
+            Some(42)
+        );
+        let error = quoter
+            .recover_quote_result::<u128>(
+                &pool,
+                "buy probe",
+                Err(anyhow!("overflow").context("quote failure")),
+            )
+            .unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "overflow");
+        assert!(format!("{error:#}").contains("quote failure"));
+        assert_eq!(
+            quoter.quote_rejections[&pool.context_name][&("buy probe", "dust output")],
+            100
+        );
+    }
+
+    #[test]
+    fn rejected_probe_is_unavailable_and_does_not_poison_next_tick_or_context() {
+        for failures in [
+            vec![Some("uniswap_v2_insufficient_output")],
+            vec![None, Some("uniswap_v2_insufficient_output")],
+        ] {
+            let mut pool = rejection_test_pool();
+            let before = serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap();
+            let mut quoter = QuoterClient::new().unwrap();
+            quoter.quote_failures = failures.into();
+            assert!(matches!(
+                compute_probe_quote_pair(
+                    &mut pool,
+                    &mut quoter,
+                    "WETH",
+                    2_000 * PRECISION,
+                    100 * PRECISION
+                )
+                .unwrap(),
+                ProbeQuotes::Rejected
+            ));
+            assert_eq!(
+                serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap(),
+                before
+            );
+            // The next tick uses the unchanged pool and fresh quotes normally.
+            assert!(matches!(
+                compute_probe_quote_pair(
+                    &mut pool,
+                    &mut quoter,
+                    "WETH",
+                    2_000 * PRECISION,
+                    100 * PRECISION
+                )
+                .unwrap(),
+                ProbeQuotes::Available(_)
+            ));
+            pool.context_name = "uniswapV2:WETH:another".into();
+            assert!(matches!(
+                compute_probe_quote_pair(
+                    &mut pool,
+                    &mut quoter,
+                    "WETH",
+                    2_000 * PRECISION,
+                    100 * PRECISION
+                )
+                .unwrap(),
+                ProbeQuotes::Available(_)
+            ));
+            quoter.quote_failures.push_back(Some("broken config"));
+            let error = compute_probe_quote_pair(
+                &mut pool,
+                &mut quoter,
+                "WETH",
+                2_000 * PRECISION,
+                100 * PRECISION,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.root_cause().to_string(), "broken config");
+        }
+    }
+
+    #[test]
+    fn rounded_zero_probe_preserves_diagnostics_for_coarser_token_decimals() {
+        let mut pool = rejection_test_pool();
+        pool.context_name = "uniswapV2:WBTC".into();
+        pool.base_symbol = "WBTC".into();
+        pool.token1 = "WBTC".into();
+        pool.token1_symbol = "WBTC".into();
+        pool.token1_decimals = 8;
+        pool.reserve1 = 10 * 100_000_000;
+        pool.anchor1 = pool.reserve1;
+        pool.e1 = pool.reserve1;
+        let before = serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap();
+        let mut quoter = QuoterClient::new().unwrap();
+        let oracle_price = 50_000 * PRECISION;
+        // One raw USDT unit buys less than one satoshi. This is a valid
+        // positive probe size, not a failed kernel quote or invalid feed.
+        let probe_usd = PRECISION / 1_000_000;
+        assert_eq!(usd_to_token_amount(probe_usd, "USDT", oracle_price), 1);
+        assert_eq!(usd_to_token_amount(probe_usd, "WBTC", oracle_price), 0);
+        let probe =
+            compute_probe_quote_pair(&mut pool, &mut quoter, "WBTC", oracle_price, probe_usd)
+                .unwrap();
+        assert!(matches!(probe, ProbeQuotes::RoundedToZero));
+        assert!(quoter.quote_rejections.is_empty());
+        assert!(quoter.uniswap_quote_cache.is_empty());
+        let mut states = HashMap::from([(
+            pool.context_name.clone(),
+            UserSlippageState {
+                context_name: pool.context_name.clone(),
+                aggregate_count: 0,
+                aggregate_sum: 0.0,
+                aggregate_sum_squares: 0.0,
+                aggregate_min: f64::INFINITY,
+                aggregate_max: f64::NEG_INFINITY,
+                histogram: vec![0; SLIPPAGE_HISTOGRAM_BUCKET_COUNT],
+                samples: vec![],
+                bucket_edges_bps: vec![0, 10_000],
+                trade_size_sum_bps: vec![0.0],
+                trade_size_count: vec![0],
+            },
+        )]);
+        let plan = build_user_quote_plan_for_context(
+            &pool,
+            "WBTC",
+            oracle_price,
+            50_000.0,
+            100 * PRECISION,
+            500_000 * PRECISION,
+            "buy",
+        )
+        .unwrap()
+        .unwrap();
+        // Preserve the historical spot=0 fallback for rounded probe inputs;
+        // the much larger diagnostic swap is still quoted and recorded.
+        assert!(execute_user_quote_plan_for_context(
+            &mut pool,
+            &mut quoter,
+            &mut states,
+            2,
+            &plan,
+            oracle_price,
+            0,
+        )
+        .unwrap());
+        assert_eq!(states[&pool.context_name].aggregate_count, 1);
+        assert_eq!(
+            serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn rejected_slippage_quote_does_not_record_a_sample_and_next_quote_still_works() {
+        let mut pool = rejection_test_pool();
+        let mut quoter = QuoterClient::new().unwrap();
+        let mut states = HashMap::from([(
+            pool.context_name.clone(),
+            UserSlippageState {
+                context_name: pool.context_name.clone(),
+                aggregate_count: 0,
+                aggregate_sum: 0.0,
+                aggregate_sum_squares: 0.0,
+                aggregate_min: f64::INFINITY,
+                aggregate_max: f64::NEG_INFINITY,
+                histogram: vec![0; SLIPPAGE_HISTOGRAM_BUCKET_COUNT],
+                samples: vec![],
+                bucket_edges_bps: vec![0, 10_000],
+                trade_size_sum_bps: vec![0.0],
+                trade_size_count: vec![0],
+            },
+        )]);
+        let plan = build_user_quote_plan_for_context(
+            &pool,
+            "WETH",
+            2_000 * PRECISION,
+            2_000.0,
+            100 * PRECISION,
+            500_000 * PRECISION,
+            "buy",
+        )
+        .unwrap()
+        .unwrap();
+        quoter
+            .quote_failures
+            .push_back(Some("uniswap_v2_insufficient_output"));
+        assert!(!execute_user_quote_plan_for_context(
+            &mut pool,
+            &mut quoter,
+            &mut states,
+            2,
+            &plan,
+            2_000 * PRECISION,
+            2_000 * PRECISION
+        )
+        .unwrap());
+        let state = &states[&pool.context_name];
+        assert_eq!(state.aggregate_count, 0);
+        assert!(state.samples.is_empty());
+        assert_eq!(state.histogram.iter().sum::<u64>(), 0);
+        assert_eq!(state.trade_size_count, vec![0]);
+        assert!(execute_user_quote_plan_for_context(
+            &mut pool,
+            &mut quoter,
+            &mut states,
+            3,
+            &plan,
+            2_000 * PRECISION,
+            2_000 * PRECISION
+        )
+        .unwrap());
+        assert_eq!(states[&pool.context_name].aggregate_count, 1);
+    }
+
+    #[test]
+    fn stateless_equilibra_quotes_use_checked_stateful_resolvers() {
+        for base_decimals in [18u8, 8] {
+            let cfg = EquilibraStatefulConfig::new(
+                "USDT",
+                "BASE",
+                6,
+                base_decimals,
+                100,
+                990_000_000_000_000_000,
+                1_000_000_000_000_000,
+                5,
+                600,
+                5_000_000_000_000_000,
+                2_500_000_000_000_000,
+                1_500_000_000_000_000,
+                0,
+                100,
+                0,
+            )
+            .unwrap();
+            let state = equilibra::EquilibraStatefulState {
+                reserve0: 500_000 * 1_000_000,
+                reserve1: 250 * pow10_u128(base_decimals as u32),
+                price_scale_wad: 2_000 * PRECISION,
+                ..equilibra::EquilibraStatefulState::empty()
+            };
+            for (token_in, amount_in, amount_out) in [
+                ("USDT", state.reserve0 / 100, state.reserve1 / 100),
+                ("BASE", state.reserve1 / 100, state.reserve0 / 100),
+            ] {
+                let input =
+                    equilibra::quote_exact_in_stateful(&cfg, &state, token_in, amount_in).unwrap();
+                assert_eq!(
+                    quote_equilibra_exact_in_stateless(
+                        &cfg,
+                        state.reserve0,
+                        state.reserve1,
+                        state.price_scale_wad,
+                        token_in,
+                        amount_in
+                    )
+                    .unwrap(),
+                    input.amount_out_raw
+                );
+                let output =
+                    equilibra::quote_exact_out_stateful(&cfg, &state, token_in, amount_out)
+                        .unwrap();
+                assert_eq!(
+                    quote_equilibra_exact_out_stateless(
+                        &cfg,
+                        state.reserve0,
+                        state.reserve1,
+                        state.price_scale_wad,
+                        token_in,
+                        amount_out
+                    )
+                    .unwrap(),
+                    output.amount_in_raw
+                );
+            }
+            assert_eq!(
+                quote_equilibra_exact_in_stateless(
+                    &cfg,
+                    0,
+                    state.reserve1,
+                    state.price_scale_wad,
+                    "USDT",
+                    1
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                quote_equilibra_exact_out_stateless(
+                    &cfg,
+                    state.reserve0,
+                    state.reserve1,
+                    state.price_scale_wad,
+                    "USDT",
+                    0
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn regular_flow_rejections_preserve_completed_legs_and_unexpected_errors_are_fatal() {
+        let cli = Cli::try_parse_from(["test", "--config", "unused.json"]).unwrap();
+        for post_arb in [true, false] {
+            for reverse_fails in [true, false] {
+                for recoverable in [true, false] {
+                    let mut pool = rejection_test_pool();
+                    let initial = pool.clone();
+                    let mut quoter = QuoterClient::new().unwrap();
+                    if reverse_fails {
+                        quoter.swap_failures.push_back(None);
+                    }
+                    quoter.swap_failures.push_back(Some(if recoverable {
+                        "uniswap_v2_insufficient_output"
+                    } else {
+                        "unexpected test failure"
+                    }));
+                    let mut cursor = 1;
+                    let mut gates = RecenterGateStatsBundle::default();
+                    let mut stats = PostArbGateStatsByContext::default();
+                    let cfg = PostArbExternalSwapsCfg {
+                        count: 3,
+                        shareBps: 1_500,
+                        minAmountUsd: 0.05,
+                        abnormalLossFactor: 1.0,
+                    };
+                    let result = if post_arb {
+                        run_post_arb_external_round_trips(
+                            &mut pool,
+                            &mut quoter,
+                            &cli,
+                            2,
+                            &mut cursor,
+                            "USDT",
+                            1_200_000_000,
+                            2_000 * PRECISION,
+                            cfg,
+                            &mut gates,
+                            &mut stats,
+                        )
+                    } else {
+                        run_min_post_arb_external_round_trip_without_arb(
+                            &mut pool,
+                            &mut quoter,
+                            &cli,
+                            2,
+                            &mut cursor,
+                            2_000 * PRECISION,
+                            cfg,
+                            &mut gates,
+                            &mut stats,
+                        )
+                    };
+                    if recoverable {
+                        result.unwrap();
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().root_cause().to_string(),
+                            "unexpected test failure"
+                        );
+                    }
+                    let mut expected = initial;
+                    if reverse_fails {
+                        let mut expected_quoter = QuoterClient::new().unwrap();
+                        execute_stateful_swap_for_context(
+                            &mut expected,
+                            &mut expected_quoter,
+                            "USDT",
+                            if post_arb { 60_000_000 } else { 50_000 },
+                            2,
+                            &cli,
+                            &mut RecenterGateStatsBundle::default(),
+                        )
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        serde_json::to_value(trace_state_out(&pool).unwrap()).unwrap(),
+                        serde_json::to_value(trace_state_out(&expected).unwrap()).unwrap()
+                    );
+                    assert!(quoter.swap_failures.is_empty());
+                    assert_eq!(cursor, if reverse_fails || recoverable { 3 } else { 2 });
+                    assert_eq!(quoter.quote_rejections.is_empty(), !recoverable);
+                }
+            }
+        }
+    }
 
     /// Replay the donation cursor over a candle grid and return the
     /// total funded seconds.
@@ -8023,7 +8544,7 @@ mod tests {
             fee_bps: 60,
             recentering_events: Vec::new(),
             last_recenter_ts: 0,
-            ema_price: 0,
+            ema_log_wad: 0,
             last_timestamp: 0,
             budget_fee0: 0,
             budget_fee1: 0,
@@ -8062,6 +8583,80 @@ mod tests {
     }
 
     #[test]
+    fn arbitrage_profit_evaluation_only_recovers_known_quote_rejections() {
+        let pool = make_curve_pool(
+            "WETH",
+            1_000_000_000_000,
+            100 * PRECISION,
+            3_200 * PRECISION,
+        );
+        let mut quoter = QuoterClient::new().unwrap();
+        quoter.quote_failures.extend([
+            Some("StableswapMath get_y did not converge"),
+            Some("unexpected search quote failure"),
+        ]);
+        let profit = evaluate_profit_for_size(
+            &pool,
+            &mut quoter,
+            "USDT",
+            1_000_000,
+            "buy",
+            "WETH",
+            3_200 * PRECISION,
+        )
+        .unwrap();
+        assert_eq!(profit, f64::NEG_INFINITY);
+        let error = evaluate_profit_for_size(
+            &pool,
+            &mut quoter,
+            "USDT",
+            1_000_000,
+            "buy",
+            "WETH",
+            3_200 * PRECISION,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.root_cause().to_string(),
+            "unexpected search quote failure"
+        );
+        assert!(quoter.quote_failures.is_empty());
+        assert_eq!(
+            quoter.quote_rejections[&pool.context_name]
+                .values()
+                .sum::<u64>(),
+            1,
+        );
+    }
+
+    #[test]
+    fn arbitrage_profit_evaluation_zero_size_does_not_request_a_quote() {
+        let pool = make_curve_pool(
+            "WETH",
+            1_000_000_000_000,
+            100 * PRECISION,
+            3_200 * PRECISION,
+        );
+        let mut quoter = QuoterClient::new().unwrap();
+        quoter
+            .quote_failures
+            .push_back(Some("unexpected search quote failure"));
+        let profit = evaluate_profit_for_size(
+            &pool,
+            &mut quoter,
+            "USDT",
+            0,
+            "buy",
+            "WETH",
+            3_200 * PRECISION,
+        )
+        .unwrap();
+        assert_eq!(profit, f64::NEG_INFINITY);
+        assert_eq!(quoter.quote_failures.len(), 1);
+        assert!(quoter.quote_rejections.is_empty());
+    }
+
+    #[test]
     fn golden_search_uses_configured_cap_and_live_tolerance() {
         // max/min == 2 made the regressed ln(max/min)/ln(phi) formula stop
         // after two refinements.  That leaves ~38% of the original interval,
@@ -8070,9 +8665,9 @@ mod tests {
         let target = 1_700_000u128;
         let mut evaluator = |size| {
             calls += 1;
-            concave_reference_profit(size, target)
+            Ok(concave_reference_profit(size, target))
         };
-        let outcome = maximize_trade_size(1_000_000, 2_000_000, 20, &mut evaluator);
+        let outcome = maximize_trade_size(1_000_000, 2_000_000, 20, &mut evaluator).unwrap();
 
         assert!(
             outcome.refinements > 2,
@@ -8099,9 +8694,10 @@ mod tests {
             let mut calls = 0usize;
             let mut evaluator = |size| {
                 calls += 1;
-                concave_reference_profit(size, target)
+                Ok(concave_reference_profit(size, target))
             };
-            let outcome = maximize_trade_size(10_000_000, 100_000_000, cap, &mut evaluator);
+            let outcome =
+                maximize_trade_size(10_000_000, 100_000_000, cap, &mut evaluator).unwrap();
             assert!(outcome.refinements <= cap);
             assert_eq!(calls, 4 + outcome.refinements);
             assert!(
@@ -8116,13 +8712,101 @@ mod tests {
     fn golden_search_keeps_profitable_interior_when_both_boundaries_lose() {
         let mut evaluator = |size: u128| {
             let distance = size.abs_diff(50_000) as f64;
-            1_000.0 - distance * distance / 100.0
+            Ok(1_000.0 - distance * distance / 100.0)
         };
-        assert!(evaluator(1_000) < 0.0);
-        assert!(evaluator(100_000) < 0.0);
-        let outcome = maximize_trade_size(1_000, 100_000, 50, &mut evaluator);
+        assert!(evaluator(1_000).unwrap() < 0.0);
+        assert!(evaluator(100_000).unwrap() < 0.0);
+        let outcome = maximize_trade_size(1_000, 100_000, 50, &mut evaluator).unwrap();
         assert!(outcome.profit.is_finite() && outcome.profit > 0.0);
         assert!(outcome.size.abs_diff(50_000) < 1_000);
+    }
+
+    #[test]
+    fn golden_search_keeps_valid_observed_candidate_when_other_sizes_reject() {
+        // Each bootstrap interior point is the sole valid quote in one run.
+        // Later rejected probes must not replace the known executable size.
+        for accepted_size in [38_818u128, 62_182u128] {
+            let mut calls = 0usize;
+            let mut evaluator = |size| {
+                calls += 1;
+                Ok(if size == accepted_size {
+                    123.0
+                } else {
+                    f64::NEG_INFINITY
+                })
+            };
+            let outcome = maximize_trade_size(1_000, 100_000, 50, &mut evaluator).unwrap();
+            assert_eq!((outcome.size, outcome.profit), (accepted_size, 123.0));
+            assert_eq!(calls, 4 + outcome.refinements);
+            assert!(outcome.refinements > 0);
+        }
+    }
+
+    #[test]
+    fn golden_search_continues_after_rejected_boundaries_and_interior() {
+        let mut observed = Vec::new();
+        let mut evaluator = |size| {
+            let profit = if size == 1_000 || size == 100_000 || size == 62_182 {
+                f64::NEG_INFINITY
+            } else {
+                concave_reference_profit(size, 50_000)
+            };
+            observed.push((size, profit));
+            Ok(profit)
+        };
+        let outcome = maximize_trade_size(1_000, 100_000, 50, &mut evaluator).unwrap();
+        assert!(outcome.profit.is_finite() && outcome.profit > 0.0);
+        assert!(observed.contains(&(outcome.size, outcome.profit)));
+        let best = observed
+            .iter()
+            .map(|(_, profit)| *profit)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(outcome.profit, best);
+        assert_eq!(observed.len(), 4 + outcome.refinements);
+        assert_eq!(
+            &observed[..2],
+            &[(1_000, f64::NEG_INFINITY), (100_000, f64::NEG_INFINITY)],
+        );
+        assert_eq!(observed[3], (62_182, f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn golden_search_all_rejected_candidates_have_no_finite_profit() {
+        let mut calls = 0usize;
+        let mut evaluator = |_| {
+            calls += 1;
+            Ok(f64::NEG_INFINITY)
+        };
+        let outcome = maximize_trade_size(1_000, 100_000, 50, &mut evaluator).unwrap();
+        assert_eq!(outcome.profit, f64::NEG_INFINITY);
+        assert_eq!(calls, 4 + outcome.refinements);
+        assert!(outcome.refinements <= 50);
+    }
+
+    #[test]
+    fn golden_search_propagates_fatal_error_without_further_probes() {
+        for fail_at in [1usize, 2, 3, 4, 7] {
+            let mut calls = 0usize;
+            let mut evaluator = |size| {
+                calls += 1;
+                if calls == fail_at {
+                    return Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected evaluator failure",
+                    ))
+                    .context("candidate probe"));
+                }
+                Ok(concave_reference_profit(size, 1_700_000))
+            };
+            let error = maximize_trade_size(1_000_000, 2_000_000, 20, &mut evaluator)
+                .expect_err("unexpected errors must not become rejected quotes");
+            assert_eq!(calls, fail_at);
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::InvalidData,
+            );
+            assert_eq!(error.to_string(), "candidate probe");
+        }
     }
 
     #[test]
@@ -8278,7 +8962,20 @@ fn main() -> Result<()> {
     let effective_oracle_dir = cli.data_dir.clone();
 
     emit_benchmark_event("phase", json!({ "phase": "oracle:load" }));
-    let (oracle, oracle_snapshot) = PriceOracle::load(&effective_oracle_dir)?;
+    // A shard consumes the complete immutable parent snapshot. A standalone
+    // single-base run needs only that base's file, never ETH as a gas proxy.
+    let selected_oracle_bases = if let Some(expected) = &expected_provenance {
+        expected.material.effective_options.selected_bases.clone()
+    } else {
+        let selected = parse_base_filter(&cli.only_bases)?;
+        SIM_BASES
+            .iter()
+            .filter(|base| base_selected(base, &selected))
+            .map(|base| (*base).to_string())
+            .collect()
+    };
+    let (oracle, oracle_snapshot) =
+        PriceOracle::load(&effective_oracle_dir, &selected_oracle_bases)?;
     let simulator_path = std::env::current_exe().with_context(|| "resolve current executable")?;
     let simulator_binary = binary_digest("simulator", &simulator_path)?;
     let report_assets_digest =

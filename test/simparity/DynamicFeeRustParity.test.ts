@@ -1,3 +1,4 @@
+import { poolEmaLogWad } from "../helpers/storageLayout";
 import { time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 import { expect } from "chai";
 import hre from "hardhat";
@@ -263,6 +264,7 @@ async function snapshotPool(f: PoolFixture): Promise<SnapshotForRustQuote> {
     equilibraE0: BigInt(bal0),
     equilibraE1: BigInt(bal1),
     equilibraEmaPrice: BigInt(ema),
+    equilibraEmaLogWad: await poolEmaLogWad(f.poolAddress),
     equilibraLastTimestamp: BigInt(f.initTs),
     equilibraLastRecenterTimestamp: BigInt(f.initTs),
     equilibraRepegStepWad: BigInt(f.repegStepWad),
@@ -339,6 +341,48 @@ async function assertParity(f: PoolFixture, amountIn: bigint, label: string, tok
 }
 
 describe("DynamicFee parity (on-chain vs Rust simulator)", function () {
+  for (const dir of ["token0", "token1"] as const) {
+    it(`maximum alpha WAD-1: exact-in quote/swap/Rust parity for ${dir}`, async function () {
+      this.timeout(180_000);
+      const f = await deployParityPool("WETH", {
+        aWad: 10n ** 18n - 1n,
+        lambdaWad: 10n ** 15n,
+        baseFee: 10,
+        feeFloorBps: 1,
+        feeRampBps: 0,
+        repegShareBps: 0,
+      });
+      await assertParity(f, hre.ethers.parseEther("5000"), `solver-max-alpha/${dir}`, dir);
+    });
+  }
+
+  for (const dir of ["token0", "token1"] as const) {
+    it(`former late counterpart solver: exact-in quote/swap/Rust parity for ${dir}`, async function () {
+      this.timeout(180_000);
+      const harness = await (await hre.ethers.getContractFactory("SwapMathHarness")).deploy();
+      await harness.waitForDeployment();
+      const seed = hre.ethers.parseEther("500000");
+      const clean = seed * 2n;
+      const f = await deployParityPool("WETH", {
+        aWad: 990000000000000000n,
+        lambdaWad: 1000000000000000n,
+        baseFee: 10,
+        feeFloorBps: 1,
+        feeRampBps: 0,
+        repegShareBps: 0,
+        seed0: seed,
+        seed1: seed,
+      });
+      const [, iterations] = await harness.quoteExactInForward(seed, seed, clean, f.aWad, f.lambdaWad);
+      expect(iterations, "curve-aware seed resolves this former late case early")
+        .to.be.greaterThan(0n)
+        .and.at.most(12n);
+      const gross = ((clean - 1n) * 10000n) / 9990n + 1n;
+      expect(gross - (gross * 10n) / 10000n).to.equal(clean);
+      await assertParity(f, gross, `solver-late/${dir}`, dir);
+    });
+  }
+
   const SWEEP_SIZES = [
     hre.ethers.parseEther("1"),
     hre.ethers.parseEther("100"),

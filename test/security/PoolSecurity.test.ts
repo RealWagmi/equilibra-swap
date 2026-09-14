@@ -264,10 +264,10 @@ describe("PoolSecurity", function () {
     const { owner, trader, pool, router, provider, poolAddress, token0Addr, token1Addr } =
       await loadFixture(deployStandardPoolFixture);
 
-    await expect(pool.connect(trader).setPaused(true)).to.be.revertedWithCustomError(pool, "Unauthorized");
+    await expect(pool.connect(trader).setPaused(true, false)).to.be.revertedWithCustomError(pool, "Unauthorized");
 
-    await pool.connect(owner).setPaused(true);
-    expect(await pool.paused()).to.equal(true);
+    await pool.connect(owner).setPaused(true, false);
+    expect(Array.from(await pool.paused())).to.deep.equal([true, false]);
 
     await expect(
       router.connect(trader).exactInputSingle({
@@ -293,10 +293,10 @@ describe("PoolSecurity", function () {
     const sharesToBurn = ownerShares / 4n; // partial exit
     await expect(pool.connect(owner).removeLiquidity(sharesToBurn, 0, 0, owner.address)).to.not.be.reverted;
     expect(await pool.balanceOf(owner.address)).to.equal(ownerShares - sharesToBurn);
-    expect(await pool.paused()).to.equal(true);
+    expect(Array.from(await pool.paused())).to.deep.equal([true, false]);
 
-    await pool.connect(owner).setPaused(false);
-    expect(await pool.paused()).to.equal(false);
+    await pool.connect(owner).setPaused(false, false);
+    expect(Array.from(await pool.paused())).to.deep.equal([false, false]);
   });
 
   it("allows the fee collector to harvest protocol fees while the pool is paused", async function () {
@@ -322,8 +322,8 @@ describe("PoolSecurity", function () {
     });
     expect((await pool.getProtocolFees()).fee0).to.be.gt(0n);
 
-    await pool.connect(owner).setPaused(true);
-    expect(await pool.paused()).to.equal(true);
+    await pool.connect(owner).setPaused(true, false);
+    expect(Array.from(await pool.paused())).to.deep.equal([true, false]);
 
     const collectorBefore = await token0.balanceOf(owner.address);
     await expect(pool.connect(owner).collectProtocolFees(owner.address)).to.not.be.reverted;
@@ -333,6 +333,6 @@ describe("PoolSecurity", function () {
     expect((await pool.getProtocolFees()).fee0).to.equal(0n);
     // Pool must still be paused — the harvest is allowed-while-paused
     // by design, not because the collector silently un-paused.
-    expect(await pool.paused()).to.equal(true);
+    expect(Array.from(await pool.paused())).to.deep.equal([true, false]);
   });
 });

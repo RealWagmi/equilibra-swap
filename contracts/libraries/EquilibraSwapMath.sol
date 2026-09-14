@@ -9,592 +9,249 @@ import { FixedPointMathLib } from "solady/src/utils/FixedPointMathLib.sol";
 import { Constants } from "./Constants.sol";
 import { Errors } from "./Errors.sol";
 
-/// @title EquilibraSwapMath
-/// @notice Math kernel for the Equilibra AMM. Single-piece **cubic**
-///         invariant with two independent concentration knobs and an
-///         **asymmetric (quote-side normalised)** math-space coordinate
-///         change.
-///
-/// === Coordinate change (asymmetric, quote-side normalised) ===
-///
-///     priceScaleWad = (yWad / xWad) at the anchor          [quote / base]
-///
-///     xMath = xWad                                          (base side, untouched)
-///     yMath = yWad · WAD / priceScaleWad                    (quote → base)
-///
-/// Properties:
-///   • At the anchor `yWad / xWad = priceScale`, so
-///     `yMath = yWad·WAD/priceScale = xWad = xMath` (diagonal).
-///   • A repeg moving `priceScale` toward EMA shifts `yMath` (only one
-///     side); the resulting `(xMath, yMath)` is genuinely off-diagonal
-///     when reserves are imbalanced, which is what gives the auto-repeg
-///     gate a meaningful IL signal (see §6 below and the pool's
-///     `_tryAutoRepeg` NatSpec). One-sided normalisation is what gives
-///     the repeg gate a real cost basis on imbalanced state.
-///
-/// === Invariant ===
-///
-///     K(xMath, yMath; L) = A · L · (xMath + yMath) / 2
-///                        + (W − A) · xMath · yMath
-///
-///     D = (yMath − xMath)² / (xMath · yMath)      // state distance
-///     A = a · W / (W + λ · D)                      // n = 1, hardcoded
-///
-///     W = WAD = 1e18.
-///
-/// Polynomial degree in `yMath` (with `xMath` fixed) is **3** after
-/// clearing denominators — the secant solver operates on a
-/// well-conditioned cubic envelope.
-///
-/// === Concentration knobs (independent) ===
-///
-///   `a` — depth at anchor. `A(D=0) = a`, so larger `a` deepens the
-///         centre. Range `[A_MIN_WAD, A_MAX_WAD] = [0.1·W, 0.99·W]`.
-///         `a == W` is forbidden — it makes `(W − A) = 0` at the
-///         anchor and the L-quadratic ill-conditioned.
-///
-///   `λ` — plateau width. `A = a/2` at `λ·D = W` (half-amplification
-///         distance). Larger `λ` narrows the plateau; smaller `λ`
-///         widens it. Range `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD]`.
-///
-/// Decoupling: `a` alone controls the centre depth, `λ` alone controls
-/// the cliff position — the two knobs are mathematically orthogonal.
-///
-/// === Depth scale L (closed-form quadratic) ===
-///
-///     At the balance-state `xMath = yMath = L_eq`, `D = 0`, `A = a`:
-///       K = a·L_eq² + (W − a)·L_eq² = W · L_eq²
-///     ⇒  L_eq = √(K / W)
-///
-///     For any state `(xMath, yMath)`, the self-consistent depth scale
-///     is the positive root of
-///       W·L² − A·L·S − (W − A)·N = 0,
-///       S = (xMath + yMath)/2,
-///       N = xMath · yMath,
-///     yielding
-///       L = (A·S + √( (A·S)² + 4·W·(W − A)·N )) / (2·W).
-///
-///     Path-additivity: every point on `K = const` recovers the same
-///     `L` (the second root is spurious and negative on every
-///     admissible state), so the secant solver freezes `L` at the
-///     pre-state value and the level-set arithmetic is exact modulo
-///     residual rounding.
-///
-/// === LP unit value (anchor-invariant) ===
-///
-///     vp = 2 · L_eq · √(priceScale · WAD) / totalSupply
-///
-///     The `√(priceScale · WAD)` factor is the anchor normaliser: it
-///     keeps `vp` in consistent units across repegs, otherwise
-///     math-space drift would mask IL.
+/**
+ * @title EquilibraSwapMath
+ * @notice Math kernel of the Equilibra AMM: a single-piece cubic invariant with two independent
+ * concentration knobs over asymmetric (quote-side normalised) math-space coordinates.
+ * @dev Coordinate change: `priceScaleWad = yWad / xWad` at the anchor (quote per base),
+ * `xMath = xWad` and `yMath = yWad * WAD / priceScaleWad`, so the anchor state lies on the
+ * diagonal `yMath == xMath`. A repeg moves `yMath` only, which gives the pool's LP-value gate a
+ * real IL signal on imbalanced reserves.
+ * Invariant: `K(x, y; L) = A * L * (x + y) / 2 + (W - A) * x * y` with
+ * `D = (y - x)^2 / (x * y)`, `A = a * W / (W + lambda * D)` and `W = WAD`. `K` is cubic in `y`
+ * at fixed `x` after clearing denominators, so the secant solver works on a well-conditioned
+ * envelope.
+ * Knobs: `a` is the depth at the anchor (`A(0) = a`, range `[A_MIN_WAD, A_MAX_WAD]`; `a == W`
+ * is excluded because the central price slope vanishes) and `lambda` is the plateau width
+ * (`A = a / 2` at `lambda * D = W`, range `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD]`). The knobs are
+ * independent.
+ * Depth: at the balance state `x = y = L_eq`, `K = W * L_eq^2`. For any state the depth is the
+ * positive root of `W * L^2 - A * L * S - (W - A) * N = 0` with `S = (x + y) / 2` and
+ * `N = x * y`. Every point of a level set recovers the same `L`, so the solver freezes `L` at
+ * the pre-state value.
+ * LP unit value: `vp = 2 * L_eq * sqrt(priceScale * WAD) / totalSupply`; the square-root factor
+ * keeps `vp` comparable across repegs.
+ */
 library EquilibraSwapMath {
-    /// @dev Maximum secant iterations per swap leg. Cubic K with frozen
-    ///      L converges in 3–6 iterations from a CP seed on the
-    ///      production envelope. The elevated cap accommodates extreme
-    ///      deep-imbalance / boundary-`λ` swaps and triggers the
-    ///      best-iterate fallback only on pathological inputs.
-    uint256 private constant _MAX_SECANT_ITER = 12;
+    uint256 internal constant Q128 = uint256(1) << 128;
 
-    // =========================================================================
-    // 1. Decimal lift / drop  (WAD ↔ raw token decimals)
-    // =========================================================================
+    /**
+     * @dev Quote K carries 18 extra fractional bits (`WAD * 2^18`); external K diagnostics stay
+     * WAD.
+     */
+    uint256 internal constant QUOTE_K_EXTRA_BITS = 18;
 
-    /// @notice Convert raw token amount to WAD-normalised units.
-    function toWad(uint256 amountRaw, uint8 decimals) internal pure returns (uint256 amountWad) {
-        if (decimals > Constants.MAX_TOKEN_DECIMALS) revert Errors.TokenDecimalsTooLarge();
-        if (decimals == 18) return amountRaw;
-        unchecked {
-            amountWad = amountRaw * (10 ** (18 - decimals));
-        }
-    }
+    /**
+     * @dev Secant iteration cap; exhaustion requires certification of the best candidate.
+     */
+    uint256 private constant _MAX_SECANT_ITER = 40;
+    /**
+     * @dev Cap-certification tolerance: `1 / (denominator - 1)` of the quoted amount (0.0001%).
+     */
+    uint256 private constant _CAP_QUOTE_EPSILON_DENOM = 1000001;
+    /**
+     * @dev Output-margin rate: every positive quote loses `max(1, amount / denominator)` math
+     * units (0.000001%).
+     */
+    uint256 private constant _QUOTE_MARGIN_DENOM = 100000000;
 
-    /// @notice Convert WAD amount to raw token decimals using floor rounding.
-    ///         Use for amounts paid OUT to the user — flooring is
-    ///         pool-favourable (dust stays on the pool side).
-    function fromWadDown(
-        uint256 amountWad,
-        uint8 decimals
-    ) internal pure returns (uint256 amountRaw) {
-        if (decimals > Constants.MAX_TOKEN_DECIMALS) revert Errors.TokenDecimalsTooLarge();
-        if (decimals == 18) return amountWad;
-        unchecked {
-            amountRaw = amountWad / (10 ** (18 - decimals));
-        }
-    }
-
-    /// @notice Convert WAD amount to raw token decimals using ceil rounding.
-    ///         Use for amounts the user must pay IN to the pool — ceiling
-    ///         is pool-favourable.
-    function fromWadUp(
-        uint256 amountWad,
-        uint8 decimals
-    ) internal pure returns (uint256 amountRaw) {
-        if (decimals > Constants.MAX_TOKEN_DECIMALS) revert Errors.TokenDecimalsTooLarge();
-        if (decimals == 18) return amountWad;
-        amountRaw = FixedPointMathLib.mulDivUp(amountWad, 1, 10 ** (18 - decimals));
+    /**
+     * @notice Secant solver state: the fixed post-swap axis, the quote-K target, the curve
+     * parameters, the frozen Q128 depth, the pre-state value of the solved axis and the
+     * direction flag.
+     */
+    struct SolverContext {
+        uint256 fixedAxis;
+        uint256 target;
+        uint256 a;
+        uint256 lambda;
+        uint256 depth;
+        uint256 previous;
+        bool exactOut;
     }
 
     // =========================================================================
-    // 2. Math-space coordinate change (symmetric)
+    // 1. Amplification A = a·W / (W + λ·D)
     // =========================================================================
 
-    /// @notice Lift `(xWad, yWad)` into the asymmetric math-space:
-    ///             xMath = xWad                              (base, untouched)
-    ///             yMath = yWad · WAD / priceScaleWad        (quote → base)
-    /// @dev    `priceScaleWad = yWad / xWad` at the anchor (quote per
-    ///         base in WAD form), so at the anchor `yMath = xWad =
-    ///         xMath` (diagonal) and the curve's symmetric kernel
-    ///         applies. Off-anchor, `yMath ≠ xMath` and the
-    ///         `(xMath, yMath)` carries one-sided priceScale
-    ///         dependence — this is the source of the auto-repeg gate's
-    ///         IL detection.
-    function toMathSpace(
-        uint256 xWad,
-        uint256 yWad,
-        uint256 priceScaleWad
-    ) internal pure returns (uint256 xMath, uint256 yMath) {
-        if (priceScaleWad == 0) revert Errors.InvalidPriceScale();
-        xMath = xWad;
-        yMath = FixedPointMathLib.divWad(yWad, priceScaleWad);
-    }
-
-    // =========================================================================
-    // 3. Distance metrics
-    // =========================================================================
-
-    /// @notice Symmetric distance between marginal and reference prices,
-    ///         used by the dynamic-fee ramp:
-    ///             dist = (p − a)² / (p · a)
-    /// @dev    Anti-symmetric in `(pMarg, pRef)`. The squared-difference
-    ///         form uses a single division instead of two, which
-    ///         eliminates cascading rounding from ratio inversion.
-    ///         Result is WAD-scaled.
-    function distanceFromAnchorWad(
-        uint256 pMargWad,
-        uint256 pRefWad
-    ) internal pure returns (uint256 distWad) {
-        if (pMargWad == 0 || pRefWad == 0) revert Errors.InvalidPriceScale();
-        if (pMargWad == pRefWad) return 0;
-
-        uint256 diff;
-        unchecked {
-            diff = pMargWad > pRefWad ? pMargWad - pRefWad : pRefWad - pMargWad;
-        }
-        uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
-        uint256 denomWad = FixedPointMathLib.mulWad(pMargWad, pRefWad);
-        if (denomWad == 0) revert Errors.MathInvariantViolation();
-        distWad = FixedPointMathLib.divWad(diffSqWad, denomWad);
-    }
-
-    /// @notice State-only math-space distance:
-    ///             D = (yMath − xMath)² / (xMath · yMath)
-    ///         WAD-scaled. Reverts on zero reserves; returns 0 at the
-    ///         anchor (xMath == yMath).
-    /// @dev    Feeds the amplification `A = a·W / (W + λ·D)`.
-    function distanceState(uint256 xMath, uint256 yMath) internal pure returns (uint256 distWad) {
-        if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
-        if (xMath == yMath) return 0;
-        uint256 diff;
-        unchecked {
-            diff = yMath > xMath ? yMath - xMath : xMath - yMath;
-        }
-        uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
-        uint256 xyWad = FixedPointMathLib.mulWad(xMath, yMath);
-        if (xyWad == 0) revert Errors.MathInvariantViolation();
-        distWad = FixedPointMathLib.divWad(diffSqWad, xyWad);
-    }
-
-    // =========================================================================
-    // 4. Amplification A = a·W / (W + λ·D)
-    // =========================================================================
-
-    /// @notice Compute the amplification `A` and its denominator
-    ///         `denom = W + λ·D` jointly.
-    /// @dev    Returns both so callers needing the marginal-price
-    ///         derivative chain — which references `A · λ / denom` —
-    ///         pay for the denominator only once.
-    ///
-    ///         Properties:
-    ///           • `D = 0` (anchor):    `A = a`,   `denom = W`
-    ///           • `λ·D = W` (knee):    `A = a/2`, `denom = 2W`
-    ///           • `D → ∞`:             `A → 0`,   `denom → ∞`
-    ///
-    ///         `A < W` strictly under the factory's `a ≤ A_MAX_WAD <
-    ///         W` invariant, so the tail term `(W − A)·N` in the
-    ///         invariant never collapses.
+    /**
+     * @dev Amplification `A = a * W / (W + lambda * D)` and its denominator, returned together so
+     * the marginal-price derivative chain (`A * lambda / denom`) pays for the denominator once.
+     * `D = 0` gives `A = a`; `lambda * D = W` gives `A = a / 2`; `A -> 0` as `D -> inf`. With
+     * `a <= A_MAX_WAD < W`, `A < W` strictly, so the tail weight `(W - A)` never vanishes.
+     */
     function _amplification(
         uint256 aWad,
         uint256 lambdaWad,
         uint256 distWad
     ) private pure returns (uint256 ampWad, uint256 denomWad) {
-        // λ·D in WAD (dimensionless)
         uint256 lambdaDWad = FixedPointMathLib.mulWad(lambdaWad, distWad);
-        // denom = W + λ·D ≥ W, strictly monotone-up in D
         denomWad = Constants.WAD + lambdaDWad;
-        // A = a · W / denom (single mulDiv, no intermediate overflow)
         ampWad = FixedPointMathLib.mulDiv(aWad, Constants.WAD, denomWad);
     }
 
     // =========================================================================
-    // 5. Invariant K and depth scale L
+    // 2. Depth scale L
     // =========================================================================
 
-    /// @notice Closed-form invariant
-    ///         `K(x, y; L) = A·L·(x+y)/2 + (W − A)·xy`
-    ///         with `L` supplied by the caller.
-    /// @dev    Private fast path used by `computeK`/`computeKAndL` and
-    ///         the secant solver. Returns 0 for degenerate states
-    ///         (zero reserve or `xy` floored to zero) so callers can
-    ///         short-circuit on cold paths.
-    function _computeKFromL(
-        uint256 xMath,
-        uint256 yMath,
-        uint256 lWad,
-        uint256 aWad,
-        uint256 lambdaWad
-    ) private pure returns (uint256 kWad) {
-        if (xMath == 0 || yMath == 0) return 0;
-        uint256 nWad = FixedPointMathLib.mulWad(xMath, yMath);
-        if (nWad == 0) return 0;
-
-        // D and A
-        uint256 distWad;
-        if (xMath != yMath) {
-            uint256 diff;
-            unchecked {
-                diff = yMath > xMath ? yMath - xMath : xMath - yMath;
-            }
-            uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
-            distWad = FixedPointMathLib.divWad(diffSqWad, nWad);
-        }
-        (uint256 ampWad, ) = _amplification(aWad, lambdaWad, distWad);
-
-        // K = A·L·(x+y)/2 + (W−A)·xy
-        uint256 sumXY = xMath + yMath;
-        uint256 sHalfWad = sumXY >> 1; // (x+y) / 2
-        uint256 alWad = FixedPointMathLib.mulWad(ampWad, lWad);
-        uint256 headWad = FixedPointMathLib.mulWad(alWad, sHalfWad);
-        uint256 tailWad = FixedPointMathLib.mulWad(Constants.WAD - ampWad, nWad);
-        kWad = headWad + tailWad;
-    }
-
-    /// @notice Solve the closed-form quadratic
-    ///         `W·L² − A·L·S − (W − A)·N = 0`
-    ///         for the positive root
-    ///         `L = (A·S + √((A·S)² + 4·W·(W − A)·N)) / (2·W)`.
-    /// @dev    The discriminant `(A·S)² + 4W(W−A)·N` is strictly
-    ///         positive on every well-defined state, so the positive
-    ///         root exists. The negative root is non-positive and
-    ///         spurious.
-    ///
-    ///         **Path-additivity**: any other point on the same
-    ///         `K = const` level set recovers the same positive root,
-    ///         so a forward leg ending at `(x', y')` and a reverse
-    ///         leg starting from `(x', y')` yield the same `L`.
-    ///         Within a swap leg the on-chain pool freezes `L` at the
-    ///         pre-state value and the secant drives
-    ///         `K(x_post, y_post; L_pre) = K_pre` to ≤ 1–2 wei
-    ///         residual.
-    ///
-    ///         **Anchor identity**: at `x = y = L`, the quadratic
-    ///         reduces to `L = (a·x + (2−a)·x)/2 = x` (with `W = 1`),
-    ///         pinning the centre exactly without sqrt rounding.
-    ///
-    ///         Returns `0` for degenerate states (zero reserve, or
-    ///         `xy` floored to 0) so callers can short-circuit.
+    /**
+     * @notice Positive depth root in Q128; reserves and parameters stay WAD.
+     * @dev Normalised by `R = max(x, y)`, `t = min(x, y) / R` and `theta = A / W`:
+     * `L / R = theta * (1 + t) / 4 + sqrt((theta * (1 + t) / 4)^2 + (1 - theta) * t)`. The
+     * normalised radicand fits uint256. Coordinates keep Q128 relative precision, not a uniform
+     * absolute-error bound: at extreme ratios `t` can round to zero. The amplification weight
+     * shares the quote kernel's WAD fallback; the returned depth stays Q128. Positive states
+     * require `x * y <= uint256.max` and `|x - y| < 2^128`, the diagonal shortcut included;
+     * otherwise reverts `MathOutOfRange`, which is not an LP-budget refusal.
+     * @param xMath Base-side math coordinate, WAD.
+     * @param yMath Quote-side math coordinate, WAD.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @return lQ128 Depth, Q128; zero when either coordinate is zero.
+     */
     function solveLFromState(
         uint256 xMath,
         uint256 yMath,
         uint256 aWad,
         uint256 lambdaWad
-    ) internal pure returns (uint256 lWad) {
+    ) internal pure returns (uint256 lQ128) {
         if (xMath == 0 || yMath == 0) return 0;
-        uint256 nWad = FixedPointMathLib.mulWad(xMath, yMath);
-        if (nWad == 0) return 0;
-
-        // D in math-space (zero at anchor)
-        uint256 distWad;
-        if (xMath != yMath) {
-            uint256 diff;
-            unchecked {
-                diff = yMath > xMath ? yMath - xMath : xMath - yMath;
-            }
-            uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
-            distWad = FixedPointMathLib.divWad(diffSqWad, nWad);
+        if (xMath == yMath) {
+            if (xMath >= Q128) revert Errors.MathOutOfRange();
+            return FixedPointMathLib.fullMulDiv(xMath, Q128, Constants.WAD);
         }
-
-        (uint256 ampWad, ) = _amplification(aWad, lambdaWad, distWad);
-
-        // S = (x + y) / 2
-        uint256 sHalfWad = (xMath + yMath) >> 1;
-        // A·S in WAD
-        uint256 asWad = FixedPointMathLib.mulWad(ampWad, sHalfWad);
-        // (A·S)² in WAD
-        uint256 asSqWad = FixedPointMathLib.mulWad(asWad, asWad);
-        // 4·W·(W − A)·N in WAD:
-        //   In real units (W = 1):       4·(W − A)·N
-        //   In stored single-WAD form:   4 · mulWad(WAD − ampWad, nWad)
-        // (The explicit `W` collapses into the single-WAD
-        //  store-scaling.)
-        uint256 fourTermWad;
-        unchecked {
-            fourTermWad = 4 * FixedPointMathLib.mulWad(Constants.WAD - ampWad, nWad);
-        }
-        uint256 discWad = asSqWad + fourTermWad;
-        // √disc · WAD = sqrtWad(disc) (single-WAD semantics)
-        uint256 sqrtDiscWad = FixedPointMathLib.sqrtWad(discWad);
-
-        // L = (A·S + √disc) / 2 in real units; stored single-WAD is
-        // numerator >> 1 since `W = 1` collapses the `2W` denominator
-        // to `2`.
-        unchecked {
-            lWad = (asWad + sqrtDiscWad) >> 1;
-        }
-    }
-
-    /// @notice Closed-form invariant K with L recovered from state.
-    ///         Used wherever the caller does not already have `L` in
-    ///         scope (LP unit-value reader, marginal-price probe,
-    ///         test harness).
-    function computeK(
-        uint256 xMath,
-        uint256 yMath,
-        uint256 aWad,
-        uint256 lambdaWad
-    ) internal pure returns (uint256 kWad) {
-        (kWad, ) = computeKAndL(xMath, yMath, aWad, lambdaWad);
-    }
-
-    /// @notice Joint K + L recovery in one fused pass. The shared state
-    ///         products — `N = x·y`, distance `D`, amplification `A`,
-    ///         half-sum `S/2` and tail `(W − A)·N` — are computed
-    ///         exactly once and reused by both the quadratic root and
-    ///         the invariant evaluation. Bit-identical to running
-    ///         `solveLFromState` + `_computeKFromL` back to back (same
-    ///         primitives, same order, same rounding) at roughly half
-    ///         the arithmetic (audit O-4).
-    function computeKAndL(
-        uint256 xMath,
-        uint256 yMath,
-        uint256 aWad,
-        uint256 lambdaWad
-    ) internal pure returns (uint256 kWad, uint256 lWad) {
-        if (xMath == 0 || yMath == 0) return (0, 0);
-        uint256 nWad = FixedPointMathLib.mulWad(xMath, yMath);
-        if (nWad == 0) return (0, 0);
-
-        // D and A — single evaluation shared by both halves.
-        uint256 distWad;
-        if (xMath != yMath) {
-            uint256 diff;
-            unchecked {
-                diff = yMath > xMath ? yMath - xMath : xMath - yMath;
-            }
-            uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
-            distWad = FixedPointMathLib.divWad(diffSqWad, nWad);
-        }
-        (uint256 ampWad, ) = _amplification(aWad, lambdaWad, distWad);
-
-        uint256 sHalfWad = (xMath + yMath) >> 1;
-        uint256 asWad = FixedPointMathLib.mulWad(ampWad, sHalfWad);
-        // `(W − A)·N` doubles as the quadratic's 4-term (×4) and the
-        // invariant's tail — computed once.
-        uint256 tailWad = FixedPointMathLib.mulWad(Constants.WAD - ampWad, nWad);
-
-        // L: positive root of `W·L² − A·L·S − (W − A)·N = 0`.
-        uint256 asSqWad = FixedPointMathLib.mulWad(asWad, asWad);
-        uint256 fourTermWad;
-        unchecked {
-            fourTermWad = 4 * tailWad;
-        }
-        uint256 discWad = asSqWad + fourTermWad;
-        uint256 sqrtDiscWad = FixedPointMathLib.sqrtWad(discWad);
-        unchecked {
-            lWad = (asWad + sqrtDiscWad) >> 1;
-        }
-        if (lWad == 0) return (0, 0);
-
-        // K = A·L·(x+y)/2 + (W − A)·xy — amp/half-sum/tail reused.
-        uint256 alWad = FixedPointMathLib.mulWad(ampWad, lWad);
-        kWad = FixedPointMathLib.mulWad(alWad, sHalfWad) + tailWad;
-    }
-
-    /// @notice Recover the balance-state depth `L_eq = √(K / W)` from
-    ///         the invariant value at the anchor.
-    /// @dev    At the anchor `K = W · L_eq²`. With `W = WAD` (real
-    ///         value 1), the stored relation is `K_stored = L²_stored
-    ///         · WAD / WAD = mulWad(L, L)`, so `L_eq = sqrt(K_stored ·
-    ///         WAD) = sqrtWad(K_stored)` recovers L in WAD-scaled
-    ///         (single-WAD) form.
-    ///
-    ///         Returns 0 on `kWad == 0`.
-    function balanceScaleFromK(uint256 kWad) internal pure returns (uint256 lEqWad) {
-        if (kWad == 0) return 0;
-        lEqWad = FixedPointMathLib.sqrtWad(kWad);
+        uint256 r = xMath > yMath ? xMath : yMath;
+        uint256 t = FixedPointMathLib.fullMulDiv(xMath > yMath ? yMath : xMath, Q128, r);
+        (uint256 theta, uint256 precision) = _tightWeightBound(
+            xMath,
+            yMath,
+            aWad,
+            lambdaWad,
+            false
+        );
+        if (precision != Q128) theta = FixedPointMathLib.fullMulDiv(theta, Q128, precision);
+        uint256 head = FixedPointMathLib.fullMulDivN(theta, Q128 + t, 130);
+        uint256 ratio = head + FixedPointMathLib.sqrt(head * head + (Q128 - theta) * t);
+        lQ128 = FixedPointMathLib.fullMulDiv(r, ratio, Constants.WAD);
     }
 
     // =========================================================================
-    // 6. LP unit value (price-scale-aware)
+    // 3. LP unit value (price-scale-aware)
     // =========================================================================
 
-    /// @notice `vp = 2 · L_eq · √(priceScale · WAD) / totalSupply` — the
-    ///         per-LP-share quote-equivalent unit value consumed by
-    ///         `_accrueLpValueGrowth` (monotone-up high-water mark) and
-    ///         the auto-repeg solvency gate.
-    /// @dev    **Role of the `√(priceScale · WAD)` normaliser.**
-    ///         The auto-repeg gate (`_tryAutoRepeg`) compares `vpAfter`
-    ///         (same reserves, candidate `priceScaleNew`) against the
-    ///         threshold; its job is to reject moves whose realised
-    ///         IL cost would exceed the LP growth cushion. For that
-    ///         check to **bite**, `vp` must change meaningfully when
-    ///         `priceScale` shifts at fixed reserves — otherwise the
-    ///         gate becomes a no-op (the symmetric coord change leaves
-    ///         `xMath · yMath` invariant and `L_eq` mostly invariant,
-    ///         so without the normaliser `vpAfter ≈ vpBefore` always
-    ///         and Gate 2 never fires).
-    ///
-    ///         The `√(priceScale · WAD)` factor is the anchor
-    ///         normaliser: it converts the math-space depth `2·L_eq` (in `L_eq` /
-    ///         share dimensionless units) into a **quote-equivalent**
-    ///         per-share value. A move from `priceScale_old` to
-    ///         `priceScale_new` at fixed reserves shifts `vp` by
-    ///         approximately `√(P_new / P_old) − 1`, which is exactly
-    ///         the IL signal Gate 2 needs.
-    ///
-    ///         vp evolution:
-    ///           • Fee-bearing swap: K↑ → L_eq↑ → vp↑ (monotone).
-    ///           • Mint/burn:        proportional — L_eq and supply
-    ///                                scale together, vp is preserved
-    ///                                modulo wei-level rounding
-    ///                                (handled by `_reanchorLpUnitValue`).
-    ///           • Repeg:            `priceScale` changes ⇒ vp shifts
-    ///                                by ≈ `√(P_new/P_old) − 1`. Gate 2
-    ///                                approves only when the post-move
-    ///                                vp stays above the LP-share
-    ///                                threshold.
-    ///
-    ///         **Anchor-invariance of growth accrual.** The accrual
-    ///         path is unaffected by the cross-repeg shift because
-    ///         `_accrueLpValueGrowth` runs **before** `_tryAutoRepeg`
-    ///         (so it sees `vp` under the unchanged pre-swap
-    ///         `priceScale`), and a successful repeg writes
-    ///         `_lpUnitValueWad = vpAfter` **directly** (bypassing the
-    ///         accrual that would otherwise double-credit the shift).
-    ///         The next swap's accrual then measures growth against
-    ///         the new baseline — only real fee-driven L_eq growth
-    ///         flows into `_lpValueGrowthWad`.
-    /// @notice `vp = 2 · L_eq · √(priceScale · WAD) / totalSupply`
-    ///         — the per-LP-share quote-equivalent unit value consumed
-    ///         by `_accrueLpValueGrowth` (monotone-up high-water mark)
-    ///         and the auto-repeg solvency gate (Gate 2).
-    /// @dev    With the asymmetric math-space coord change
-    ///         (`yMath = yWad · WAD / priceScale`), repegs at fixed
-    ///         reserves shift `yMath` only — making `(xMath, yMath)`
-    ///         genuinely off-balance. The resulting `L_eq` typically
-    ///         drops, and the `√(priceScale·WAD)` factor either
-    ///         partially compensates (when priceScale moves toward
-    ///         reserve balance, reducing math-space imbalance) or
-    ///         amplifies the IL signal. This gives Gate 2 a real
-    ///         "did the repeg consume too much LP cushion?" reading.
+    /**
+     * @notice Per-share LP value `vp = 2 * L_eq * sqrt(priceScale) / supply`, WAD.
+     * @dev Depth is Q128; price scale and supply are WAD. The anchor normaliser puts values
+     * before and after a repeg on the same basis: both `L_eq` and `sqrt(priceScale)` change
+     * during a repeg and neither factor alone measures its cost. Returns zero when any input is
+     * zero.
+     * @param lEqQ128 Balanced depth, Q128.
+     * @param priceScaleWad Anchor, WAD.
+     * @param totalSupplyWad LP supply, WAD.
+     * @return unitValueWad LP unit value, WAD.
+     */
     function computeLpUnitValueWad(
-        uint256 lEqWad,
+        uint256 lEqQ128,
         uint256 priceScaleWad,
         uint256 totalSupplyWad
     ) internal pure returns (uint256 unitValueWad) {
-        if (totalSupplyWad == 0 || lEqWad == 0 || priceScaleWad == 0) {
+        if (totalSupplyWad == 0 || lEqQ128 == 0 || priceScaleWad == 0) {
             return 0;
         }
-        // sqrtWad(x) returns `√(x · WAD)` in WAD form — the canonical
-        // WAD-of-a-WAD-quantity primitive used everywhere else.
+        // sqrtWad(x) = sqrt(x * WAD): the WAD square root of a WAD quantity.
         uint256 sqrtPsWad = FixedPointMathLib.sqrtWad(priceScaleWad);
-        uint256 doubleL = lEqWad << 1;
-        unitValueWad = FixedPointMathLib.fullMulDiv(doubleL, sqrtPsWad, totalSupplyWad);
+        uint256 depthPerShareQ128 = FixedPointMathLib.fullMulDiv(
+            lEqQ128,
+            2 * Constants.WAD,
+            totalSupplyWad
+        );
+        unitValueWad = FixedPointMathLib.fullMulDivN(depthPerShareQ128, sqrtPsWad, 128);
     }
 
     // =========================================================================
-    // 7. Marginal price (analytic, math-space, n = 1)
+    // 4. Marginal price (analytic, math-space, n = 1)
     // =========================================================================
 
-    /// @notice Math-space marginal price `pMarg = ∂K/∂xMath ÷
-    ///         ∂K/∂yMath` at `(xMath, yMath)` with frozen depth `L`.
-    ///         WAD-scaled. At the diagonal (`xMath == yMath`) collapses
-    ///         to `WAD` exactly.
-    /// @dev    Closed-form derivation for `A = a·W / (W + λ·D)`:
-    ///             ∂K/∂x = (∂A/∂x)·(L·S − N) + A·L/2 + (W − A)·y
-    ///             ∂K/∂y = (∂A/∂y)·(L·S − N) + A·L/2 + (W − A)·x
-    ///
-    ///         Symmetry of D in (x, y) gives
-    ///             x · ∂A/∂x  =  −y · ∂A/∂y
-    ///         so the case-split collapses to ONE sign decision
-    ///         (`sign(yMath − xMath)`).
-    ///
-    ///         Magnitudes:
-    ///             |x·∂D/∂x| = |yMath − xMath|·(xMath + yMath) / N
-    ///             |x·∂A/∂x| = (A·λ / denom) · |x·∂D/∂x|        [n = 1]
-    ///             |τ|       = |x·∂A/∂x| · |L·S − N|
-    ///
-    ///         Assemble:
-    ///             x · ∂K/∂x = τ + base_x,   base_x = A·L·x/2 + (W − A)·N
-    ///             y · ∂K/∂y = −τ + base_y, base_y = A·L·y/2 + (W − A)·N
-    ///             pMarg     = (yMath · (x·∂K/∂x)) /
-    ///                          (xMath · (y·∂K/∂y))
-    ///
-    ///         The subtractive branch is mathematically positive for
-    ///         every admissible (a, λ) in the factory-validated
-    ///         envelope. A runtime underflow on that branch signals a
-    ///         parameter-envelope regression and reverts with
-    ///         `MathInvariantViolation`.
+    /**
+     * @notice Math-space marginal price `pMarg = dK/dxMath / dK/dyMath` at `(xMath, yMath)` with
+     * frozen depth `L`, WAD; exactly `WAD` on the diagonal.
+     * @dev With `A = a * W / (W + lambda * D)`:
+     * `dK/dx = (dA/dx) * (L * S - N) + A * L / 2 + (W - A) * y`, and symmetrically for `y`.
+     * Symmetry of `D` gives `x * dA/dx = -y * dA/dy`, so one sign decision
+     * (`sign(yMath - xMath)`) suffices. With `tau = (x * dA/dx) * (L * S - N)`:
+     * `x * dK/dx = tau + baseX`, `y * dK/dy = -tau + baseY`,
+     * `baseX = A * L * x / 2 + (W - A) * N`, `baseY = A * L * y / 2 + (W - A) * N` and
+     * `pMarg = (y * xKx) / (x * yKy)`. The subtractive branch is positive for every admissible
+     * `(a, lambda)`; an underflow there reverts `MathInvariantViolation`. Coordinates at or above
+     * `2^125` cancel `x` before the final ratio so the WAD-scaled derivative products stay inside
+     * uint256. Reverts `InsufficientLiquidity` on a zero coordinate or, off the diagonal, a zero
+     * depth.
+     * @param xMath Base-side math coordinate, WAD.
+     * @param yMath Quote-side math coordinate, WAD.
+     * @param lQ128 Frozen depth, Q128.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @return pMargMathWad Marginal price, WAD.
+     */
     function marginalPrice(
         uint256 xMath,
         uint256 yMath,
-        uint256 lWad,
+        uint256 lQ128,
         uint256 aWad,
         uint256 lambdaWad
     ) internal pure returns (uint256 pMargMathWad) {
         if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
-        // Diagonal short-circuit — D = 0, ∂A/∂{x,y} = 0, the formula
-        // collapses to base_x = base_y, pMarg = WAD exactly.
+        // Diagonal: D = 0, so pMarg = WAD exactly.
         if (xMath == yMath) return Constants.WAD;
-        if (lWad == 0) revert Errors.InsufficientLiquidity();
+        if (lQ128 == 0) revert Errors.InsufficientLiquidity();
 
-        (uint256 xKx, uint256 yKy) = _marginalPriceParts(xMath, yMath, lWad, aWad, lambdaWad);
+        (uint256 xKx, uint256 yKy) = _marginalPriceParts(xMath, yMath, lQ128, aWad, lambdaWad);
 
         if (yKy == 0) revert Errors.DivisionByZero();
 
+        // Cancel xMath first when WAD-scaled derivative products could overflow; ordinary
+        // magnitudes keep the established rounding order.
+        if (xMath >= (uint256(1) << 125) || yMath >= (uint256(1) << 125)) {
+            uint256 intermediate = FixedPointMathLib.fullMulDiv(yMath, xKx, xMath);
+            return FixedPointMathLib.fullMulDiv(intermediate, Constants.WAD, yKy);
+        }
         // pMarg = (yMath · xKx) / (xMath · yKy)
-        uint256 num = FixedPointMathLib.mulWad(yMath, xKx);
-        uint256 den = FixedPointMathLib.mulWad(xMath, yKy);
-        pMargMathWad = FixedPointMathLib.divWad(num, den);
+        uint256 num = FixedPointMathLib.fullMulDiv(yMath, xKx, Constants.WAD);
+        uint256 den = FixedPointMathLib.fullMulDiv(xMath, yKy, Constants.WAD);
+        pMargMathWad = FixedPointMathLib.fullMulDiv(num, Constants.WAD, den);
     }
 
-    /// @dev Compute the two numerators `(x·∂K/∂x, y·∂K/∂y)` for the
-    ///      marginal-price ratio. Extracted from `marginalPrice` so the
-    ///      caller's stack stays under the 16-slot limit on `viaIR=false`
-    ///      builds. Pre-conditions: `xMath != yMath > 0`, `lWad > 0`.
+    /**
+     * @dev The two numerators `(x * dK/dx, y * dK/dy)` of the marginal-price ratio, split out of
+     * `marginalPrice` to keep its stack under the 16-slot limit on legacy builds. Preconditions:
+     * `xMath != yMath`, both positive, `lQ128 > 0`. Reverts `MathInvariantViolation` when a
+     * subtractive branch would underflow.
+     */
     function _marginalPriceParts(
         uint256 xMath,
         uint256 yMath,
-        uint256 lWad,
+        uint256 lQ128,
         uint256 aWad,
         uint256 lambdaWad
     ) private pure returns (uint256 xKx, uint256 yKy) {
-        // Bundle the amplification-side computations into one helper
-        // so the outer function's stack stays under the 16-slot limit
-        // on `viaIR=false`. `nWad` is also returned because the τ
-        // helper needs it again — re-deriving costs a `mulWad`.
+        // nWad is returned because the tau helper needs it again.
         (uint256 prefactor, uint256 baseX, uint256 baseY, uint256 nWad) = _marginalPriceAmpSide(
             xMath,
             yMath,
-            lWad,
+            lQ128,
             aWad,
             lambdaWad
         );
 
-        (uint256 absTau, bool tauPositive) = _marginalPriceTau(prefactor, lWad, xMath, yMath, nWad);
+        (uint256 absTau, bool tauPositive) = _marginalPriceTau(
+            prefactor,
+            lQ128,
+            xMath,
+            yMath,
+            nWad
+        );
 
-        // Combine with proper signs:
-        //   x·∂K/∂x = τ + base_x
-        //   y·∂K/∂y = −τ + base_y
+        // x·∂K/∂x = τ + base_x, y·∂K/∂y = −τ + base_y
         if (tauPositive) {
             xKx = baseX + absTau;
             if (baseY <= absTau) revert Errors.MathInvariantViolation();
@@ -610,16 +267,16 @@ library EquilibraSwapMath {
         }
     }
 
-    /// @dev All amplification-side derived quantities the marginal-price
-    ///      formula needs, computed in one helper to keep
-    ///      `_marginalPriceParts` shallow on the stack:
-    ///        - `prefactor = A · λ / denom` (the τ-scaling factor)
-    ///        - `baseX = A·L·x/2 + (W−A)·N`, `baseY = A·L·y/2 + (W−A)·N`
-    ///        - `nWad = x · y / W` (returned because τ also needs it).
+    /**
+     * @dev Amplification-side quantities of the marginal-price formula, computed together to keep
+     * `_marginalPriceParts` shallow on the stack: `prefactor = A * lambda / denom`,
+     * `baseX = A * L * x / 2 + (W - A) * N`, `baseY = A * L * y / 2 + (W - A) * N` and
+     * `nWad = x * y / W`. Reverts `MathInvariantViolation` when `nWad` rounds to zero.
+     */
     function _marginalPriceAmpSide(
         uint256 xMath,
         uint256 yMath,
-        uint256 lWad,
+        uint256 lQ128,
         uint256 aWad,
         uint256 lambdaWad
     ) private pure returns (uint256 prefactor, uint256 baseX, uint256 baseY, uint256 nWad) {
@@ -629,13 +286,14 @@ library EquilibraSwapMath {
         uint256 distWad = _distState(xMath, yMath, nWad);
         (uint256 ampWad, uint256 denomWad) = _amplification(aWad, lambdaWad, distWad);
 
-        (baseX, baseY) = _marginalPriceBases(ampWad, lWad, xMath, yMath, nWad);
+        (baseX, baseY) = _marginalPriceBases(ampWad, lQ128, xMath, yMath, nWad);
         prefactor = FixedPointMathLib.mulDiv(ampWad, lambdaWad, denomWad);
     }
 
-    /// @dev State distance `D = (yMath − xMath)² / (xMath · yMath)` in
-    ///      WAD with the product `nWad = xMath·yMath/W` pre-computed
-    ///      to avoid a redundant `mulWad`.
+    /**
+     * @dev State distance `D = (yMath - xMath)^2 / (xMath * yMath)` in WAD, with
+     * `nWad = xMath * yMath / W` supplied by the caller.
+     */
     function _distState(
         uint256 xMath,
         uint256 yMath,
@@ -649,27 +307,22 @@ library EquilibraSwapMath {
         distWad = FixedPointMathLib.divWad(diffSqWad, nWad);
     }
 
-    /// @dev Signed off-diagonal term `τ = (x·∂A/∂x)·(L·S − N)` split
-    ///      into magnitude + sign. Returned bool is the sign of `τ`.
-    ///      `prefactor = A·λ / denom` is supplied pre-computed by the
-    ///      caller to keep this helper's argument count below the
-    ///      `viaIR=false` stack-spill threshold.
-    ///      `|x·∂A/∂x| = prefactor · |y − x|·(x + y) / N` and the
-    ///      sign rule
-    ///        sign(τ) = sign(x·∂A/∂x) · sign(H)
-    ///                = (yMath > xMath) ⊕ (lsWad < nWad)
-    ///      collapses to an `==` between the two flags.
+    /**
+     * @dev Off-diagonal term `tau = (x * dA/dx) * (L * S - N)` as magnitude and sign, with
+     * `prefactor = A * lambda / denom` supplied by the caller to stay under the legacy stack
+     * limit. `|x * dA/dx| = prefactor * |y - x| * (x + y) / N`, and
+     * `sign(tau) = sign(x * dA/dx) * sign(L * S - N)` collapses to an equality of the two flags.
+     */
     function _marginalPriceTau(
         uint256 prefactor,
-        uint256 lWad,
+        uint256 lQ128,
         uint256 xMath,
         uint256 yMath,
         uint256 nWad
     ) private pure returns (uint256 absTau, bool tauPositive) {
         uint256 sumXY = xMath + yMath;
 
-        // |x·∂A/∂x| via paired fullMulDiv to keep intermediates inside
-        // 256 bits at the envelope's upper corner.
+        // Paired fullMulDiv keeps the intermediates inside 256 bits.
         uint256 absXdAdxWad;
         {
             uint256 diff;
@@ -682,7 +335,7 @@ library EquilibraSwapMath {
         }
 
         // H = L·S − N, sign-tracked. S = sumXY / 2.
-        uint256 lsWad = FixedPointMathLib.mulWad(lWad, sumXY >> 1);
+        uint256 lsWad = FixedPointMathLib.fullMulDivN(lQ128, sumXY, 129);
         bool hPositive = lsWad >= nWad;
         uint256 absH;
         unchecked {
@@ -693,136 +346,121 @@ library EquilibraSwapMath {
         tauPositive = (yMath > xMath) == hPositive;
     }
 
-    /// @dev Diagonal base terms `base_x = A·L·x/2 + (W−A)·N` and
-    ///      `base_y = A·L·y/2 + (W−A)·N`. The two outputs share the
-    ///      `alHalf` and `tailWad` factors.
+    /**
+     * @dev Diagonal base terms `baseX = A * L * x / 2 + (W - A) * N` and
+     * `baseY = A * L * y / 2 + (W - A) * N`, sharing the `alHalf` and `tailWad` factors.
+     */
     function _marginalPriceBases(
         uint256 ampWad,
-        uint256 lWad,
+        uint256 lQ128,
         uint256 xMath,
         uint256 yMath,
         uint256 nWad
     ) private pure returns (uint256 baseX, uint256 baseY) {
-        uint256 alHalf = FixedPointMathLib.mulWad(ampWad, lWad) >> 1;
+        uint256 alHalf = FixedPointMathLib.fullMulDiv(ampWad, lQ128, 2 * Constants.WAD);
         uint256 wMinusA;
         unchecked {
             wMinusA = Constants.WAD - ampWad;
         }
         uint256 tailWad = FixedPointMathLib.mulWad(wMinusA, nWad);
-        baseX = FixedPointMathLib.mulWad(alHalf, xMath) + tailWad;
-        baseY = FixedPointMathLib.mulWad(alHalf, yMath) + tailWad;
+        baseX = FixedPointMathLib.fullMulDivN(alHalf, xMath, 128) + tailWad;
+        baseY = FixedPointMathLib.fullMulDivN(alHalf, yMath, 128) + tailWad;
     }
 
-    /// @notice Convenience overload that recovers `L` from state
-    ///         internally. Slightly more expensive than the
-    ///         L-supplied form; the pool prefers the supplied form
-    ///         on swap hot paths where `L` is already in scope.
+    /**
+     * @notice Marginal price with freshly recovered depth; call `marginalPrice` directly when the
+     * Q128 depth is already available.
+     * @param xMath Base-side math coordinate, WAD.
+     * @param yMath Quote-side math coordinate, WAD.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @return pMargMathWad Marginal price, WAD.
+     */
     function marginalPriceFromState(
         uint256 xMath,
         uint256 yMath,
         uint256 aWad,
         uint256 lambdaWad
     ) internal pure returns (uint256 pMargMathWad) {
-        uint256 lWad = solveLFromState(xMath, yMath, aWad, lambdaWad);
-        pMargMathWad = marginalPrice(xMath, yMath, lWad, aWad, lambdaWad);
+        uint256 lQ128 = solveLFromState(xMath, yMath, aWad, lambdaWad);
+        pMargMathWad = marginalPrice(xMath, yMath, lQ128, aWad, lambdaWad);
     }
 
     // =========================================================================
-    // 8. Swap quotes (secant against frozen-L cubic K)
+    // 5. Swap quotes (secant against frozen-L cubic K)
     // =========================================================================
 
-    /// @notice Forward exact-input: given pre-state `(xMath, yMath)`
-    ///         and deposit `dxMath` on the x-side, return the output
-    ///         `dyMath` on the y-side conserving `K(·; L_pre)`.
-    /// @dev    Algorithm:
-    ///           1. `L_pre = solveLFromState(xMath, yMath; a, λ)`.
-    ///           2. `kTarget = K(xMath, yMath; L_pre, a, λ)` via
-    ///              `_computeKFromL` (same formula path the secant
-    ///              uses inside the loop — bit-exact match on the
-    ///              residual).
-    ///           3. `xPost = xMath + dxMath`.
-    ///           4. Seed `yPost ≈ N_pre / xPost` (CP proxy).
-    ///           5. Secant on `K(xPost, yPost; L_pre) = kTarget`,
-    ///              ≤ `_MAX_SECANT_ITER` iters, best-iterate fallback.
-    ///           6. `dyMath = yMath − yPost`. A wrong-side terminal
-    ///              iterate (`yPost > yMath`) reports as `dyMath = 0` —
-    ///              a fail-closed refusal to quote that flows into the
-    ///              typed dust guards downstream.
-    function quoteExactInForward(
-        uint256 xMath,
-        uint256 yMath,
-        uint256 dxMath,
-        uint256 aWad,
-        uint256 lambdaWad
-    ) internal pure returns (uint256 dyMath, uint256 iters) {
-        if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
-        if (dxMath == 0) revert Errors.ZeroAmount();
-
-        (uint256 kTarget, uint256 lPre) = computeKAndL(xMath, yMath, aWad, lambdaWad);
-        if (lPre == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
-
-        return _quoteExactInBody(xMath, yMath, dxMath, aWad, lambdaWad, lPre, kTarget);
-    }
-
-    /// @notice L-supplied overload: the pool solves the pre-state `L`
-    ///         exactly once per swap/quote and threads it here (audit
-    ///         O-3). `lPreWad` MUST be `solveLFromState` of the same
-    ///         pre-state — the kernel is symmetric in `(x, y)`, so one
-    ///         value serves both trade directions bit-for-bit.
+    /**
+     * @notice Exact-input quote: the y-side output `dyMath` for an x-side deposit `dxMath` that
+     * conserves `K` at the frozen pre-state depth.
+     * @dev `kTarget = computeQuoteKFromL(xMath, yMath, lPreQ128)` is the same evaluation the
+     * secant uses, so the residual matches bit-for-bit. The counterpart search starts from the
+     * curve-aware seed, runs at most `_MAX_SECANT_ITER` iterations and certifies the best
+     * residual at the cap or reverts `SolverDidNotConverge`. A terminal iterate on the wrong side
+     * of the pre-state (`yPost > yMath`) returns `dyMath = 0`: a fail-closed refusal that the
+     * callers' dust guards reject, not a claim that the true output is zero. Reverts
+     * `InsufficientLiquidity` on a zero coordinate, depth or target and `ZeroAmount` on a zero
+     * input.
+     * @param xMath Pre-state input-side coordinate, WAD.
+     * @param yMath Pre-state output-side coordinate, WAD.
+     * @param dxMath Input, WAD math units.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @param lPreQ128 Pre-state depth from `solveLFromState`, Q128.
+     * @return dyMath Output after the output margin, WAD math units.
+     * @return iters Secant iterations used.
+     */
     function quoteExactInForward(
         uint256 xMath,
         uint256 yMath,
         uint256 dxMath,
         uint256 aWad,
         uint256 lambdaWad,
-        uint256 lPreWad
+        uint256 lPreQ128
     ) internal pure returns (uint256 dyMath, uint256 iters) {
         if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
         if (dxMath == 0) revert Errors.ZeroAmount();
 
-        uint256 kTarget = _computeKFromL(xMath, yMath, lPreWad, aWad, lambdaWad);
-        if (lPreWad == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
+        uint256 kTarget = computeQuoteKFromL(xMath, yMath, lPreQ128, aWad, lambdaWad);
+        if (lPreQ128 == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
 
-        return _quoteExactInBody(xMath, yMath, dxMath, aWad, lambdaWad, lPreWad, kTarget);
+        return _quoteExactInBody(xMath, yMath, dxMath, aWad, lambdaWad, lPreQ128, kTarget);
     }
 
-    /// @dev Shared secant body for both `quoteExactInForward` variants.
+    /**
+     * @dev Secant setup of `quoteExactInForward`: CP seed `xMath * yMath / xPost` (at least 1),
+     * then `_solveCounterpart` on the fixed axis `xPost`.
+     */
     function _quoteExactInBody(
         uint256 xMath,
         uint256 yMath,
         uint256 dxMath,
         uint256 aWad,
         uint256 lambdaWad,
-        uint256 lPre,
+        uint256 lPreQ128,
         uint256 kTarget
     ) private pure returns (uint256 dyMath, uint256 iters) {
         uint256 xPost = xMath + dxMath;
 
         // CP seed: yPost ≈ xMath · yMath / xPost
         uint256 ySeed = FixedPointMathLib.mulDiv(xMath, yMath, xPost);
-        if (ySeed == 0) ySeed = 1;
+        assembly ("memory-safe") {
+            ySeed := or(ySeed, iszero(ySeed))
+        }
 
-        (uint256 yPost, uint256 used) = _solveCounterpart(
-            xPost,
-            ySeed,
-            kTarget,
-            aWad,
-            lambdaWad,
-            lPre
-        );
+        SolverContext memory c;
+        c.fixedAxis = xPost;
+        c.previous = yMath;
+        c.exactOut = false;
+        c.target = kTarget;
+        c.a = aWad;
+        c.lambda = lambdaWad;
+        c.depth = lPreQ128;
+        (uint256 yPost, uint256 used) = _solveCounterpart(ySeed, c);
 
         if (yPost > yMath) {
-            // The secant's terminal iterate landed on the wrong side of
-            // the pre-state: no physically admissible discrete quote
-            // was found for this input (observed on dust-scale trades
-            // where the kernel's integer quantization dominates the
-            // signal, e.g. strongly de-anchored pools). Fail closed
-            // with a zero-output sentinel — the swap path stops in the
-            // typed zero-raw-output guard
-            // (`AmountTooSmallAfterNormalization`) and `quoteExactIn`
-            // returns 0 like every other unquotable dust case. This is
-            // a refusal to quote, not a claim that the true real-valued
-            // output is exactly zero.
+            // Wrong-side terminal iterate: no admissible discrete quote. Fail closed with the
+            // zero-output sentinel, which the callers' zero-raw-output guard rejects.
             return (0, used);
         }
         unchecked {
@@ -831,80 +469,83 @@ library EquilibraSwapMath {
         iters = used;
     }
 
-    /// @notice Forward exact-output: mirror of `quoteExactInForward`.
-    function quoteExactOutForward(
-        uint256 xMath,
-        uint256 yMath,
-        uint256 dyMath,
-        uint256 aWad,
-        uint256 lambdaWad
-    ) internal pure returns (uint256 dxMath, uint256 iters) {
-        if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
-        if (dyMath == 0) revert Errors.ZeroAmount();
-        if (dyMath >= yMath) revert Errors.InsufficientLiquidity();
-
-        (uint256 kTarget, uint256 lPre) = computeKAndL(xMath, yMath, aWad, lambdaWad);
-        if (lPre == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
-
-        return _quoteExactOutBody(xMath, yMath, dyMath, aWad, lambdaWad, lPre, kTarget);
-    }
-
-    /// @notice L-supplied overload — see `quoteExactInForward` (audit
-    ///         O-3): `lPreWad` must be the same pre-state's
-    ///         `solveLFromState` value (direction-independent).
+    /**
+     * @notice Exact-output quote: the x-side input `dxMath` that pays the y-side output `dyMath`
+     * while conserving `K` at the frozen pre-state depth.
+     * @dev Mirror of `quoteExactInForward`. The trial output is enlarged to
+     * `dyMath + max(1, dyMath / (_QUOTE_MARGIN_DENOM - 1))`, the integer inverse of the exact-in
+     * output margin, so no input surcharge follows. A wrong-side terminal iterate
+     * (`xPost < xMath`) returns `dxMath = 0`, rejected by the callers' zero-input guard. Reverts
+     * `InsufficientLiquidity` when the requested or trial output reaches the reserve or on a
+     * zero coordinate, depth or target, and `ZeroAmount` on a zero output.
+     * @param xMath Pre-state input-side coordinate, WAD.
+     * @param yMath Pre-state output-side coordinate, WAD.
+     * @param dyMath Requested output, WAD math units.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @param lPreQ128 Pre-state depth from `solveLFromState`, Q128.
+     * @return dxMath Required input, WAD math units.
+     * @return iters Secant iterations used.
+     */
     function quoteExactOutForward(
         uint256 xMath,
         uint256 yMath,
         uint256 dyMath,
         uint256 aWad,
         uint256 lambdaWad,
-        uint256 lPreWad
+        uint256 lPreQ128
     ) internal pure returns (uint256 dxMath, uint256 iters) {
         if (xMath == 0 || yMath == 0) revert Errors.InsufficientLiquidity();
         if (dyMath == 0) revert Errors.ZeroAmount();
         if (dyMath >= yMath) revert Errors.InsufficientLiquidity();
 
-        uint256 kTarget = _computeKFromL(xMath, yMath, lPreWad, aWad, lambdaWad);
-        if (lPreWad == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
+        uint256 kTarget = computeQuoteKFromL(xMath, yMath, lPreQ128, aWad, lambdaWad);
+        if (lPreQ128 == 0 || kTarget == 0) revert Errors.InsufficientLiquidity();
 
-        return _quoteExactOutBody(xMath, yMath, dyMath, aWad, lambdaWad, lPreWad, kTarget);
+        return _quoteExactOutBody(xMath, yMath, dyMath, aWad, lambdaWad, lPreQ128, kTarget);
     }
 
-    /// @dev Shared secant body for both `quoteExactOutForward` variants.
+    /**
+     * @dev Secant setup of `quoteExactOutForward`: enlarge the trial output by the inverse
+     * margin, seed with the CP estimate `xMath * yMath / yPost` (strictly above `xMath`) and
+     * solve on the fixed axis `yPost`; the kernel is symmetric in `(x, y)`.
+     */
     function _quoteExactOutBody(
         uint256 xMath,
         uint256 yMath,
         uint256 dyMath,
         uint256 aWad,
         uint256 lambdaWad,
-        uint256 lPre,
+        uint256 lPreQ128,
         uint256 kTarget
     ) private pure returns (uint256 dxMath, uint256 iters) {
         uint256 yPost = yMath - dyMath;
+        // Upper integer inverse of u - max(1, floor(u / D)): the increased
+        // trial output maps back to exactly dyMath after the output margin.
+        uint256 margin = dyMath / (_QUOTE_MARGIN_DENOM - 1);
+        assembly ("memory-safe") {
+            margin := or(margin, iszero(margin))
+        }
+        if (margin >= yPost) revert Errors.InsufficientLiquidity();
+        yPost -= margin;
 
         uint256 xSeed = FixedPointMathLib.mulDiv(xMath, yMath, yPost);
         if (xSeed <= xMath) xSeed = xMath + 1;
 
-        // Search with (yPost, xSeed): the secant treats yPost as the
-        // fixed axis. The cubic is symmetric in (xMath, yMath), so
-        // this works without extra structure.
-        (uint256 xPost, uint256 used) = _solveCounterpart(
-            yPost,
-            xSeed,
-            kTarget,
-            aWad,
-            lambdaWad,
-            lPre
-        );
+        SolverContext memory c;
+        c.fixedAxis = yPost;
+        c.previous = xMath;
+        c.exactOut = true;
+        c.target = kTarget;
+        c.a = aWad;
+        c.lambda = lambdaWad;
+        c.depth = lPreQ128;
+        (uint256 xPost, uint256 used) = _solveCounterpart(xSeed, c);
 
         if (xPost < xMath) {
-            // Wrong-side terminal iterate on the input axis: no
-            // physically admissible discrete quote (mirror of the
-            // exact-in case). Fail closed with a zero-input sentinel —
-            // both the view and the swap path stop in the existing
-            // `cleanInRaw == 0` typed guard
-            // (`AmountTooSmallAfterNormalization`), so a zero-input
-            // settlement can never happen.
+            // Wrong-side terminal iterate on the input axis: no admissible discrete quote. Fail
+            // closed with the zero-input sentinel, which the callers' `cleanInRaw == 0` guard
+            // rejects, so a zero-input settlement can never happen.
             return (0, used);
         }
         unchecked {
@@ -913,72 +554,116 @@ library EquilibraSwapMath {
         iters = used;
     }
 
-    /// @notice Solve `K(aFixed, b; L) = kTarget` for `b` via secant
-    ///         iteration on the closed-form cubic with frozen depth `L`.
-    /// @dev    `K(aFixed, ·; L)` is strictly monotone in `b` on the
-    ///         production envelope (head term `A·L·(aFixed + b)/2`
-    ///         increases linearly; tail term `(W−A)·aFixed·b` is
-    ///         non-negative; A varies smoothly with D). Two-seed
-    ///         bootstrap (`b1 = bSeed`, `b2 = b1·1.001`) provides a
-    ///         finite initial slope.
-    ///
-    ///         Early-exit conditions:
-    ///           • `k2 == kTarget`  — exact hit.
-    ///           • `dk == 0`        — degenerate slope.
-    ///           • `b3u == b2`      — integer fixed point.
-    ///
-    ///         **Best-iterate fallback.** Pure secant on integer
-    ///         cubics can oscillate around the fixed point — each
-    ///         iterate flips sign and magnitude does not necessarily
-    ///         shrink. When the loop exits on `MAX_ITER` we return
-    ///         the iterate with the smallest absolute residual
-    ///         observed, never strictly worse than the most recent.
+    /**
+     * @dev Curve-aware initial guess; the counterpart solver and the native settlement checks
+     * decide acceptance. Freezes `theta` at the CP point and solves the linear-in-b envelope,
+     * flooring that estimate at `cp / 1000` to limit cancellation near zero; when the envelope
+     * has no positive root, uses the `b << s` tail of the invariant. Falls back to `cp` when an
+     * operand exceeds uint128 or the tail denominator is not positive.
+     */
+    function _curveSeed(uint256 cp, SolverContext memory c) private pure returns (uint256) {
+        uint256 s = c.fixedAxis;
+        uint256 halfL = FixedPointMathLib.fullMulDivN(c.depth, Constants.WAD, 129);
+        uint256 kOverS = FixedPointMathLib.fullMulDiv(
+            c.target,
+            Constants.WAD >> QUOTE_K_EXTRA_BITS,
+            s
+        );
+        // This bounds only the inexpensive initializer, never an accepted swap.
+        if (s > type(uint128).max || halfL > type(uint128).max || kOverS > type(uint128).max)
+            return cp;
+        (uint256 theta, uint256 precision) = _tightWeightBound(s, cp, c.a, c.lambda, false);
+        uint256 head = FixedPointMathLib.mulDiv(theta, halfL, precision);
+        uint256 numerator;
+        uint256 denominator;
+        if (kOverS > head) {
+            numerator = kOverS - head;
+            denominator = FixedPointMathLib.mulDiv(precision - theta, s, precision) + head;
+        } else {
+            // b ~= lambda*K / (a*L/2 + lambda*s - (1-2*lambda)*K/s).
+            numerator = FixedPointMathLib.mulDiv(c.lambda, kOverS, Constants.WAD);
+            denominator =
+                FixedPointMathLib.mulDiv(c.a, halfL, Constants.WAD) +
+                FixedPointMathLib.mulDiv(c.lambda, s, Constants.WAD) +
+                2 * numerator;
+            if (denominator <= kOverS) return cp;
+            denominator -= kOverS;
+        }
+        if (denominator == 0) return cp;
+        uint256 seed = FixedPointMathLib.mulDiv(s, numerator, denominator);
+        assembly ("memory-safe") {
+            seed := or(seed, iszero(seed))
+        }
+        if (kOverS > head) {
+            uint256 floor = cp / 1000;
+            if (seed < floor) return floor;
+        }
+        return seed;
+    }
+
+    /**
+     * @dev Solve at frozen depth and apply the single output-side margin
+     * (`max(1, output / _QUOTE_MARGIN_DENOM)` math units) to a positive exact-in output.
+     * Exact-out already enlarged its trial output and needs no input surcharge; nonpositive
+     * quotes keep their zero sentinel.
+     */
     function _solveCounterpart(
-        uint256 aFixed,
         uint256 bSeed,
-        uint256 kTarget,
-        uint256 aWad,
-        uint256 lambdaWad,
-        uint256 lWad
+        SolverContext memory c
     ) private pure returns (uint256 b, uint256 iters) {
+        (b, iters) = _solveUnadjustedCounterpart(bSeed, c);
+        if (!c.exactOut && b < c.previous) {
+            b += _quoteEpsilon(c, b, _QUOTE_MARGIN_DENOM);
+        }
+    }
+
+    /**
+     * @dev Secant on the Q128-weight quote invariant at frozen depth. Equal-K and
+     * unchanged-counterpart exits apply at every iteration; a proposed nonpositive counterpart
+     * takes the half-step `b / 2 + 1`. At the iteration cap the best-residual iterate is
+     * certified once at `_CAP_QUOTE_EPSILON_DENOM` (0.0001%) and an unconfirmed candidate reverts
+     * `SolverDidNotConverge`. Integer exits alone do not prove exact agreement with the
+     * continuous invariant; the caller applies the margin, the native bounds and the LP-depth
+     * guard.
+     */
+    function _solveUnadjustedCounterpart(
+        uint256 bSeed,
+        SolverContext memory c
+    ) private pure returns (uint256 b, uint256 iters) {
+        bSeed = _curveSeed(bSeed, c);
         uint256 b1 = bSeed;
-        uint256 b2 = (bSeed * 1001) / 1000;
-        if (b2 == b1) b2 = b1 + 1;
-
-        uint256 k1 = _computeKFromL(aFixed, b1, lWad, aWad, lambdaWad);
-
-        uint256 bBest = b1;
-        uint256 residualAbsBest = k1 >= kTarget ? k1 - kTarget : kTarget - k1;
-
-        for (uint256 i = 0; i < _MAX_SECANT_ITER; ++i) {
-            uint256 k2 = _computeKFromL(aFixed, b2, lWad, aWad, lambdaWad);
-            if (k2 == kTarget) {
-                return (b2, i + 1);
+        uint256 b2;
+        {
+            uint256 step = bSeed / 1000;
+            assembly ("memory-safe") {
+                step := or(step, iszero(step))
             }
+            b2 = bSeed > step ? bSeed - step : bSeed + step;
+            // A lower point reduces the product, but can increase |fixed-b|.
+            // At that opposite square boundary retain the original upper side.
+            if (c.fixedAxis >= Q128 && b2 <= c.fixedAxis - Q128) b2 = bSeed + step;
+        }
+        uint256 k1 = _solverK(c, b1);
+        uint256 kBest = k1;
+        uint256 bBest = b1;
+        uint256 residualAbsBest = k1 >= c.target ? k1 - c.target : c.target - k1;
 
-            // `residMag` doubles as the best-iterate residual and the
-            // secant numerator below — one computation serves both.
-            bool residPos = k2 >= kTarget;
+        for (; iters < _MAX_SECANT_ITER; ) {
+            ++iters;
+            uint256 k2 = _solverK(c, b2);
+            if (k2 == c.target) return (b2, iters);
+
+            bool residPos = k2 >= c.target;
             uint256 residMag;
             unchecked {
-                residMag = residPos ? k2 - kTarget : kTarget - k2;
+                residMag = residPos ? k2 - c.target : c.target - k2;
             }
             if (residMag < residualAbsBest) {
                 bBest = b2;
                 residualAbsBest = residMag;
+                kBest = k2;
             }
 
-            // Signed secant step `step = (residual · db) / dk`, computed
-            // over magnitudes with a 512-bit `fullMulDiv` so the
-            // `residual · db` product can never overflow on large pools
-            // (the quotient always fits; the naive `int256` product
-            // reverts once |residual·db| ≥ 2²⁵⁵, which is reachable below
-            // the uint128 reserve cap). Sign is tracked separately. This
-            // mirrors the Rust reference `solve_counterpart` bit-for-bit
-            // (`mul_div_floor` over magnitudes + boolean sign XOR), so
-            // the parity suite stays green and large pools no longer DoS.
-            // Scoped: keeps the frame within the 16-slot legacy-codegen
-            // stack limit (coverage builds compile without viaIR).
             uint256 b3u;
             {
                 bool dkPos = k2 >= k1;
@@ -989,56 +674,97 @@ library EquilibraSwapMath {
                     dkMag = dkPos ? k2 - k1 : k1 - k2;
                     dbMag = dbPos ? b2 - b1 : b1 - b2;
                 }
-                if (dkMag == 0) return (b2, i + 1);
-
-                uint256 stepMag = FixedPointMathLib.fullMulDiv(residMag, dbMag, dkMag);
-                // sign(step) = sign(residual·db) ⊕ sign(1/dk)
-                //            = (residPos == dbPos) ⊕ (!dkPos)
-                bool stepPos = (residPos == dbPos) != (!dkPos);
-
-                // b3 = b2 − step, clamped to ≥ 1 on underflow.
-                if (stepPos) {
-                    b3u = b2 > stepMag ? b2 - stepMag : 1;
+                if (dkMag == 0) {
+                    b3u = b2;
                 } else {
-                    b3u = b2 + stepMag;
+                    uint256 stepMag = FixedPointMathLib.fullMulDiv(residMag, dbMag, dkMag);
+                    bool stepPos = (residPos == dbPos) != (!dkPos);
+                    if (stepPos) b3u = b2 > stepMag ? b2 - stepMag : b2 / 2 + 1;
+                    else b3u = b2 + stepMag;
                 }
             }
-            if (b3u == b2) return (b2, i + 1);
+
+            if (b3u == b2) return (b2, iters);
             b1 = b2;
             k1 = k2;
             b2 = b3u;
         }
-        return (bBest, _MAX_SECANT_ITER);
+
+        b = _certifyCounterpart(c, bBest, kBest, _quoteEpsilon(c, bBest, _CAP_QUOTE_EPSILON_DENOM));
+        if (b == 0) revert Errors.SolverDidNotConverge();
+        return (b, iters);
+    }
+
+    /**
+     * @dev Quote K at `(fixedAxis, b)` with the context's depth and curve parameters.
+     */
+    function _solverK(SolverContext memory c, uint256 b) private pure returns (uint256) {
+        return computeQuoteKFromL(c.fixedAxis, b, c.depth, c.a, c.lambda);
+    }
+
+    /**
+     * @dev Amount-based local tolerance with a one-math-unit minimum. For certification the
+     * denominator is `1 + inverse tolerance`, which covers the smaller quote in the bracket:
+     * `epsilon / (quote - epsilon) <= 1 / (denominator - 1)`. The common margin uses the inverse
+     * rate directly and applies to every positive quote.
+     */
+    function _quoteEpsilon(
+        SolverContext memory c,
+        uint256 b,
+        uint256 denominator
+    ) private pure returns (uint256 epsilon) {
+        uint256 amount = c.exactOut
+            ? (b >= c.previous ? b - c.previous : 0)
+            : (b <= c.previous ? c.previous - b : 0);
+        epsilon = amount / denominator;
+        assembly ("memory-safe") {
+            epsilon := or(epsilon, iszero(epsilon))
+        }
+    }
+
+    /**
+     * @dev Certify a cap candidate by bracketing `target` within `epsilon` of `b`; returns `b`
+     * unchanged when confirmed and zero when unresolved. The common margin is applied
+     * separately, exactly once. The local bracket in the Q128-weight quote K is not a global
+     * continuous-root or strict pool-side proof; integer rounding is retained.
+     */
+    function _certifyCounterpart(
+        SolverContext memory c,
+        uint256 b,
+        uint256 k,
+        uint256 epsilon
+    ) internal pure returns (uint256) {
+        if (k == c.target) return b;
+        if (k > c.target) {
+            uint256 low = b > epsilon ? b - epsilon : 1;
+            if (low < b && _solverK(c, low) <= c.target) return b;
+        } else {
+            uint256 high = b + epsilon;
+            if (_solverK(c, high) >= c.target) return b;
+        }
+        return 0;
     }
 
     // =========================================================================
-    // 9. CP-proxy distance predictor (dynamic-fee resolver)
+    // 6. CP-proxy distance predictor (dynamic-fee resolver)
     // =========================================================================
 
-    /// @notice Predict the post-swap math-space distance `D_post` for
-    ///         an exact-in trade using a constant-product proxy.
-    /// @dev    Used by the pool's exact-in dynamic-fee resolver to set
-    ///         the fee rate BEFORE running the actual cubic. The proxy is
-    ///         intentionally cheap, and it can diverge from the true
-    ///         cubic post-state distance in EITHER direction: it tends
-    ///         to *under*-state the distance on plateau / imbalance-
-    ///         increasing trades (the cubic's plateau holds the state
-    ///         closer to balance than constant product predicts, but a
-    ///         D-increasing trade also moves further per unit of input),
-    ///         so the resolved fee can sit below the true-distance fee
-    ///         by a double-digit share of the dynamic range on large
-    ///         (≥5% of reserves) swaps. The gross-vs-clean input bias
-    ///         (~2·fee relative) only partially compensates — the
-    ///         net bias is NOT guaranteed to favour LPs. Bounded
-    ///         consequences: the resolved rate always stays in
-    ///         `[feeFloor, baseFee]`, quote == swap holds, and the
-    ///         exact-out identity is unaffected; the cost is
-    ///         under-collected LP premium on exactly the large trades
-    ///         the ramp targets. See the math audit, finding L-1
-    ///         (accepted).
-    ///
-    ///         Returns 0 when the proxy lands at the diagonal
-    ///         (`yProxy == xPost`) or any reserve is zero.
+    /**
+     * @notice Predict the post-swap math-space distance of an exact-in trade with a
+     * constant-product proxy.
+     * @dev Used by the pool's exact-in dynamic-fee resolver to set the rate before running the
+     * cubic. The proxy can diverge from the true cubic post-state distance in either direction
+     * and tends to understate it on plateau or imbalance-increasing trades, so on large swaps the
+     * resolved fee can sit below the true-distance fee; the resolved rate always stays in
+     * `[feeFloor, baseFee]` and same-state quote equals swap. Returns 0 when the proxy lands on
+     * the diagonal or any reserve is zero. An exhausted proxy or a distance square outside
+     * uint256 saturates at WAD: with `x * y <= uint256.max`, `D >= 1` there and every allowed
+     * ramp is saturated.
+     * @param xMath Pre-state input-side coordinate, WAD.
+     * @param yMath Pre-state output-side coordinate, WAD.
+     * @param dxMathGross Gross input, WAD math units.
+     * @return distPostWad Predicted post-swap distance, WAD.
+     */
     function predictPostDistanceCp(
         uint256 xMath,
         uint256 yMath,
@@ -1050,12 +776,14 @@ library EquilibraSwapMath {
         if (nPre == 0) return 0;
         // yProxy = N_pre · WAD / xPost (single mulDiv keeps single-WAD scale)
         uint256 yProxy = FixedPointMathLib.mulDiv(xMath, yMath, xPost);
-        if (yProxy == 0 || yProxy == xPost) return 0;
+        if (yProxy == 0) return Constants.WAD;
+        if (yProxy == xPost) return 0;
 
         uint256 diff;
         unchecked {
             diff = yProxy > xPost ? yProxy - xPost : xPost - yProxy;
         }
+        if (diff >= Q128) return Constants.WAD;
         uint256 diffSqWad = FixedPointMathLib.mulWad(diff, diff);
         uint256 denomWad = FixedPointMathLib.mulWad(xPost, yProxy);
         if (denomWad == 0) return 0;
@@ -1063,40 +791,28 @@ library EquilibraSwapMath {
     }
 
     // =========================================================================
-    // 10. Smoothstep dynamic-fee ramp
+    // 7. Smoothstep dynamic-fee ramp
     // =========================================================================
 
-    /// @notice Smoothstep dynamic-fee ramp: the WAD-scale fee rate
-    ///         climbs from `floorWad` to `feeCeilingWad` via
-    ///         `m(r) = 2r − r²` with `r = distPostWad / rampDistWad`.
-    /// @dev    Shape is C¹-continuous (`m'(0) = 2`, `m'(1) = 0`).
-    ///         Rates are WAD fractions (`1 bps == 1e14`); resolving at
-    ///         WAD rather than integer-bps precision keeps the
-    ///         gross → clean-input map monotone up to a dust residual
-    ///         on the order of `gross / 1e18` wei per rate step (the
-    ///         inputs `distPostWad` and `r` are WAD-quantized too, so
-    ///         one input wei can cross several rate ulps at once).
-    ///         Disabled paths return `feeCeilingWad`
-    ///         unchanged:
-    ///           • `rampDistWad == 0`        — pool opted out of ramp
-    ///           • `feeCeilingWad <= floor`  — ceiling not strictly
-    ///                                          above floor
-    ///           • `distPostWad >= ramp`     — saturated
-    ///
-    ///         **Splittable by design (accepted).** The fee is a function
-    ///         of the *instantaneous* post-swap distance, charged on each
-    ///         leg's own input, so it is **marginal**, not cumulative: a
-    ///         directional trade split into N legs pays the area under the
-    ///         rising `f(D)` curve, whereas one swap of the same notional
-    ///         pays the rectangle `f(D_final)·total ≥ that area`. Splitting
-    ///         is therefore strictly cheaper (≈ 30–40 % of the dynamic
-    ///         premium at ~32 legs). This is inherent to any
-    ///         instantaneous-state fee and is NOT an LP
-    ///         drain — the per-leg integral is the marginal-cost-fair
-    ///         charge, while a single swap merely over-charges the early
-    ///         units; the only consistent non-splittable fee is that same
-    ///         integral, which would lower fees for everyone. The behaviour
-    ///         is pinned by `test/security/DynamicFeeSplittability.test.ts`.
+    /**
+     * @notice Smoothstep dynamic-fee rate: climbs from `floorWad` to `feeCeilingWad` along
+     * `m(r) = 2r - r^2` with `r = distPostWad / rampDistWad`.
+     * @dev The shape is C1-continuous (`m'(0) = 2`, `m'(1) = 0`). Rates are WAD fractions
+     * (1 bps = 1e14); resolving at WAD precision keeps the gross to clean-input map monotone up
+     * to a dust residual on the order of `gross / 1e18` per rate step (the inputs are
+     * WAD-quantised, so one input wei can cross several rate ulps). Returns `feeCeilingWad`
+     * unchanged when `rampDistWad == 0` (ramp disabled), `feeCeilingWad <= floorWad` or
+     * `distPostWad >= rampDistWad` (saturated). The fee is marginal, not cumulative: it depends
+     * on the instantaneous post-swap distance and is charged on each leg's own input, so a
+     * directional trade split into legs pays the area under the rising curve while one swap pays
+     * the rectangle `f(D_final) * total`. Splitting is cheaper by construction; the per-leg
+     * integral is the marginal-cost-fair charge.
+     * @param distPostWad Post-swap state distance, WAD.
+     * @param rampDistWad Ramp width, WAD; zero disables the ramp.
+     * @param floorWad Fee floor rate, WAD.
+     * @param feeCeilingWad Fee ceiling rate, WAD.
+     * @return feeWad Resolved fee rate, WAD.
+     */
     function smoothstepFeeWad(
         uint256 distPostWad,
         uint256 rampDistWad,
@@ -1118,31 +834,28 @@ library EquilibraSwapMath {
     }
 
     // =========================================================================
-    // 11. V3-compat (sqrtPriceX96 ↔ math-space marginal price)
+    // 8. V3-compat (sqrtPriceX96 ↔ math-space marginal price)
     // =========================================================================
 
-    /// @notice Convert a V3 `sqrtPriceX96` (Q64.96 of
-    ///         `sqrt(token1/token0)`) into the math-space marginal
-    ///         price `pMargMath` in WAD scale.
-    /// @dev    The conversion sits purely in the coordinate-change
-    ///         layer and is independent of the invariant: spot price
-    ///         in raw token units is recovered from the Q64.96 sqrt,
-    ///         then divided by `priceScale` to project onto the
-    ///         math-space axis where the anchor sits at `WAD`.
-    ///
-    ///         Total over the whole canonical sqrt-ratio domain
-    ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO)`: both poles saturate
-    ///         instead of degenerating, so a caller naming a domain
-    ///         endpoint gets a usable extreme price rather than a
-    ///         revert or an ambiguous zero. Saturation is lossy —
-    ///         every input below `2^48` returns the same maximal price,
-    ///         and inputs past the representable top return `1` wei —
-    ///         but the whole saturated band lies orders of magnitude
-    ///         beyond any reachable pool state, so every value in it
-    ///         resolves to the same answer downstream. Accuracy in the
-    ///         operating range is unaffected (relative error tracks
-    ///         `(2^48 / sqrtPriceX96)²`). The inverse saturates at the
-    ///         matching poles, keeping the pair symmetric.
+    /**
+     * @notice Convert a V3 `sqrtPriceX96` (Q64.96 of `sqrt(token1 / token0)` in raw units) into
+     * the math-space marginal price, WAD.
+     * @dev Pure coordinate change, independent of the invariant: the raw spot is recovered from
+     * the Q64.96 square root, then divided by `priceScale` to project onto the math-space axis
+     * where the anchor sits at `WAD`. Total over `[MIN_SQRT_RATIO, MAX_SQRT_RATIO)`: both poles
+     * saturate instead of degenerating. Every input below `2^48` maps to the same largest
+     * representable math price and inputs past the representable top return 1 wei; the saturated
+     * band lies far beyond any reachable pool state, and the operating range keeps a relative
+     * error on the order of `(2^48 / sqrtPriceX96)^2`. Token scales are positive powers of ten
+     * (0 to 18 decimals); their ratio is reduced before multiplication, and an unrepresentable
+     * final price saturates at `uint256.max`. Reverts `InvalidPriceScale` on a zero anchor and
+     * `MathInvariantViolation` on a zero scale or a zero input.
+     * @param sqrtPriceX96 V3 sqrt price, Q64.96.
+     * @param priceScaleWad Anchor, WAD.
+     * @param token0Scale Token0 decimal scale, `10^(18 - decimals0)`.
+     * @param token1Scale Token1 decimal scale, `10^(18 - decimals1)`.
+     * @return pMargWad Math-space marginal price, WAD, at least 1.
+     */
     function sqrtPriceX96ToMathPriceWad(
         uint160 sqrtPriceX96,
         uint256 priceScaleWad,
@@ -1150,15 +863,12 @@ library EquilibraSwapMath {
         uint256 token1Scale
     ) internal pure returns (uint256 pMargWad) {
         if (priceScaleWad == 0) revert Errors.InvalidPriceScale();
-        if (token1Scale == 0) revert Errors.MathInvariantViolation();
+        if (token0Scale == 0 || token1Scale == 0) revert Errors.MathInvariantViolation();
         if (sqrtPriceX96 == 0) revert Errors.MathInvariantViolation();
         uint256 sp = uint256(sqrtPriceX96);
-        uint256 priceQ96 = FixedPointMathLib.fullMulDiv(sp, sp, 1 << 96);
-        // Saturate instead of failing at the low pole: `sqrtPriceX96 <
-        // 2^48` squares below the Q96 unit, so the quotient floors to
-        // zero. Pinning it to the smallest representable Q96 price maps
-        // that whole band to the largest representable math price —
-        // the intent of a caller naming a sub-representable target.
+        uint256 priceQ96 = FixedPointMathLib.fullMulDivN(sp, sp, 96);
+        // Low pole: below 2^48 the square floors to zero. Pinning it to the smallest Q96 price
+        // maps that whole band to the largest representable math price.
         assembly ("memory-safe") {
             priceQ96 := or(priceQ96, iszero(priceQ96))
         }
@@ -1166,46 +876,141 @@ library EquilibraSwapMath {
         // pMargWad = WAD² · t0Scale · 2^96 / (priceQ96 · t1Scale · priceScale)
         //          = (WAD_SQ_X96 / priceQ96) · t0Scale / t1Scale / priceScale
         uint256 num = Constants.WAD_SQ_X96 / priceQ96;
-        uint256 stage = FixedPointMathLib.fullMulDiv(num, token0Scale, token1Scale);
-        pMargWad = stage / priceScaleWad;
-        // Mirror at the high pole: a target far above the representable
-        // range floors the cascade to zero, which callers cannot tell
-        // apart from "no admissible quote". One wei keeps it a price.
+        if (token0Scale >= token1Scale) {
+            uint256 scale = token0Scale / token1Scale;
+            if (
+                scale > priceScaleWad &&
+                num > FixedPointMathLib.fullMulDiv(type(uint256).max, priceScaleWad, scale)
+            ) return type(uint256).max;
+            pMargWad = FixedPointMathLib.fullMulDiv(num, scale, priceScaleWad);
+        } else {
+            pMargWad = num / (token1Scale / token0Scale) / priceScaleWad;
+        }
+        // High pole: a target far above the representable range floors to zero, which callers
+        // could not tell apart from "no admissible quote". One wei keeps it a price.
         assembly ("memory-safe") {
             pMargWad := or(pMargWad, iszero(pMargWad))
         }
     }
 
-    /// @notice Inverse of `sqrtPriceX96ToMathPriceWad`.
-    /// @dev    The Q64.96 lift is applied BEFORE the scale-ratio
-    ///         division so no precision is lost to early flooring
-    ///         (audit L-10): the previous order floored
-    ///         `numWad · t0Scale / t1Scale` first, costing ~1e-6
-    ///         relative error on 18/6-decimals pairs and collapsing
-    ///         to 0 on 18/0 pairs. `fullMulDiv`'s 512-bit intermediate
-    ///         absorbs the lifted magnitudes.
-    ///
-    ///         The output is clamped into the canonical V3 sqrt-ratio
-    ///         domain `[MIN_SQRT_RATIO, MAX_SQRT_RATIO − 1]` (audit
-    ///         L-11) so TickMath-style consumers never revert on an
-    ///         extreme state; `pMargMathWad == 0` (infinite price)
-    ///         saturates at the upper clamp.
+    /**
+     * @notice Inverse of `sqrtPriceX96ToMathPriceWad`.
+     * @dev The Q64.96 lift is applied before the scale-ratio division so no precision is lost to
+     * early flooring; `fullMulDiv`'s 512-bit intermediate absorbs the lifted magnitudes. The
+     * decimal-scale ratio is reduced before the final lift, and a product outside uint256
+     * already exceeds the canonical upper clamp. The output is clamped into
+     * `[MIN_SQRT_RATIO, MAX_SQRT_RATIO - 1]` so TickMath-style consumers never revert on an
+     * extreme state; `pMargMathWad == 0` (infinite price) saturates at the upper clamp. Reverts
+     * `InvalidPriceScale` on a zero anchor or scale.
+     * @param pMargMathWad Math-space marginal price, WAD.
+     * @param priceScaleWad Anchor, WAD.
+     * @param token0Scale Token0 decimal scale.
+     * @param token1Scale Token1 decimal scale.
+     * @return sqrtPriceX96 Clamped V3 sqrt price, Q64.96.
+     */
     function mathPriceToSqrtPriceX96(
         uint256 pMargMathWad,
         uint256 priceScaleWad,
         uint256 token0Scale,
         uint256 token1Scale
     ) internal pure returns (uint160 sqrtPriceX96) {
-        if (priceScaleWad == 0 || token1Scale == 0) revert Errors.InvalidPriceScale();
+        if (priceScaleWad == 0 || token0Scale == 0 || token1Scale == 0)
+            revert Errors.InvalidPriceScale();
         if (pMargMathWad == 0) return Constants.MAX_SQRT_RATIO_MINUS_ONE;
         uint256 numWad = FixedPointMathLib.fullMulDiv(Constants.WAD, Constants.WAD, pMargMathWad);
         uint256 priceQ96 = FixedPointMathLib.fullMulDiv(numWad, 1 << 96, priceScaleWad);
-        priceQ96 = FixedPointMathLib.fullMulDiv(priceQ96, token0Scale, token1Scale);
+        if (token0Scale >= token1Scale) {
+            uint256 scale = token0Scale / token1Scale;
+            if (priceQ96 > type(uint256).max / scale) return Constants.MAX_SQRT_RATIO_MINUS_ONE;
+            priceQ96 *= scale;
+        } else {
+            priceQ96 /= token1Scale / token0Scale;
+        }
         uint256 sqrtPrice = FixedPointMathLib.sqrt(priceQ96) << 48;
         if (sqrtPrice < Constants.MIN_SQRT_RATIO) return Constants.MIN_SQRT_RATIO;
         if (sqrtPrice > Constants.MAX_SQRT_RATIO_MINUS_ONE) {
             return Constants.MAX_SQRT_RATIO_MINUS_ONE;
         }
         sqrtPriceX96 = uint160(sqrtPrice);
+    }
+
+    /**
+     * @notice Lower-rounded quote K at frozen depth, also evaluated by every secant step.
+     * @dev Depth and weights use Q128; K uses `WAD * 2^18`. Reducing both denominators before
+     * division preserves bits that scaling a rounded WAD K cannot recover. Reverts
+     * `MathOutOfRange` through the weight bound when `x * y` or `(x - y)^2` overflows.
+     * @param x First coordinate, WAD math units.
+     * @param y Second coordinate, WAD math units.
+     * @param depth Frozen depth, Q128.
+     * @param aWad Depth-at-anchor knob, WAD.
+     * @param lambdaWad Plateau-width knob, WAD.
+     * @return Quote K scaled by `WAD * 2^18`; zero when either coordinate is zero.
+     */
+    function computeQuoteKFromL(
+        uint256 x,
+        uint256 y,
+        uint256 depth,
+        uint256 aWad,
+        uint256 lambdaWad
+    ) internal pure returns (uint256) {
+        if (x == 0 || y == 0) return 0;
+        uint256 n = FixedPointMathLib.fullMulDiv(x, y, Constants.WAD >> QUOTE_K_EXTRA_BITS);
+        uint256 h = FixedPointMathLib.fullMulDivN(depth, x + y, 129 - uint8(QUOTE_K_EXTRA_BITS));
+        if (h == n) return n;
+        bool positive = h > n;
+        bool roundUp = !positive;
+        (uint256 theta, uint256 precision) = _tightWeightBound(x, y, aWad, lambdaWad, roundUp);
+        uint256 correction = _directedMulDiv(theta, positive ? h - n : n - h, precision, roundUp);
+        return positive ? n + correction : n - correction;
+    }
+
+    /**
+     * @dev Directed bound of the amplification weight `theta = A / precision` at `(x, y)`,
+     * rounded up when `upper` is true and down otherwise. Precision is Q128, falling back to WAD
+     * at extreme ratios (`(x - y)^2 / (x * y) >= 2^127`) to keep the denominator inside uint256.
+     * Reverts `MathOutOfRange` when `x * y` overflows or `|x - y| >= 2^128`.
+     */
+    function _tightWeightBound(
+        uint256 x,
+        uint256 y,
+        uint256 aWad,
+        uint256 lambdaWad,
+        bool upper
+    ) private pure returns (uint256 theta, uint256 precision) {
+        precision = Q128;
+        if (x == y) return (_directedMulDiv(aWad, precision, Constants.WAD, upper), precision);
+        uint256 difference = x > y ? x - y : y - x;
+        uint256 xy;
+        uint256 square;
+        bool validProducts;
+        // The square fits exactly when difference < 2^128.
+        assembly ("memory-safe") {
+            xy := mul(x, y)
+            validProducts := and(iszero(shr(128, difference)), eq(div(xy, x), y))
+            square := mul(difference, difference)
+        }
+        if (!validProducts) revert Errors.MathOutOfRange();
+        // When square/xy < 2^127, directed D*Q128 < 2^255+1.
+        // For lambda<=W the denominator then fits uint256. Retain the
+        // proven WAD bound at extreme ratios instead of narrowing the domain.
+        if ((square >> 127) >= xy) precision = Constants.WAD;
+        uint256 distance = _directedMulDiv(square, precision, xy, !upper);
+        uint256 denominator = precision +
+            _directedMulDiv(lambdaWad, distance, Constants.WAD, !upper);
+        uint256 anchor = _directedMulDiv(aWad, precision, Constants.WAD, upper);
+        theta = _directedMulDiv(anchor, precision, denominator, upper);
+    }
+
+    /**
+     * @dev `x * y / denominator` rounded up when `upper` is true and down otherwise.
+     */
+    function _directedMulDiv(
+        uint256 x,
+        uint256 y,
+        uint256 denominator,
+        bool upper
+    ) private pure returns (uint256 value) {
+        value = FixedPointMathLib.fullMulDiv(x, y, denominator);
+        if (upper && mulmod(x, y, denominator) != 0) ++value;
     }
 }

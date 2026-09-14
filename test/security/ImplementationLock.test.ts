@@ -62,26 +62,15 @@ describe("EquilibraPool: implementation lock (constructor sentinel)", function (
   it("implementation rejects any direct initialize() call with AlreadyInitialized", async function () {
     const { poolImpl, token0, token1 } = await loadFixture(deployFixture);
 
-    // Decimal-lift scales are pre-computed by the factory in the
-    // production path. The tokens here are 18-decimal mocks, so the
-    // lift collapses to `10**(18-18) == 1`.
+    // Packed words need not be valid here: the constructor sentinel
+    // must reject the call before any initializer body executes.
     const params = {
       token0: await token0.getAddress(),
       token1: await token1.getAddress(),
-      token0Scale: 1n,
-      token1Scale: 1n,
-      aWad: PRESET.aWad,
-      lambdaWad: PRESET.lambdaWad,
-      baseFee: 30,
-      emaPeriod: 1200,
-      repegStepWad: hre.ethers.parseUnits("1", 15),
-      repegThresholdToken1UpWad: hre.ethers.parseUnits("1", 15),
-      repegThresholdToken1DownWad: hre.ethers.parseUnits("1", 15),
-      feeRampBps: 0,
-      feeFloorBps: 20,
-      repegShareBps: 5000,
-      protocolFeePercent: 0,
-      pairPoolIndex: 0,
+      feeConfigBits: 0n,
+      scaleRampConfig: 0n,
+      curveConfig: 0n,
+      repegConfig: 0n,
       isPrivate: false,
       lpName: "spoof",
       lpSymbol: "SPF",
@@ -103,8 +92,8 @@ describe("EquilibraPool: implementation lock (constructor sentinel)", function (
     // reverts with `Unauthorized` / `OwnableUnauthorizedAccount`) would
     // surface as a test failure instead of silently re-routing the
     // gate.
-    await expect(poolImpl.connect(owner).setPaused(true)).to.be.revertedWithoutReason();
-    expect(await poolImpl.paused()).to.equal(false);
+    await expect(poolImpl.connect(owner).setPaused(true, false)).to.be.revertedWithoutReason();
+    expect(Array.from(await poolImpl.paused())).to.deep.equal([false, false]);
   });
 
   it("clones are NOT affected by the lock: factory.createPoolAndAddLiquidity() initialises a fresh clone", async function () {
@@ -134,26 +123,16 @@ describe("EquilibraPool: implementation lock (constructor sentinel)", function (
     const poolAddr = await factory.allPools(0);
     const pool = await hre.ethers.getContractAt("EquilibraPool", poolAddr);
     expect((await pool.getPoolMetadata()).factory).to.equal(await factory.getAddress());
-    // Second `initialize()` on the same clone must still revert. Scales
-    // mirror the factory's pre-computed lift for 18-decimal tokens.
+    // Packing fee fields next to `_factory` must not erase the clone's
+    // initialization sentinel. A second initialize must still reject.
     await expect(
       pool.initialize({
         token0: await token0.getAddress(),
         token1: await token1.getAddress(),
-        token0Scale: 1n,
-        token1Scale: 1n,
-        aWad: PRESET.aWad,
-        lambdaWad: PRESET.lambdaWad,
-        baseFee: 30,
-        emaPeriod: 1200,
-        repegStepWad: hre.ethers.parseUnits("1", 15),
-        repegThresholdToken1UpWad: hre.ethers.parseUnits("1", 15),
-        repegThresholdToken1DownWad: hre.ethers.parseUnits("1", 15),
-        feeRampBps: 0,
-        feeFloorBps: 20,
-        repegShareBps: 5000,
-        protocolFeePercent: 0,
-        pairPoolIndex: 0,
+        feeConfigBits: 0n,
+        scaleRampConfig: 0n,
+        curveConfig: 0n,
+        repegConfig: 0n,
         isPrivate: false,
         lpName: "dup",
         lpSymbol: "DUP",
@@ -189,9 +168,9 @@ describe("EquilibraPool: implementation lock (constructor sentinel)", function (
     const poolAddr = await factory.allPools(0);
     const pool = await hre.ethers.getContractAt("EquilibraPool", poolAddr);
 
-    await pool.connect(owner).setPaused(true);
-    expect(await pool.paused()).to.equal(true);
-    await pool.connect(owner).setPaused(false);
-    expect(await pool.paused()).to.equal(false);
+    await pool.connect(owner).setPaused(true, false);
+    expect(Array.from(await pool.paused())).to.deep.equal([true, false]);
+    await pool.connect(owner).setPaused(false, false);
+    expect(Array.from(await pool.paused())).to.deep.equal([false, false]);
   });
 });

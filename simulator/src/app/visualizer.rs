@@ -47,13 +47,12 @@ pub struct VisualizerCurveInput {
 #[serde(rename_all = "camelCase")]
 pub struct VisualizerEquilibraInput {
     /// Depth-at-anchor knob `a` (WAD). On-chain range
-    /// `Constants.A_MIN_WAD..A_MAX_WAD` = `[1e17, 99e16]` (display
-    /// `0.1..0.99`). The visualizer itself accepts the wider research
-    /// band (display `0.01..0.99`) — only the factory enforces the
-    /// production bounds.
+    /// `Constants.A_MIN_WAD..A_MAX_WAD` = `[1e17, WAD-1]`. The preview
+    /// keeps the lower research range but rejects a >= 1 using exact
+    /// integers, before any floating-point display conversion.
     pub a_wad: String,
     /// Plateau-width knob `λ` (WAD). Range
-    /// `Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD` = `[1e15, 1e18]`.
+    /// `Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD` = `[1e12, 1e18]`.
     pub lambda_wad: String,
 }
 
@@ -96,14 +95,9 @@ pub struct VisualizerSeriesResponse {
 
 /// Health of the kernel's secant solver for the requested `(a, λ)`.
 ///
-/// `EquilibraSwapMath._solveCounterpart` seeds its secant with a
-/// constant-product proxy and gives up after a fixed iteration cap,
-/// returning the best iterate seen. On curves whose plateau is still wide
-/// far from the anchor the seed can sit an order of magnitude away from
-/// the root, and the returned iterate then misses it by a percent-scale
-/// margin — which shows up as exact-in output that DECREASES when the
-/// input grows. The miss is always in the pool's favour, so this is a
-/// quote-quality property, not a solvency one.
+/// Off-chain geometry diagnostics, not an LP-value/solvency certificate.
+/// The capped solver may return a fallback. This probe measures its output
+/// shortfall and monotonicity; it does not assume errors favour the pool.
 ///
 /// The probe re-solves the same settlements exactly (bisection on the
 /// depth `L`, which is monotone in the output reserve and constant along
@@ -131,6 +125,9 @@ pub struct VisualizerSolverHealthResponse {
     /// Number of probed quotes and how many regressed against the previous
     /// (smaller) input.
     pub samples: u32,
+    /// Unquotable trials (including zero-output dust), across the corridor
+    /// and imbalance ladder. Request-local only; never a simulation counter.
+    pub rejected_samples: u32,
     pub monotonicity_breaks: u32,
     /// How far one swap may move the price out of a balanced pool while
     /// still settling exactly, as the post-swap price relative to the
@@ -196,9 +193,8 @@ pub struct CoverageBucket {
 ///      accumulation between rows — every row starts from the genesis
 ///      reserves).
 ///
-/// Mirrors `test/math/UsdtWbtcAwayTowardTable.test.ts` semantically but
-/// runs against the synthetic balanced visualiser pool so the same
-/// shape comparison can be surfaced without a Hardhat node.
+/// Runs against the synthetic balanced visualiser pool so the shape
+/// comparison can be surfaced without a Hardhat node.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VisualizerIsolatedSwapsResponse {
@@ -513,6 +509,16 @@ fn parse_u128_decimal(value: &str, field: &str) -> Result<u128> {
         .with_context(|| format!("parse {field} as u128"))
 }
 
+fn parse_equilibra_a_wad(value: &str) -> Result<u128> {
+    let a = parse_u128_decimal(value, "equilibra.aWad")?;
+    if a > crate::app::config::A_MAX_WAD {
+        return Err(anyhow!(
+            "equilibra.aWad must be <= 999999999999999999 (a < 1)"
+        ));
+    }
+    Ok(a)
+}
+
 fn mul_div_u128(a: u128, b: u128, denominator: u128, field: &str) -> Result<u128> {
     if denominator == 0 {
         return Err(anyhow!("{field}: denominator is zero"));
@@ -613,18 +619,62 @@ fn quote_exact_input_for_amm(
     amm_state.quote_exact_input(quoter, token_in, amount_in)
 }
 
-/// Best-effort quote: returns `None` when the underlying kernel rejects the
-/// amount (e.g. numerically unsafe inputs that would overflow the 512→256 bit
-/// reduction inside `predict_target_price_exact_in` for small-decimal assets
-/// such as WBTC). Used by the visualizer solver to skip "physically
-/// unreachable" sample points rather than aborting the whole series.
+/// Only explicit trade-domain refusals are unavailable samples. Arithmetic,
+/// invalid configuration/state and unknown failures must remain visible errors.
+fn expected_equilibra_trial_rejection(error: &anyhow::Error) -> bool {
+    matches!(
+        error.root_cause().to_string().as_str(),
+        "equilibra_stateful: amountInMath zero"
+            | "equilibra_stateful: amountOutMath zero"
+            | "equilibra_stateful: amount_too_small_after_normalization"
+            | "equilibra_swap_stateful_insufficient_liquidity"
+            | "equilibra_stateful: insufficient liquidity"
+            | "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity)"
+            | "equilibra_math: SolverDidNotConverge"
+            | "equilibra_stateful: LpValueDecreased"
+    )
+}
+
+fn recover_visualizer_trial<T>(
+    amm_state: &VisualizerAmmState,
+    result: Result<T>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let expected = match amm_state {
+                VisualizerAmmState::Equilibra { .. } => expected_equilibra_trial_rejection(&error),
+                VisualizerAmmState::Curve { .. } => matches!(
+                    error.root_cause().to_string().as_str(),
+                    "curve_exchange_dust"
+                        | "StableswapMath get_y did not converge"
+                        | "newton_y_twocrypto did not converge"
+                        | "get_y_twocrypto unsafe values x[i]"
+                        | "newton_y_twocrypto unsafe values x[i]"
+                        | "get_y_twocrypto unsafe value for y"
+                ),
+                VisualizerAmmState::UniswapV2 { .. } => {
+                    error.root_cause().to_string() == "uniswap_v2_insufficient_output"
+                }
+            };
+            if expected && amm_state.reserve0() > 0 && amm_state.reserve1() > 0 {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A refused amount is not a successful zero quote.
 fn try_quote_exact_input_for_amm(
     quoter: &mut LocalQuoter,
     amm_state: &VisualizerAmmState,
     token_in: &str,
     amount_in: u128,
-) -> Option<u128> {
-    quote_exact_input_for_amm(quoter, amm_state, token_in, amount_in).ok()
+) -> Result<Option<u128>> {
+    let result = quote_exact_input_for_amm(quoter, amm_state, token_in, amount_in);
+    recover_visualizer_trial(amm_state, result)
 }
 
 fn find_amount_in_for_target_out(
@@ -653,13 +703,12 @@ fn find_amount_in_for_target_out(
         1
     };
 
-    // Bracket `hi` upward. If the initial estimate is already rejected by the
-    // kernel (huge raw amount × small-decimal scale → 512→256 overflow in
-    // `predict_target_price`), halve it until we find a quotable amount.
+    // Bracket `hi` upward. If the initial estimate is a known trade refusal,
+    // halve it until we find a quotable amount. Unexpected failures propagate.
     // `(best_hi, best_out)` retains the largest quotable sample so a later
     // rejection does not erase partial progress.
     let (mut best_hi, mut best_out, mut out_hi) =
-        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, hi) {
+        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, hi)? {
             Some(v) => (hi, v, v),
             None => {
                 let mut fallback = hi;
@@ -670,7 +719,7 @@ fn find_amount_in_for_target_out(
                         break;
                     }
                     if let Some(v) =
-                        try_quote_exact_input_for_amm(quoter, amm_state, token_in, fallback)
+                        try_quote_exact_input_for_amm(quoter, amm_state, token_in, fallback)?
                     {
                         found = Some((fallback, v));
                         break;
@@ -705,7 +754,7 @@ fn find_amount_in_for_target_out(
                 reached: best_out >= target_out,
             });
         }
-        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, next_hi) {
+        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, next_hi)? {
             Some(v) => {
                 hi = next_hi;
                 out_hi = v;
@@ -739,7 +788,7 @@ fn find_amount_in_for_target_out(
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, mid) {
+        match try_quote_exact_input_for_amm(quoter, amm_state, token_in, mid)? {
             Some(out_mid) => {
                 if out_mid >= target_out {
                     hi = mid;
@@ -756,17 +805,18 @@ fn find_amount_in_for_target_out(
     }
 
     let out_lo = if lo > 0 {
-        try_quote_exact_input_for_amm(quoter, amm_state, token_in, lo).unwrap_or(0)
+        try_quote_exact_input_for_amm(quoter, amm_state, token_in, lo)?
     } else {
-        0
+        None
     };
-    let out_at_hi = match try_quote_exact_input_for_amm(quoter, amm_state, token_in, hi) {
-        Some(v) => v,
-        None => best_out,
+    // Keep the input and output from the same successful quote. A rejected
+    // high boundary must never be paired with a different trial's output.
+    let (hi, out_at_hi) = match try_quote_exact_input_for_amm(quoter, amm_state, token_in, hi)? {
+        Some(v) => (hi, v),
+        None => (best_hi, best_out),
     };
-    let err_lo = out_lo.abs_diff(target_out);
     let err_hi = out_at_hi.abs_diff(target_out);
-    if err_lo <= err_hi && lo > 0 {
+    if let Some(out_lo) = out_lo.filter(|out| out.abs_diff(target_out) <= err_hi) {
         Ok(TradeSolve {
             amount_in: lo,
             amount_out: out_lo,
@@ -1068,16 +1118,20 @@ fn sample_penalty_at_d_bps(
     base_reserve_out: u128,
     probe_in: u128,
     d_bps: u64,
-) -> SeriesPoint {
+) -> Result<SeriesPoint> {
     let token_in = TOKEN0;
     if let VisualizerAmmState::Equilibra { config, state } = quote_state {
-        let rate = equilibra_viz_marginal_at_depletion(config, state, d_bps).unwrap_or(0);
+        let rate = recover_visualizer_trial(
+            quote_state,
+            equilibra_viz_marginal_at_depletion(config, state, d_bps),
+        )?
+        .unwrap_or(0);
         let penalty = if rate > 0 {
             (base_rate.saturating_mul(PENALTY_SCALE) / rate) as f64 / PENALTY_SCALE as f64 - 1.0
         } else {
             f64::INFINITY
         };
-        return SeriesPoint {
+        return Ok(SeriesPoint {
             d_bps,
             penalty: if penalty.is_finite() {
                 penalty.max(0.0)
@@ -1085,59 +1139,42 @@ fn sample_penalty_at_d_bps(
                 f64::INFINITY
             },
             liquidity: 0.0,
-        };
+        });
     }
 
     let mut sim_state = quote_state.clone();
     let target_out = base_reserve_out.saturating_mul(BPS.saturating_sub(d_bps as u128)) / BPS;
     if base_reserve_out > target_out {
         let need_out = base_reserve_out - target_out;
-        let solved = match find_amount_in_for_target_out(
+        let solved = find_amount_in_for_target_out(
             quoter,
             &sim_state,
             token_in,
             base_reserve_in,
             base_reserve_out,
             need_out,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return SeriesPoint {
-                    d_bps,
-                    penalty: f64::INFINITY,
-                    liquidity: 0.0,
-                };
-            }
-        };
+        )?;
         if !solved.reached {
-            return SeriesPoint {
+            return Ok(SeriesPoint {
                 d_bps,
                 penalty: f64::INFINITY,
                 liquidity: 0.0,
-            };
+            });
         }
         // `settle_swap` deliberately leaves Curve's cached D unchanged.
-        if sim_state
-            .settle_swap(true, solved.amount_in, solved.amount_out)
-            .is_err()
-        {
-            return SeriesPoint {
-                d_bps,
-                penalty: f64::INFINITY,
-                liquidity: 0.0,
-            };
-        }
+        sim_state.settle_swap(true, solved.amount_in, solved.amount_out)?;
     }
-    let rate = match scaled_rate_from_quote(quoter, &sim_state, token_in, probe_in) {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
+    let rate = recover_visualizer_trial(
+        &sim_state,
+        scaled_rate_from_quote(quoter, &sim_state, token_in, probe_in),
+    )?
+    .unwrap_or(0);
     let penalty = if rate > 0 {
         (base_rate.saturating_mul(PENALTY_SCALE) / rate) as f64 / PENALTY_SCALE as f64 - 1.0
     } else {
         f64::INFINITY
     };
-    SeriesPoint {
+    Ok(SeriesPoint {
         d_bps,
         penalty: if penalty.is_finite() {
             penalty.max(0.0)
@@ -1145,7 +1182,7 @@ fn sample_penalty_at_d_bps(
             f64::INFINITY
         },
         liquidity: 0.0,
-    }
+    })
 }
 
 /// Sample (penalty, liquidity-placeholder) at every d_bps in `grid` using the
@@ -1164,12 +1201,13 @@ fn sample_uniform_at_grid(
     let base_reserve_out = quote_state.reserve1();
     let probe_in = (base_reserve_in / 1_000_000).max(1);
     // Equilibra uses its analytic derivative; secondary AMMs retain a tiny
-    // fee-free quote probe. A failed baseline produces an all-unreachable
-    // series rather than a 400 while the user tweaks parameters.
-    let base_rate = match marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in) {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
+    // fee-free quote probe. Only a known refused baseline is unavailable;
+    // invalid configuration and arithmetic failures still abort the request.
+    let base_rate = recover_visualizer_trial(
+        baseline_state,
+        marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in),
+    )?
+    .unwrap_or(0);
     if base_rate == 0 {
         return Ok(grid
             .iter()
@@ -1191,7 +1229,7 @@ fn sample_uniform_at_grid(
             base_reserve_out,
             probe_in,
             d_bps,
-        ));
+        )?);
     }
     Ok(points)
 }
@@ -1220,10 +1258,11 @@ fn adaptive_refine_points(
     let base_reserve_in = quote_state.reserve0();
     let base_reserve_out = quote_state.reserve1();
     let probe_in = (base_reserve_in / 1_000_000).max(1);
-    let base_rate = match marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in) {
-        Ok(v) => v,
-        Err(_) => return Ok(points),
-    };
+    let base_rate = recover_visualizer_trial(
+        baseline_state,
+        marginal_rate_for_sampling(quoter, baseline_state, token_in, probe_in),
+    )?
+    .unwrap_or(0);
     if base_rate == 0 {
         return Ok(points);
     }
@@ -1262,7 +1301,7 @@ fn adaptive_refine_points(
                 base_reserve_out,
                 probe_in,
                 mid_bps,
-            ));
+            )?);
         }
         points.append(&mut additions);
         points.sort_by_key(|p| p.d_bps);
@@ -1395,8 +1434,8 @@ struct RoundTripLeg {
 
 /// Settle a forward `token1 → token0` swap onto a cloned AMM state and
 /// produce the reverse-leg quote + post-fwd marginal price. Returns
-/// `None` for any failure (kernel rejection, overflow on update,
-/// negative reserves) so the caller can render `-` for that AMM.
+/// `None` for a known trade refusal or unquotable dust; arithmetic/state
+/// failures propagate instead of silently removing a table cell.
 ///
 /// The reverse leg uses the *same* `fwd_out` as its `amount_in` —
 /// (immediately after that swap, on the saved state, swap the received
@@ -1409,41 +1448,50 @@ fn run_round_trip_for_amm(
     fwd_amount_out: u128,
     token0_decimals: u32,
     token1_decimals: u32,
-) -> Option<RoundTripLeg> {
+) -> Result<Option<RoundTripLeg>> {
     if fwd_amount_in == 0 || fwd_amount_out == 0 {
-        return None;
+        return Ok(None);
     }
     let mut post = base_state.clone();
     // Forward leg was token1 → token0, so `zero_for_one = false`.
     // `settle_swap` (vs raw `update_after_swap`) is needed for Curve:
     // it deliberately skips recomputing `D`, since the liquidity
     // invariant must persist across swaps.
-    post.settle_swap(false, fwd_amount_in, fwd_amount_out)
-        .ok()?;
+    post.settle_swap(false, fwd_amount_in, fwd_amount_out)?;
 
-    let rev_back_raw = post
-        .quote_exact_input(quoter, TOKEN0, fwd_amount_out)
-        .ok()?;
+    let Some(rev_back_raw) = try_quote_exact_input_for_amm(quoter, &post, TOKEN0, fwd_amount_out)?
+        .filter(|out| *out > 0)
+    else {
+        return Ok(None);
+    };
 
     // Marginal price on the post-fwd state via a tiny token0 probe.
     // Uses the same probe sizing (`reserve0 / 1e6`, floor 1) as the
     // slippage-curve sampler so the displayed pMarg is consistent with
     // the chart's measured base rate.
     let probe_in = (post.reserve0() / 1_000_000).max(1);
-    let probe_out = post.quote_exact_input(quoter, TOKEN0, probe_in).ok()?;
-    let probe_in_h = raw_to_human(probe_in, token0_decimals)?;
-    let probe_out_h = raw_to_human(probe_out, token1_decimals)?;
+    let Some(probe_out) =
+        try_quote_exact_input_for_amm(quoter, &post, TOKEN0, probe_in)?.filter(|out| *out > 0)
+    else {
+        return Ok(None);
+    };
+    let Some(probe_in_h) = raw_to_human(probe_in, token0_decimals) else {
+        return Ok(None);
+    };
+    let Some(probe_out_h) = raw_to_human(probe_out, token1_decimals) else {
+        return Ok(None);
+    };
     let pmarg_post_fwd = if probe_in_h > 0.0 {
         probe_out_h / probe_in_h
     } else {
-        return None;
+        return Ok(None);
     };
 
-    Some(RoundTripLeg {
+    Ok(Some(RoundTripLeg {
         fwd_out_raw: fwd_amount_out,
         rev_back_raw,
         pmarg_post_fwd,
-    })
+    }))
 }
 
 /// Build the round-trip probe table. Each row swaps `pct% × reserve1`
@@ -1506,15 +1554,12 @@ fn build_isolated_swaps(
         // Forward leg: same `amount_in_raw` for every AMM. Each one
         // returns a different `fwd_out_raw` according to its curve
         // shape — that's the comparison signal we want.
-        let eq_fwd_out_raw = eq_state
-            .quote_exact_input(quoter, TOKEN1, amount_in_raw)
-            .ok();
-        let uni_fwd_out_raw = uni_state
-            .quote_exact_input(quoter, TOKEN1, amount_in_raw)
-            .ok();
-        let curve_fwd_out_raw = curve_state
-            .quote_exact_input(quoter, TOKEN1, amount_in_raw)
-            .ok();
+        let eq_fwd_out_raw =
+            try_quote_exact_input_for_amm(quoter, eq_state, TOKEN1, amount_in_raw)?;
+        let uni_fwd_out_raw =
+            try_quote_exact_input_for_amm(quoter, uni_state, TOKEN1, amount_in_raw)?;
+        let curve_fwd_out_raw =
+            try_quote_exact_input_for_amm(quoter, curve_state, TOKEN1, amount_in_raw)?;
 
         // Settle + reverse + post-fwd pMarg per AMM. Each call clones
         // its own state, so there's no cross-AMM contamination.
@@ -1526,7 +1571,7 @@ fn build_isolated_swaps(
                 o,
                 token0_decimals,
                 token1_decimals,
-            ),
+            )?,
             _ => None,
         };
         let uni_leg = match uni_fwd_out_raw {
@@ -1537,7 +1582,7 @@ fn build_isolated_swaps(
                 o,
                 token0_decimals,
                 token1_decimals,
-            ),
+            )?,
             _ => None,
         };
         let curve_leg = match curve_fwd_out_raw {
@@ -1548,7 +1593,7 @@ fn build_isolated_swaps(
                 o,
                 token0_decimals,
                 token1_decimals,
-            ),
+            )?,
             _ => None,
         };
 
@@ -1596,9 +1641,8 @@ fn build_isolated_swaps(
 /// real pool carries.
 const SOLVER_HEALTH_SCALE: u128 = 1_000_000_000_000_000_000_000_000;
 
-/// Below this the solver is exact for practical purposes — converged
-/// configurations land many orders of magnitude under it (the shipped
-/// presets measure a flat zero).
+/// Diagnostic display threshold for sampled output shortfall, including
+/// the common quote margin. This is not the solver acceptance tolerance.
 const SOLVER_HEALTH_OK_PCT: f64 = 0.01;
 
 /// At or above this the miss is large enough to matter to a taker on its
@@ -1647,12 +1691,21 @@ pub fn check_solver_health(
     a_wad: U256,
     lambda_wad: U256,
 ) -> Result<VisualizerSolverHealthResponse> {
+    check_solver_health_with_quote(a_wad, lambda_wad, equilibra_math::quote_exact_in_forward)
+}
+
+fn check_solver_health_with_quote(
+    a_wad: U256,
+    lambda_wad: U256,
+    mut quote: impl FnMut(U256, U256, U256, U256, U256) -> Result<(U256, u32)>,
+) -> Result<VisualizerSolverHealthResponse> {
     let x = U256::from(SOLVER_HEALTH_SCALE);
     let mut worst_error_pct = 0.0f64;
     let mut worst_input_ratio: Option<f64> = None;
     let mut worst_imbalance: Option<f64> = None;
     let mut first_bad_input_ratio: Option<f64> = None;
     let mut samples: u32 = 0;
+    let mut rejected_samples: u32 = 0;
     let mut monotonicity_breaks: u32 = 0;
 
     // Corridor walk: out of a balanced pool, growing the trade until the
@@ -1666,9 +1719,16 @@ pub fn check_solver_health(
             let mut permille = 500u64;
             while permille <= 3_000 {
                 let dx = x * U256::from(permille) / U256::from(1_000u64);
-                let (quoted, _) =
-                    equilibra_math::quote_exact_in_forward(x, x, dx, a_wad, lambda_wad)?;
+                let quoted = match quote(x, x, dx, a_wad, lambda_wad) {
+                    Ok((value, _)) => value,
+                    Err(error) if expected_equilibra_trial_rejection(&error) => {
+                        rejected_samples += 1;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if quoted.is_zero() || quoted >= x {
+                    rejected_samples += 1;
                     break;
                 }
                 let exact_y = exact_counterpart(x + dx, l_pre, x, a_wad, lambda_wad)?;
@@ -1680,9 +1740,9 @@ pub fn check_solver_health(
                 // mis-solved quote would settle at, which reads higher purely
                 // because the output came up short.
                 let post_price =
-                    equilibra_math::marginal_price_from_state(x + dx, exact_y, a_wad, lambda_wad)
-                        .map(|p| p.as_u128() as f64 / 1e18f64)
-                        .unwrap_or(f64::NAN);
+                    equilibra_math::marginal_price_from_state(x + dx, exact_y, a_wad, lambda_wad)?
+                        .as_u128() as f64
+                        / 1e18f64;
                 let failed = exact_out > quoted
                     && ((exact_out - quoted) * U256::from(1_000_000u64) / exact_out).as_u128()
                         as f64
@@ -1717,9 +1777,17 @@ pub fn check_solver_health(
             if dx.is_zero() {
                 continue;
             }
-            let (quoted, _) = equilibra_math::quote_exact_in_forward(x, y, dx, a_wad, lambda_wad)?;
+            let quoted = match quote(x, y, dx, a_wad, lambda_wad) {
+                Ok((value, _)) => value,
+                Err(error) if expected_equilibra_trial_rejection(&error) => {
+                    rejected_samples += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             // Zero is the kernel's documented unquotable-dust sentinel.
             if quoted.is_zero() {
+                rejected_samples += 1;
                 continue;
             }
             samples += 1;
@@ -1754,7 +1822,11 @@ pub fn check_solver_health(
         }
     }
 
-    let status = if monotonicity_breaks > 0 || worst_error_pct >= SOLVER_HEALTH_BAD_PCT {
+    let status = if rejected_samples > 0
+        || samples == 0
+        || monotonicity_breaks > 0
+        || worst_error_pct >= SOLVER_HEALTH_BAD_PCT
+    {
         "bad"
     } else if worst_error_pct > SOLVER_HEALTH_OK_PCT {
         "warn"
@@ -1769,6 +1841,7 @@ pub fn check_solver_health(
         worst_imbalance,
         first_bad_input_ratio,
         samples,
+        rejected_samples,
         monotonicity_breaks,
         safe_price_low,
         first_bad_price,
@@ -1822,7 +1895,7 @@ pub fn build_visualizer_series(raw_request: Value) -> Result<VisualizerSeriesRes
         "reserve0 base construction",
     )?;
 
-    let eq_a_wad = parse_u128_decimal(&req.equilibra.a_wad, "equilibra.aWad")?;
+    let eq_a_wad = parse_equilibra_a_wad(&req.equilibra.a_wad)?;
     let eq_lambda_wad = parse_u128_decimal(&req.equilibra.lambda_wad, "equilibra.lambdaWad")?;
 
     // Genesis: priceScale = (r0·t0Scale) / (r1·t1Scale) = yWad / xWad
@@ -2020,6 +2093,96 @@ pub fn build_visualizer_series(raw_request: Value) -> Result<VisualizerSeriesRes
 mod tests {
     use super::*;
 
+    #[test]
+    fn preview_trial_refusals_are_narrow_and_never_zero_quotes() {
+        let (state, _, _) = equilibra_corner_state();
+        for reason in [
+            "equilibra_math: SolverDidNotConverge",
+            "equilibra_stateful: amount_too_small_after_normalization",
+            "equilibra_stateful: amountInMath zero",
+            "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity)",
+        ] {
+            let result: Result<u128> = Err(anyhow!(reason)).context("preview trial");
+            assert_eq!(recover_visualizer_trial(&state, result).unwrap(), None);
+        }
+        for reason in [
+            "equilibra_math: u512→u256 overflow",
+            "equilibra_math: zero priceScale",
+            "equilibra_stateful: empty math state",
+            "equilibra_math: SolverDidNotConverge: unexpected detail",
+            "get_y_twocrypto unsafe values x[i]",
+            "unexpected quote failure",
+            "equilibra_math: quoteExactOutForward dy >= y (insufficient liquidity): unexpected detail",
+        ] {
+            assert!(recover_visualizer_trial::<u128>(&state, Err(anyhow!(reason))).is_err());
+        }
+        assert_eq!(
+            recover_visualizer_trial(&state, Ok(42u128)).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn rejected_health_trials_are_bad_but_unknown_errors_abort() {
+        let a = U256::from(990_000_000_000_000_000u128);
+        let lambda = U256::from(1_000_000_000_000_000u128);
+        // Zero output and expected raw-math solver refusals are unavailable
+        // diagnostic samples, never successful zero-price quotes.
+        for reason in [None, Some("equilibra_math: SolverDidNotConverge")] {
+            let mut calls = 0;
+            let health = check_solver_health_with_quote(a, lambda, |_, _, _, _, _| {
+                calls += 1;
+                match reason {
+                    None => Ok((U256::zero(), 1)),
+                    Some(reason) => Err(anyhow!(reason)),
+                }
+            })
+            .unwrap();
+            assert_eq!(
+                calls, 41,
+                "corridor stops; ladder trials remain independent"
+            );
+            assert_eq!(health.status, "bad");
+            assert_eq!(health.samples, 0);
+            assert_eq!(health.rejected_samples, 41);
+            assert_eq!(health.safe_price_low, None);
+            let json = serde_json::to_value(health).unwrap();
+            assert_eq!(json["rejectedSamples"], 41);
+        }
+        let error = check_solver_health_with_quote(a, lambda, |_, _, _, _, _| {
+            Err(anyhow!("equilibra_math: u512→u256 overflow"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "equilibra_math: u512→u256 overflow");
+    }
+
+    #[test]
+    fn preview_invalid_depletion_and_state_updates_are_not_hidden() {
+        let (state, reserve0, reserve1) = equilibra_corner_state();
+        let mut quoter = LocalQuoter::new();
+        let error = sample_penalty_at_d_bps(&mut quoter, &state, 1, reserve0, reserve1, 1, 10_000)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "equilibra visualizer depletion must be < BPS"
+        );
+        assert!(run_round_trip_for_amm(&mut quoter, &state, 1, reserve0 + 1, 18, 6).is_err());
+    }
+
+    #[test]
+    fn preview_a_upper_bound_does_not_round_to_one() {
+        assert_eq!(
+            parse_equilibra_a_wad("999999999999999999").unwrap(),
+            PRECISION - 1
+        );
+        assert!(parse_equilibra_a_wad("1000000000000000000").is_err());
+        assert!(parse_equilibra_a_wad("1000000000000000001").is_err());
+        assert!(
+            parse_equilibra_a_wad("10000000000000000").is_ok(),
+            "lower research range unchanged"
+        );
+    }
+
     fn point(d_bps: u64, penalty: f64) -> SeriesPoint {
         SeriesPoint {
             d_bps,
@@ -2081,6 +2244,7 @@ mod tests {
                     probe,
                     *d,
                 )
+                .unwrap()
             })
             .collect();
 
@@ -2234,11 +2398,11 @@ mod tests {
         assert_eq!(price_from_penalty_capped(100.0, 1.0, 9_500, 9_000), None);
     }
 
-    /// The shipped presets must read clean, the near-constant-sum corner
-    /// must not, and widening lambda must be enough to leave the region —
-    /// those three facts are what the Curve Lab lamp reports.
+    /// The checked continuation resolves the former deployable corner:
+    /// all forty samples stay monotone and within the 0.01% display threshold.
+    /// The corridor reports the tested extent, not a proved global bound.
     #[test]
-    fn solver_health_separates_the_deployable_corner() {
+    fn solver_health_accepts_the_checked_deployable_corner() {
         let preset = check_solver_health(
             U256::from(909_610_000_000_000_030u128),
             U256::from(16_780_000_000_000_000u128),
@@ -2260,59 +2424,40 @@ mod tests {
             U256::from(1_000_000_000_000_000u128),
         )
         .expect("corner probe");
-        assert_eq!(
-            corner.status, "bad",
-            "a at A_MAX with lambda at LAMBDA_MIN mis-solves large trades"
-        );
-        assert!(
-            corner.monotonicity_breaks > 0,
-            "the corner must show output regressing as input grows"
-        );
-        assert!(
-            corner.worst_error_pct > 1.0,
-            "corner shortfall should be percent-scale, got {}",
-            corner.worst_error_pct
-        );
-        // The failure scales with the OUTPUT-side reserve, so the first
-        // affected size sits at or just above 1.0x of it.
-        let first = corner
-            .first_bad_input_ratio
-            .expect("corner must report a first affected size");
-        assert!(
-            first >= 1.0,
-            "failure must start once the input reaches the output reserve, got {first}"
-        );
+        assert_eq!(corner.status, "ok");
+        assert_eq!(corner.samples, 40);
+        assert_eq!(corner.monotonicity_breaks, 0);
+        // The response rounds percentages to four decimals, so a small
+        // nonzero strict-tolerance error can display as zero.
+        assert!(corner.worst_error_pct >= 0.0);
+        assert!(corner.worst_error_pct <= SOLVER_HEALTH_OK_PCT);
+        if corner.worst_error_pct == 0.0 {
+            assert!(corner.worst_input_ratio.is_none());
+            assert!(corner.worst_imbalance.is_none());
+        } else {
+            assert!(corner.worst_input_ratio.is_some_and(|r| r > 0.0));
+            assert!(corner.worst_imbalance.is_some_and(|r| r > 0.0));
+        }
+        assert!(corner.first_bad_input_ratio.is_none());
 
-        // Same depth-at-anchor, one decade wider plateau: out of the region.
+        // A wider plateau also remains within the configured quote tolerance.
         let widened = check_solver_health(
             U256::from(990_000_000_000_000_000u128),
             U256::from(10_000_000_000_000_000u128),
         )
         .expect("widened probe");
-        assert_ne!(
-            widened.status, "bad",
-            "widening lambda by a decade must clear the hard failure"
-        );
+        assert_eq!(widened.status, "ok");
         assert_eq!(widened.monotonicity_breaks, 0);
 
-        // The corridor is the operator-facing form of the same boundary:
-        // walked out of a balanced pool, quotes stay exact until one swap
-        // pushes the price past it. A curve that fails must report both
-        // edges, ordered; a clean one reports how far it was probed with no
-        // boundary at all.
+        // All sampled balanced-pool trades now converge through the end
+        // of the walk; no first failing price is fabricated.
         let safe = corner
             .safe_price_low
-            .expect("a failing curve must report how far it stayed exact");
-        let boundary = corner
-            .first_bad_price
-            .expect("a failing curve must report where it stops being exact");
+            .expect("the probe must report the last successfully tested price");
+        assert!(corner.first_bad_price.is_none());
         assert!(
-            boundary < safe,
-            "the first mis-solved price {boundary} must sit past the safe edge {safe}"
-        );
-        assert!(
-            safe > 0.0 && safe < 1.0,
-            "the corridor edge is a price below the anchor, got {safe}"
+            safe > 0.001 && safe < 0.0011,
+            "pin the tested low-price extent, got {safe}"
         );
         assert!(
             preset.first_bad_price.is_none(),

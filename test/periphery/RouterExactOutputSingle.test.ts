@@ -267,13 +267,9 @@ describe("Router.exactOutputSingle — input-amount conservation", function () {
         });
 
         it(`round-trip: quoteExactIn(quoteExactOut(out)) >= out - residual (${presetName})`, async function () {
-          // If the resolver under-stated `amountIn` for `out`, then
-          // feeding the (under-stated) `amountIn` back through
-          // `quoteExactIn` would yield strictly less than `out`. This
-          // round-trip is therefore the lower-bound check that
-          // complements the upper-bound `realised <= quoted` envelope:
-          // together they sandwich `quoteExactOut` against the
-          // curve-true minimum.
+          // The common output margin cancels its exact-out trial expansion.
+          // This ordinary fixture allows one output-native unit of solver dust,
+          // not another percentage margin or a universal inversion guarantee.
           const fx = await setupBalanced(presetName);
           const { zeroForOne } = dirAddrs(fx, "quoteToBase");
           const outReserveRaw = fx.initialBaseRaw;
@@ -282,10 +278,7 @@ describe("Router.exactOutputSingle — input-amount conservation", function () {
             if (wantOut === 0n) continue;
             const dx = BigInt(await fx.pool.quoteExactOut(zeroForOne, wantOut));
             const dyBack = BigInt(await fx.pool.quoteExactIn(zeroForOne, dx));
-            // Allow secant residual + ceil-rounding bias: ≤ 1 ppb of
-            // wantOut + 4096 wei. Any larger drift indicates the
-            // resolver under-priced `dx` for `wantOut`.
-            const tol = wantOut / 10n ** 9n + 4_096n;
+            const tol = 1n;
             expect(
               dyBack,
               `${presetName}/${bps}bps: round-trip out=${wantOut} dx=${dx} dyBack=${dyBack}`
@@ -524,7 +517,7 @@ describe("Router.exactOutputSingle — input-amount conservation", function () {
           const preset = EQUILIBRA_PRESETS[presetName];
           // Pin `feeFloorBps` strictly below `baseFee` so the
           // smoothstep ramp always has headroom to interpolate into.
-          // The factory's `FeeRampNoHeadroom` invariant rejects
+          // The factory's `InvalidFeeFloor` invariant rejects
           // `feeRampBps != 0` with `feeFloorBps == baseFee`, which is
           // a sane production guard — but the *purpose* of this test
           // is to stress the non-iterative endpoint-max fee resolver,

@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ORACLE_SNAPSHOT_VERSION: &str = "oracle-snapshot/v1";
 pub const EXECUTION_PROVENANCE_VERSION: &str = "execution-provenance/v1";
-// v2: `resultDigest` is the canonical content digest
-// (`common::canonical_result_digest`) in both report paths.
-pub const REPORT_ALGORITHM_VERSION: &str = "equilibra-report/v2";
+// v3 includes all executed flow in volume and fees; v2 introduced the canonical
+// result content digest (`common::canonical_result_digest`) in both report paths.
+pub const REPORT_ALGORITHM_VERSION: &str = "equilibra-report/v3";
 pub const ORACLE_FILE_NAMES: [&str; 2] = ["btc-usd.json", "eth-usd.json"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +207,41 @@ fn validate_material(material: &ExecutionProvenanceMaterial) -> Result<()> {
             ));
         }
     }
-    verify_oracle_descriptor(&material.oracle_snapshot)
+    verify_oracle_descriptor(&material.oracle_snapshot)?;
+    let expected_names = oracle_file_names_for_bases(&material.effective_options.selected_bases)?;
+    let actual_names = material
+        .oracle_snapshot
+        .files
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect::<Vec<_>>();
+    if actual_names != expected_names {
+        return Err(anyhow!(
+            "oracle snapshot files do not match selected bases: expected {:?}, got {:?}",
+            expected_names,
+            actual_names
+        ));
+    }
+    Ok(())
+}
+
+/// The standalone CLI may run either base without requiring the other feed.
+/// A shared execution manifest still declares the complete parent selection.
+pub fn oracle_file_names_for_bases(bases: &[String]) -> Result<Vec<&'static str>> {
+    if bases.is_empty() {
+        return Err(anyhow!("oracle selection must contain at least one base"));
+    }
+    let mut names = bases
+        .iter()
+        .map(|base| match base.as_str() {
+            "WETH" => Ok("eth-usd.json"),
+            "WBTC" => Ok("btc-usd.json"),
+            _ => Err(anyhow!("unsupported oracle base '{base}'")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
 }
 
 fn verify_oracle_descriptor(snapshot: &OracleSnapshot) -> Result<()> {
@@ -218,20 +252,19 @@ fn verify_oracle_descriptor(snapshot: &OracleSnapshot) -> Result<()> {
             ORACLE_SNAPSHOT_VERSION
         ));
     }
-    let expected_names = ORACLE_FILE_NAMES
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-    let actual_names = snapshot
+    let names = snapshot
         .files
         .iter()
-        .map(|entry| entry.file_name.clone())
+        .map(|entry| entry.file_name.as_str())
         .collect::<Vec<_>>();
-    if actual_names != expected_names {
+    if names.is_empty()
+        || names.iter().any(|name| !ORACLE_FILE_NAMES.contains(name))
+        || names.windows(2).any(|pair| pair[0] >= pair[1])
+    {
         return Err(anyhow!(
-            "oracle snapshot files mismatch: expected {:?}, got {:?}",
-            expected_names,
-            actual_names
+            "oracle snapshot files must be a nonempty sorted unique subset of {:?}, got {:?}",
+            ORACLE_FILE_NAMES,
+            names
         ));
     }
     if snapshot.files.iter().any(|entry| !is_sha256(&entry.sha256))
@@ -302,6 +335,10 @@ pub fn binary_digest(role: &str, path: &Path) -> Result<BinaryArtifactDigest> {
 }
 
 pub fn inspect_oracle_dir(dir: &Path) -> Result<OracleSnapshot> {
+    inspect_oracle_files(dir, &ORACLE_FILE_NAMES)
+}
+
+fn inspect_oracle_files(dir: &Path, names: &[&str]) -> Result<OracleSnapshot> {
     let metadata = fs::symlink_metadata(dir)
         .with_context(|| format!("stat oracle directory {}", dir.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -310,8 +347,8 @@ pub fn inspect_oracle_dir(dir: &Path) -> Result<OracleSnapshot> {
             dir.display()
         ));
     }
-    let mut files = Vec::with_capacity(ORACLE_FILE_NAMES.len());
-    for file_name in ORACLE_FILE_NAMES {
+    let mut files = Vec::with_capacity(names.len());
+    for file_name in names {
         files.push(hash_file(&dir.join(file_name))?);
     }
     let oracle_digest = oracle_digest(&files)?;
@@ -327,16 +364,6 @@ pub fn inspect_oracle_dir(dir: &Path) -> Result<OracleSnapshot> {
 pub fn oracle_snapshot_from_bytes(
     files_by_name: &BTreeMap<String, Vec<u8>>,
 ) -> Result<OracleSnapshot> {
-    let expected_names = ORACLE_FILE_NAMES
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-    if files_by_name.keys().cloned().collect::<Vec<_>>() != expected_names {
-        return Err(anyhow!(
-            "oracle byte inputs must contain exactly {:?}",
-            expected_names
-        ));
-    }
     let files = files_by_name
         .iter()
         .map(|(file_name, bytes)| FileDigest {
@@ -425,7 +452,12 @@ fn hash_directory_tree_filtered(root: &Path, skip_top_level_dir: Option<&str>) -
 
 pub fn verify_oracle_dir(dir: &Path, expected: &OracleSnapshot) -> Result<()> {
     verify_oracle_descriptor(expected)?;
-    let actual = inspect_oracle_dir(dir)?;
+    let names = expected
+        .files
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect::<Vec<_>>();
+    let actual = inspect_oracle_files(dir, &names)?;
     if &actual != expected {
         return Err(anyhow!(
             "oracle snapshot at {} no longer matches its descriptor: expected digest {}, got {}",
@@ -745,6 +777,27 @@ mod tests {
             result_format_version: "result/v1".to_string(),
             report_algorithm_version: REPORT_ALGORITHM_VERSION.to_string(),
         };
+        let mut mismatched = material.clone();
+        mismatched.effective_options.selected_bases = vec!["WBTC".to_string()];
+        assert!(
+            ExecutionProvenance::new(mismatched.clone()).is_err(),
+            "extra declared ETH rejected"
+        );
+        mismatched
+            .oracle_snapshot
+            .files
+            .retain(|entry| entry.file_name == "btc-usd.json");
+        mismatched.oracle_snapshot.oracle_digest =
+            oracle_digest(&mismatched.oracle_snapshot.files).unwrap();
+        ExecutionProvenance::new(mismatched.clone()).expect("matching BTC-only material");
+        mismatched
+            .effective_options
+            .selected_bases
+            .push("WETH".to_string());
+        assert!(
+            ExecutionProvenance::new(mismatched).is_err(),
+            "missing declared ETH rejected"
+        );
         let first = ExecutionProvenance::new(material.clone()).expect("first provenance");
         let mut reordered = material;
         reordered.effective_options.selected_amms.reverse();
@@ -752,6 +805,40 @@ mod tests {
         let second = ExecutionProvenance::new(reordered).expect("second provenance");
         assert_eq!(first.execution_fingerprint, second.execution_fingerprint);
         first.verify().expect("verify fingerprint");
+    }
+
+    #[test]
+    fn oracle_subset_is_strict_and_verifies_only_declared_files() {
+        let root = unique_temp_dir("subset");
+        fs::create_dir_all(&root).expect("create subset fixture");
+        let bytes = b"btc bytes".to_vec();
+        fs::write(root.join("btc-usd.json"), &bytes).expect("write BTC");
+        let mut files = BTreeMap::from([("btc-usd.json".to_string(), bytes)]);
+        let snapshot = oracle_snapshot_from_bytes(&files).expect("BTC-only snapshot");
+        verify_oracle_dir(&root, &snapshot).expect("no ETH needed");
+        assert!(
+            inspect_oracle_dir(&root).is_err(),
+            "full dashboard selection still requires both"
+        );
+        fs::write(root.join("eth-usd.json"), "unrelated").unwrap();
+        verify_oracle_dir(&root, &snapshot).expect("unselected ETH irrelevant");
+        fs::remove_file(root.join("btc-usd.json")).unwrap();
+        assert!(
+            verify_oracle_dir(&root, &snapshot).is_err(),
+            "declared file required"
+        );
+        assert!(oracle_snapshot_from_bytes(&BTreeMap::new()).is_err());
+        files.insert("other.json".to_string(), vec![]);
+        assert!(
+            oracle_snapshot_from_bytes(&files).is_err(),
+            "extra unknown file rejected"
+        );
+        let mut duplicate = snapshot;
+        duplicate.files.push(duplicate.files[0].clone());
+        assert!(verify_oracle_descriptor(&duplicate).is_err());
+        assert!(oracle_file_names_for_bases(&[]).is_err());
+        assert!(oracle_file_names_for_bases(&["ETH".to_string()]).is_err());
+        fs::remove_dir_all(root).expect("cleanup subset");
     }
 
     #[test]

@@ -14,8 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // oracle fixture. Every intentional behaviour, default or result-shape
 // change shifts it: re-record it together with the behavioural asserts
 // below and document the cause in the commit message.
+// Half-step seeding, a common 0.000001% margin, a strict LP guard and persistent
+// unbiased log EMA, token1-up proportional mint payments, sensitive gas-free
+// actors and the 15% / $0.05 flow policy. Actor counts remain unchanged;
+// repeats and shared-manifest shards below must
+// reproduce the rounding-level trajectory changes exactly.
 const EXPECTED_SEMANTIC_SHA256: &str =
-    "611523751a6a5544adb91b2ec885f359ac59d487ccd65dbb6d7d12f5f3ae33a9";
+    "980ab10b03f5d6aaa85a212d5ea6b73908d09cfe3dfd696b2af34f7cdc00c9f2";
 
 fn unique_temp_dir() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -105,6 +110,15 @@ fn deterministic_actor_scenario_matches_golden_trajectory() {
     )
     .expect("write config");
     let raw = run_simulator(&root, &config_path, &fixture_dir(), None, None);
+    let actual: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    eprintln!(
+        "golden semantic SHA-256: {}; results: {}",
+        Sha256::digest(serde_json::to_vec(&semantic_trajectory(&actual)).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        root.join("sim_results.json").display()
+    );
     let results: RunResults = serde_json::from_slice(&raw).expect("parse sim_results");
     validate_run_results_contract(&results).expect("validate result contract");
     assert_eq!(
@@ -136,7 +150,7 @@ fn deterministic_actor_scenario_matches_golden_trajectory() {
     );
     assert_eq!(
         weth_arb.trades.last().expect("last WETH arb").amount_in,
-        "bigint:218283566877"
+        "bigint:217190023770"
     );
     let wbtc_arb = results
         .arb_states
@@ -153,19 +167,18 @@ fn deterministic_actor_scenario_matches_golden_trajectory() {
     // Base-in-slot-0 layout: amount0 is the WETH leg, amount1 the USDT leg.
     assert_eq!(
         weth_lp.final_position.amount0,
-        "bigint:160802361882517624802"
+        "bigint:160011715594985131682"
     );
-    assert_eq!(weth_lp.final_position.amount1, "bigint:557984478599");
+    assert_eq!(weth_lp.final_position.amount1, "bigint:554992569442");
     let wbtc_lp = results
         .passive_lp_states
         .iter()
         .find(|state| state.context_name == "equilibra:WBTC")
         .expect("WBTC passive LP state");
     // Base-in-slot-0 layout: amount0 is the WBTC leg, amount1 the USDT
-    // leg — the values are the bit-exact mirror of the quote-first
-    // layout (no arb trades fire in this context).
+    // leg. Exact positions pin the updated mint rounding even without arb trades.
     assert_eq!(wbtc_lp.final_position.amount0, "bigint:833333377");
-    assert_eq!(wbtc_lp.final_position.amount1, "bigint:500000049399");
+    assert_eq!(wbtc_lp.final_position.amount1, "bigint:500000038200");
 
     let parsed_value = serde_json::from_slice(&raw).expect("parse semantic result value");
     let semantic = semantic_trajectory(&parsed_value);
@@ -247,4 +260,50 @@ fn deterministic_actor_scenario_matches_golden_trajectory() {
 
     fs::remove_dir_all(root).expect("cleanup golden run");
     fs::remove_dir_all(repeat_root).expect("cleanup repeat run");
+}
+
+#[test]
+fn standalone_btc_run_and_report_need_no_eth_feed() {
+    let root = unique_temp_dir();
+    let data = root.join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::copy(
+        fixture_dir().join("btc-usd.json"),
+        data.join("btc-usd.json"),
+    )
+    .unwrap();
+    let config_path = root.join("params.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&golden_config()).unwrap(),
+    )
+    .unwrap();
+    let raw = run_simulator(&root, &config_path, &data, Some("WBTC"), None);
+    let results: RunResults = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(results.contexts.len(), 1);
+    assert_eq!(results.contexts[0].pool_key, "WBTC");
+    let provenance = equilibra_offchain_simulator::app::provenance::load_execution_provenance(
+        &root.join("inputs/execution.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance.material.effective_options.selected_bases,
+        ["WBTC"]
+    );
+    assert_eq!(provenance.material.oracle_snapshot.files.len(), 1);
+    assert_eq!(
+        provenance.material.oracle_snapshot.files[0].file_name,
+        "btc-usd.json"
+    );
+    let report = root.join("report");
+    equilibra_offchain_simulator::report::generate_report_from_results(
+        &root.join("sim_results.json"),
+        &report,
+        &data,
+        &provenance,
+    )
+    .unwrap();
+    assert!(report.join("REPORT_COMPLETE.json").is_file());
+    assert!(!data.join("eth-usd.json").exists());
+    fs::remove_dir_all(root).unwrap();
 }

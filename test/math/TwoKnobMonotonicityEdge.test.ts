@@ -1,46 +1,17 @@
-// ТЗ-V15 § 9.4 #6 — edge-band monotonicity for the two-knob kernel.
-//
-// `TwoKnobIndependence.test.ts` pins the operator-matrix decoupling at
-// one off-anchor state and the 3 × 3 production envelope. That is
-// sufficient for the structural decoupling claim, but leaves three
-// blind spots:
-//
-//   1. **State sweep.** The 3 × 3 L-matrix monotonicity (rows ↓ in λ,
-//      cols ↑ in a) is only asserted at one off-anchor probe
-//      (`κ = 2.618`). The same property must hold across the full
-//      imbalance band a real pool will ever see — from a hair off
-//      anchor (5 % bias) up to deep depletion (70 % bias).
-//
-//   2. **Envelope corners.** A 3-point grid `{A_MIN, A_MID, A_MAX}` ×
-//      `{LAMBDA_MIN, LAMBDA_MID, LAMBDA_MAX}` tests the centre and
-//      the bounds, but the **diagonal corners**
-//      `(a=A_MIN, λ=LAMBDA_MIN)`, `(A_MAX, LAMBDA_MIN)`, `(A_MIN,
-//      LAMBDA_MAX)`, `(A_MAX, LAMBDA_MAX)` are where numerical
-//      conditioning is most fragile. They get probed indirectly by
-//      the matrix sweep, but a deliberate corner-only assertion makes
-//      the failure mode crystal clear (you'd see exactly which corner
-//      misbehaves).
-//
-//   3. **Slippage curve monotonicity in `d`.** The kernel must
-//      produce a strictly non-decreasing `amount_out(d)` as the
-//      drained fraction `d` grows — otherwise the swap-loop is
-//      arbitrageable. The visualizer's `enforce_monotonic_penalty`
-//      helper (`simulator/src/app/visualizer.rs:647`) exists because
-//      raw per-point `sample_penalty_at_d_bps` *can* return
-//      non-monotone values under floor-rounding noise on the
-//      *inversion* step (find-amount-in-for-target-out bisection
-//      residual). That noise lives in the visualizer's slippage
-//      sampler, not in the kernel itself — but no test directly
-//      pins the **kernel-level** slippage monotonicity. This file
-//      adds that probe for all four envelope corners.
+import { exactInputReference, assertQuotePrecision } from "../helpers/continuousReference";
+// Coarse two-knob depth and quote grids. Passing these samples is not a
+// universal monotonicity claim: depleted tails and conditional native repair
+// have known adjacent-input reversals. SmallLambdaMonotonicity.test.ts replays
+// those witnesses; the shared Rust integration test also rescans the dense grid.
+// A quote reversal alone does not establish a profitable closed swap cycle.
 
 import { expect } from "chai";
 import hre from "hardhat";
 
 const WAD = 10n ** 18n;
 const A_MIN = 10n ** 17n; // 0.1 · W
-const A_MAX = 99n * 10n ** 16n; // 0.99 · W
-const LAMBDA_MIN = 10n ** 15n; // 1e-3 · W
+const A_MAX = WAD - 1n; // largest fixed-point alpha strictly below 1
+const LAMBDA_MIN = 10n ** 12n; // 1e-6 · W
 const LAMBDA_MAX = 10n ** 18n; // 1 · W
 
 const A_MID = 5n * 10n ** 17n; // 0.5 · W
@@ -133,10 +104,8 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
     // For each of the four corners `(a, λ) ∈ {A_MIN, A_MAX} ×
     // {LAMBDA_MIN, LAMBDA_MAX}`, sweep a coarse `dx`-ladder
     // through the math-space `quoteExactInForward` kernel and
-    // assert that `amount_out` is strictly non-decreasing in
-    // `amount_in`. (This is the structural "no negative
-    // slippage" property — a curve that runs backwards anywhere
-    // is arbitrageable in a single round-trip.)
+    // assert that `amount_out` is non-decreasing in `amount_in`
+    // on this sampled grid, not universally in depleted tails.
     //
     // The probes are mid-band reserves `(xMath = yMath = 1e22)`;
     // we sweep `dx` from sub-bps (`1e-6` of x) up to 60 % of x.
@@ -160,9 +129,8 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
         // `xMath` keeps the relative size invariant across the
         // test (rather than absolute wei amounts that get tiny
         // at the upper end of the production band).
-        // The upper end matches the largest input any in-protocol
-        // consumer can quote: `EquilibraPool._bisectAmountInForTarget`
-        // caps its probes at `inputReserve - inputReserve / 100`.
+        // Match the Router's price-target probe cap. Direct swaps and
+        // exact-in quotes do not impose this 99% input limit.
         const dxBpsLadder = [1n, 10n, 100n, 1_000n, 2_500n, 5_000n, 6_000n, 7_500n, 9_000n, 9_900n];
         const outs: bigint[] = [];
         for (const bps of dxBpsLadder) {
@@ -184,60 +152,30 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
         }
       });
 
-      it(`${corner.label}: post-swap K-level-set is preserved to within sqrt-floor (1 wei)`, async function () {
-        // Companion structural check at each corner: a single
-        // forward swap on the fee-free math harness must leave the
-        // K-level-set numerically invariant. The pool-level
-        // `L_post ≥ L_pre` invariant (which DOES require fee
-        // accrual) lives in `NoPersistentG.test.ts`; this probe is
-        // the kernel-only version — without fees `L` is constant up
-        // to a 1-wei sqrt-floor residual, and any drift larger than
-        // that signals a numerical regression at the corner.
+      it(`${corner.label}: the common margin increases depth without excessive underquote`, async function () {
+        // Fee-free returned quotes now retain an explicit common margin.
         const xMath = 10n ** 22n;
         const yMath = xMath;
         const dx = xMath / 100n; // 1 %
         const lPre = BigInt(await h.solveLFromState(xMath, yMath, corner.a, corner.lambda));
         const [outRaw] = await h.quoteExactInForward(xMath, yMath, dx, corner.a, corner.lambda);
         const out = BigInt(outRaw);
-        if (out === 0n) return; // sub-wei probe (e.g. λ=MAX with κ→1) — skip
+        expect(out).to.be.greaterThan(0n);
         const xPost = xMath + dx;
         const yPost = yMath - out;
         const lPost = BigInt(await h.solveLFromState(xPost, yPost, corner.a, corner.lambda));
-        const drift = lPost > lPre ? lPost - lPre : lPre - lPost;
-        // 1-wei tolerance: the closed-form L solver uses `sqrtWad`
-        // which floors. A drift > 1 wei at the kernel level means
-        // either the solver is numerically unstable at the corner
-        // (the property the two-knob kernel is supposed to fix) or a multi-stage
-        // mulDiv has lost precision past the documented envelope.
-        expect(
-          drift,
-          `${corner.label}: |L_post − L_pre|=${drift} wei exceeds 1-wei sqrt-floor tolerance ` +
-            `(L_pre=${lPre}, L_post=${lPost})`
-        ).to.be.lte(1n);
+        expect(lPost, "retained margin must not reduce depth").to.be.at.least(lPre);
+        const ref = await exactInputReference(h, xMath, yMath, dx, corner.a, corner.lambda);
+        assertQuotePrecision(out, ref.referenceMath, ref.iterations, 1n, corner.label);
       });
     }
   });
   describe("Error direction past the whole reserve", function () {
-    // The corner probes above bound the kernel two-sidedly to 1 wei,
-    // which holds while the constant-product seed of
-    // `EquilibraSwapMath._solveCounterpart` lands near the root. Once
-    // the input exceeds the entire reserve on a curve whose plateau
-    // reaches that far — `aWad` near `A_MAX`, `lambdaWad` near
-    // `LAMBDA_MIN` — the seed sits an order of magnitude off, the
-    // 12-iteration cap engages its best-iterate fallback, and the
-    // settled point carries a percent-scale residual. Output is not
-    // monotone in the input over that domain.
-    //
-    // What must never bend is the DIRECTION of that residual: the
-    // settlement may keep more depth than the curve owes, never less.
-    // `solveLFromState` is constant along a `K = const` level set
-    // (path additivity), so `L_post >= L_pre` states exactly that.
-    //
-    // Tolerance is one-sided and loose because quotes floor their
-    // output: `L_post` sits a few wei under `L_pre` on any leg, worst
-    // case ~1.3e-18 of `L_pre` across this grid. `L_pre / 1e15` clears
-    // that by three orders of magnitude while still catching a leak
-    // twelve orders below the percent-scale residual itself.
+    // Fee-free raw math: preserve the existing one-sided depth budget
+    // on successful quotes. At high alpha / lambda=1e12 some large tail
+    // probes reach the 40-iteration limit; verify that exact refusal,
+    // not a returned unchecked result. Native settlement's strict LP
+    // guard is tested separately and has no such depth tolerance.
 
     const AS: Array<[string, bigint]> = [
       ["A_MIN", A_MIN],
@@ -249,37 +187,59 @@ describe("TwoKnobMonotonicityEdge: L-matrix monotonicity across states + slippag
       ["preset", 16780000000000000n],
       ["LAMBDA_MAX", LAMBDA_MAX],
     ];
-    // Anchor plus both de-anchored directions; sizes run past the
-    // whole reserve, where the fallback iterate takes over.
+    // Anchor plus both de-anchored directions, including whole-reserve inputs.
     const STATES: Array<[string, bigint, bigint]> = [
       ["anchor", 10n ** 22n, 10n ** 22n],
       ["y = x/4", 10n ** 22n, 10n ** 22n / 4n],
       ["y = 4x", 10n ** 22n, 4n * 10n ** 22n],
     ];
-    // Exact-in: past the whole reserve, where the seed degrades.
-    const IN_SIZE_PERMILLE = [900n, 1_000n, 1_050n, 1_500n, 3_000n];
+    // Include a substantial 0.1% control so every state exercises a
+    // successful quote even when its large tail probes are refused.
+    const IN_SIZE_PERMILLE = [1n, 900n, 1_000n, 1_050n, 1_500n, 3_000n];
     // Exact-out: output is bounded by the reserve it is drawn from, so
     // the demanding end is near-total depletion instead.
     const OUT_SIZE_PERMILLE = [900n, 990n, 999n];
 
-    it("exact-in never settles below the pre-state depth", async function () {
+    it("successful exact-in quotes preserve depth; extreme nonconvergence is explicit", async function () {
       for (const [aTag, a] of AS) {
         for (const [lTag, lambda] of LAMBDAS) {
           for (const [sTag, x, y] of STATES) {
             const lPre = BigInt(await h.solveLFromState(x, y, a, lambda));
             const tolerance = lPre / 10n ** 15n;
+            let completed = 0;
+            let largeCompleted = 0;
+            const refused: bigint[] = [];
             for (const permille of IN_SIZE_PERMILLE) {
               const dx = (x * permille) / 1_000n;
-              const [outRaw] = await h.quoteExactInForward(x, y, dx, a, lambda);
-              const out = BigInt(outRaw);
-              if (out === 0n) continue; // documented unquotable-dust sentinel
+              let out: bigint;
+              try {
+                const [outRaw] = await h.quoteExactInForward(x, y, dx, a, lambda);
+                out = BigInt(outRaw);
+              } catch (error) {
+                const tag = `a=${aTag} λ=${lTag} state=${sTag} dx=${permille}/1000`;
+                expect(a, tag).to.be.gt(A_MIN);
+                expect(lambda, tag).to.equal(LAMBDA_MIN);
+                expect(permille, tag).to.be.gte(900n);
+                expect((error as { data?: string }).data, tag).to.equal(
+                  h.interface.getError("SolverDidNotConverge")!.selector
+                );
+                refused.push(permille);
+                continue;
+              }
+              expect(out).to.be.gt(0n);
               const lPost = BigInt(await h.solveLFromState(x + dx, y - out, a, lambda));
               expect(
                 lPost + tolerance,
                 `a=${aTag} λ=${lTag} state=${sTag} dx=${permille}/1000 of x: ` +
                   `L_post=${lPost} fell below L_pre=${lPre} beyond floor dust`
               ).to.be.gte(lPre);
+              completed += 1;
+              if (permille > 1n) largeCompleted += 1;
             }
+            expect(completed, `a=${aTag} λ=${lTag} state=${sTag}: no depth checks executed`).to.be.gt(0);
+            expect(largeCompleted, "the 0.1% control must not be the only successful quote").to.be.gt(0);
+            // Curve-aware seeding resolves every former refusal in this grid.
+            expect(refused, `a=${aTag} λ=${lTag} state=${sTag}: refusal frontier changed`).to.deep.equal([]);
           }
         }
       }

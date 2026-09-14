@@ -20,16 +20,98 @@ W          = WAD = 1e18
 
 At the anchor (`xMath = yMath = L`) the kernel reduces to
 `K = W · L²`. At deep imbalance (`D → ∞`) it collapses to the
-constant-product asymptote `K → W · x · y` — every swap stays
-feasible, no liquidity wall.
+constant-product asymptote `K → W · x · y`, without a finite-price
+liquidity wall in the continuous invariant. Integer execution uses up to
+40 secant iterations. Equal-K and unchanged-counterpart exits apply at every
+iteration; there is no approximate early exit. At the forty-iteration cap,
+the best absolute K residual is checked once at a nominal 0.0001% quote
+tolerance; an unconfirmed candidate rejects SolverDidNotConverge. No unchecked
+best is returned. A proposed
+nonpositive counterpart takes a half-step, b / 2 + 1, instead of jumping
+to one. The curve-aware initializer floors only its linear estimate at
+max(1, floor(CP / 1000)); the small-counterpart tail is unchanged.
+The seed is only a starting guess, not a quote bound or acceptance check.
+Certification returns its candidate unchanged. Exact-in subtracts exactly
+one output margin: max(1, floor(rawOutput / 100000000)) in math units (0.000001%).
+Exact-out solves for trialOutput = requestedOutput + max(1, floor(requestedOutput / 99999999)),
+the conservative integer inverse of that same output-margin rule. There is no
+input surcharge: only native conversion and fee gross-up follow, and settlement
+pays the original requested output. A trial output at or above the reserve
+rejects InsufficientLiquidity. The policy applies to every solver exit.
+The 0.0001% cap tolerance and 0.000001% common margin are separate, not a
+combined error guarantee. Integer exits and rounded-K brackets do not prove universal
+agreement with the continuous invariant.
+Quote K uses WAD * 2^18; diagnostic K getters remain WAD. Internal depth
+and amplification use Q128 through the invariant, marginal price and LP
+valuation. External amounts, prices and LP values retain native/WAD units.
+Native quotes, swaps and zap previews use the same adjusted math quote.
+One strict LP-depth guard compares fresh Q128 depth before and after native
+rounding and settlement, including LP fees and excluding the protocol cut,
+at the unchanged anchor before repeg. A decrease rejects LpValueDecreased.
+There is no reserve-ratio quantum, conditional repair, solver retry or
+second guard. Nonpositive normalized amounts reject the existing typed
+dust error. Post-depth is reused for LP growth and repeg. The common margin
+is not a fee; exact-out's existing gross +1 fee-rounding bump is unchanged.
+At a positive resolved rate, a fee rounded to zero is raised to one raw
+input unit; already-positive floor-fees are unchanged. Exact-out applies
+this minimum before its separate +1 raw gross-input bump. A zero resolved
+rate remains zero, and protocol-fee splitting still rounds down.
+The minimum margin is one math unit, not one native token unit: native
+floor/ceiling conversion can still dominate on 0–2 decimal tokens.
+Invariant-weight products `x*y` and `(x-y)^2` must fit uint256; overflow
+rejects `MathOutOfRange`, including at solver trial states. The diagonal
+depth shortcut also rejects `x=y >= 2^128`. There is no per-coordinate cap
+off diagonal. Genesis, liquidity changes and settlement reuse this depth
+validation; a numeric error during a candidate repeg reverts the entire swap,
+not just the repeg. Economic LP-budget refusals retain the halving/skip policy.
+This does not expand the arithmetic domain or clamp CP starting guesses.
+
+Large-coordinate spot ratios reorder their products only above `2^125`;
+ordinary states keep their previous rounding. Oracle/anchor projections use
+full-width products, and V3-price conversions reduce decimal scales before
+multiplication, clamping genuinely unrepresentable final values. CP fee proxies
+with a guaranteed saturated distance return the fee ceiling without squaring
+an oversized difference. The Rust math mirrors these changes; its existing
+anchor remains u128; persistent EMA is an unbiased signed i128 logarithm.
+
+`quoteSwapToPrice(tokenIn, tokenOut, poolIndex, sqrtPriceTargetX96)` lives in the Router and is
+intended for off-chain use because its bounded search is expensive. Every probe
+uses the Pool's checked quote and the actual native post-swap reserves. Expected
+quote refusals, including a probe's `MathOutOfRange`, narrow the search toward a smaller input; dust probes try larger
+inputs. The bounded, best-effort search returns only a checked, non-crossing
+candidate, not necessarily the largest possible fill. Normal `quoteExactIn` and
+`quoteExactOut` remain Pool views. No separate quoter deployment is needed.
+The Router resolves the factory's pool from the token pair and pair-local index;
+the target always uses canonical `sqrt(token1 raw / token0 raw) * 2^96` units.
+Quote state is shared with zap previews through typed getters, including the
+lightweight `getPriceScale()` anchor getter. The Router does not decode storage
+slots. Token decimals must remain stable, as required by pool initialization.
+Zap splits use a single product square root when the product fits uint256;
+only oversized products retain the conservative factored estimate. Zap-in
+previews enforce both nonzero deposit legs after the proportional mint cap.
+After genesis, LP shares are priced on token0: its matching token1 payment
+rounds up. If the requested token1 maximum binds, token0 rounds down instead.
+Neither requested maximum is exceeded, and share issuance still rounds down.
+The router's zap-in preview and both Rust copies use the same integer rule.
+
+Repeg activation bands are independent of swap fees: each creation value
+must stay in `[1, WAD]`, but may exceed the floor or flat fee. For example,
+`1e15` means a 0.1% (10 bps) geometric EMA/anchor deviation. Crossing a
+band only permits an attempt; the existing step, cadence and LP-budget gates
+remain. Timelocked threshold/step updates additionally require both bands
+to be no greater than the step cap, checked against the live state at queue
+and execution time. This relation is not a factory creation restriction.
 
 Highlights:
 
-- **Two-knob design with full decoupling.** `aWad` ∈ `[0.1·W, 0.99·W]`
+- **Two-knob design with full decoupling.** `aWad` ∈ `[0.1·W, W − 1]`
   controls the depth at anchor (`A(D=0) = a`); `lambdaWad` ∈
-  `[1e15, 1e18]` controls the plateau width (`A = a/2` at `λ·D = W`).
+  `[1e12, 1e18]` controls the plateau width (`A = a/2` at `λ·D = W`).
   Moving one knob never shifts the other's effect — operators can
-  tune centre depth and cliff position independently.
+  tune centre depth and cliff position independently. The maximum is
+  `999999999999999999` WAD: strictly below one, where the centre slope
+  would vanish. Existing presets retain their previous alpha values;
+  the expanded parameter envelope does not guarantee every quote is executable.
 - **Asymmetric math-space coordinate change.** Only the quote side is
   normalised by `priceScale`; the base side stays identity. A repeg
   moves `yMath` only, so off-balance reserves register a genuine
@@ -45,7 +127,9 @@ Highlights:
   `repegShareBps = 5 000`).
 - **Dynamic fee.** Smoothstep ramp from `feeFloorBps` near the
   anchor to `baseFee` at deep imbalance, with a single closed-form
-  prediction per swap. Set `feeRampBps = 0` to opt out.
+  prediction per swap. A live ramp requires
+  `1 <= feeFloorBps < baseFee`, so its ceiling is at least 2 bps.
+  Set `feeRampBps = 0` to use a flat fee, including 1 bps.
 - **Bit-exact off-chain twin.** The Rust simulator
   (`simulator/`) is a byte-for-byte port of the Solidity kernel; the
   parity tests under `test/simparity/` enforce
@@ -67,7 +151,7 @@ projects, and the numbers produced by this repo for them are not a
 literal verdict on their on-chain behaviour.** They are simplified
 stand-ins:
 
-- gas, fee precision and slippage policy are simulator
+- fee precision and slippage policy are simulator
   approximations;
 - corner-case behaviour, governance levers, ramp dynamics and
   oracle handling diverge in subtle ways from the upstream
@@ -150,14 +234,52 @@ npm install
 
 ---
 
+## Pool lifecycle
+
+The creation-time EMA half-life minimum is **600 seconds for public pools**
+and **60 seconds for private pools**. The maximum remains 419731 seconds.
+Public genesis also requires strictly `1_000_000 < initialPriceScaleWad < 10^30`
+(human price between 1e-12 and 1e12 token0 per token1). These admission bounds
+do not restrict later swaps, repegs or liquidity changes. Private pools have
+no additional initial-price interval. Rust and Simulator have no public/private
+mode: EMA minimum stays 60 seconds and there is no extra initial-price limit.
+Presets remain unchanged.
+
+The oracle stores unbiased `ln(price)` between updates; WAD prices are decoded
+only for consumers, with a minimum of one WAD price unit. Zero logarithm means
+price 1, not an empty oracle. Trace snapshots include signed `equilibraEmaLogWad`
+to preserve this precision across Rust replay.
+
+Read both flags with `paused() -> (paused_, stopped_)`; there is no separate
+`stopped()` getter. Factory owners call `setPaused(paused_, stopped_)`. `(true, false)` is a
+reversible pause; `(true, true)` is an irreversible stop. `(false, true)`
+reverts. Once stopped, other authorized pause calls do nothing. Swaps and
+mints stay blocked, but LPs can redeem directly or through the router.
+Stopped withdrawals skip LP-value reanchoring and post-transfer solvency
+checking; token transfers, min-out checks, proportional payouts and buffer
+burns remain. Actual token deficits can still prevent transfers larger than
+the remaining balance. Cached LP metrics are not refreshed after these exits.
+
 ## Build & test (Solidity)
 
 ```bash
 npm run compile                # clean + hardhat compile
+npm run size                   # compile and show production contract sizes
 npm test                       # math / periphery / security suites + typecheck
+npm run test:ci                # regressions, without heavy matrices / Monte Carlo
+npm test -- all                # all tracked suites, including stress
 npm run lint-fix               # prettier for .sol and .ts
 npm run simulator:run
 ```
+
+Normal compilation also prints `hardhat-contract-sizer`'s deployed/runtime
+and initcode sizes in bytes for Pool, Router, Factory and ParamTimelock.
+Exceeding the 24,576-byte runtime or 49,152-byte initcode limit produces a
+warning, not a compilation failure. Test mocks and dependencies are excluded;
+coverage does not run the table automatically. The existing `BytecodeSize`
+test remains strict and is independent of this warning-only plugin.
+`npm run size -- --no-compile` reads existing artifacts without rebuilding;
+rebuild first if compiler settings or sources changed.
 
 Run a single test file or pattern:
 
@@ -165,6 +287,47 @@ Run a single test file or pattern:
 npx hardhat test test/security/RepegConservation.test.ts
 npx hardhat test --grep "vp_final ≥ genesis"
 ```
+
+The fixed small-lambda witnesses remain in the ordinary security/CI profile.
+`test/security/SmallLambdaMonotonicity.test.ts` replays all 300 recorded
+adjacent-input output drops at `lambdaWad=1e12`, 66 at `5e13`, 548 at `6e13`
+and, at reduced `aWad=999750000000000000`, 264 at `lambdaWad=6e13`
+and 22 at `1e14`; the maximum-alpha control (`aWad=WAD-1`) has 22 at `1e14`
+through actual pool quotes and swaps. It prints
+pre/post depletion, maximum input, absolute/relative output drops, their
+direction and a separate independent-reference comparison. These extrema
+belong to the sampled grid, not proven universal thresholds. Both the 1 bps
+and 5 bps controls are deployable.
+The tracked `SmallLambdaCorners.test.ts` round-trip matrix is manual
+(`npm test -- security` or `npm test -- all`), not part of `test:ci`.
+Both keep the current anchor fixed (no automatic repeg).
+
+`scripts/test-profile.ts` lists the heavy suites excluded from CI; individual
+heavy cases in mixed suites carry `[stress]`. Regression assertions and
+sample counts are unchanged. The six Rust dense grids are ignored by default:
+`cargo test --manifest-path simulator/Cargo.toml --release --test small_lambda_monotonicity -- --ignored`.
+The separate historical Rust replay remains enabled. Diagnostic tables and
+Bob/Charlie research live in gitignored `.local/research/`, outside test discovery
+and TypeScript project checking.
+
+The current maximum-alpha/`1e14` control uses a factory-valid dynamic
+1–5 bps fee with `feeRampBps=9500` (the current desktop Pegged ramp width),
+without storage overrides. The grid checks floor/transition/ceiling coverage;
+recorded witness fees are compared with the Solidity swap events.
+The older flat-fee corpora remain historical numerical controls, not claims
+that a flat 1 bps pool can be deployed through the factory.
+
+The shared vectors live in
+`simulator/tests/fixtures/equilibra-small-lambda-monotonicity.json`,
+`simulator/tests/fixtures/equilibra-lambda-5e13-monotonicity.json`,
+`simulator/tests/fixtures/equilibra-lambda-6e13-monotonicity.json`,
+`simulator/tests/fixtures/equilibra-lambda-6e13-alpha-99975-monotonicity.json`,
+`simulator/tests/fixtures/equilibra-lambda-1e14-alpha-99975-monotonicity.json` and
+`simulator/tests/fixtures/equilibra-lambda-1e14-alpha-max-monotonicity.json`.
+`cargo test --release --manifest-path simulator/Cargo.toml --test small_lambda_monotonicity -- --nocapture`
+regenerates the dense grid for those corpora and rejects new unrecorded reversals,
+lost witness coverage, quote/execution divergence and profitable completed
+swap cycles. Tests do not need any files from `/tmp`.
 
 ### Coverage
 
@@ -251,7 +414,7 @@ fails closed.
 1. **Setup** — open the dashboard, tweak preset parameters in the
    Setup page (`aWad`, `lambdaWad`, fees, EMA period, repeg knobs, …) and click
    _Save_. The page materializes the complete
-   `benchmark-run-config/v11` object and validates it against the same
+   `benchmark-run-config/v13` object and validates it against the same
    constraints the on-chain factory enforces; partial or older configs fail
    rather than inheriting hidden runtime defaults.
 2. **Run** — submit a run from the dashboard. Before queue publication, the
@@ -338,8 +501,8 @@ npm run deploy:verify --network=<hardhat-network>
 Pool specs intentionally have no silent defaults: every parameter of a
 `PoolSpec` must be an explicitly reviewed snapshot. `aWad` /
 `lambdaWad` are the two independent concentration knobs (see
-`Constants.A_MIN_WAD..A_MAX_WAD` = `[1e17, 99e16]` and
-`Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD` = `[1e15, 1e18]`); the
+`Constants.A_MIN_WAD..A_MAX_WAD` = `[1e17, 999999999999999999]` and
+`Constants.LAMBDA_MIN_WAD..LAMBDA_MAX_WAD` = `[1e12, 1e18]`); the
 current research presets live in
 `simulator/src/app/config.rs::build_default_config`. The factory
 accepts `(tokenA, tokenB)` in any order and canonicalises them to
@@ -365,3 +528,26 @@ MockWETH9 and a mock-token smoke pool).
   internals, AMM-model description, configuration keys.
 - static landing page mirrored at `http://localhost:3100/info` once
   the dashboard is running.
+
+## Small-lambda regression fixtures
+
+The six `*-monotonicity.json` files preserve historical reversal inputs,
+old outputs and old fees. They are evidence, not current quote expectations;
+do not delete fee-only dust inputs or overwrite the historical reversals.
+
+`equilibra-small-lambda-regression.json` separately pins current native
+quotes/fees, both quote and swap refusals, completed historical cycles,
+and exact dense-grid coverage/refusal totals. Classification digests also
+pin which inputs pass/refuse. Expected output-margin boundary refusals
+are counted separately and never substitute for completed round trips.
+Solidity checks every historical outcome against the same Rust snapshot.
+
+```bash
+npm run simulator:fixtures:small-lambda -- --check  # reproduce without writing
+npm run simulator:fixtures:small-lambda -- --write  # explicit baseline update
+```
+
+The generator reuses the dense/historical test code; invariant checks stay
+enabled while regenerating. Review new refusals and the baseline diff,
+then run the tests. Do not add a percentage cushion to coverage checks.
+Copy the resulting snapshot to the desktop fixture mirror when synchronizing.

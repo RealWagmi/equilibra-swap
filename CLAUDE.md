@@ -20,12 +20,17 @@ W          = WAD = 1e18
 ```
 
 - **Solidity stack** (pool, factory, router, oracle, lp-token, mocks)
-  is the production surface. `EquilibraPool` runtime bytecode is
-  24,471 bytes / 24,576 bytes (`optimizer.runs = 2000`, `viaIR = true`,
-  `metadata.appendCBOR = true`, `evmVersion = "cancun"`).
-- **Test suite**: run `npm run test:ci` for the non-interactive full
-  Solidity suite. Security tests (`test/security/*`)
-  covers every attacker-perspective scenario — round-trip, batching,
+  is the production surface. After the numeric-domain and oracle overflow
+  corrections, permanent-stop implementation, internal scalar/helper cleanup,
+  and positive EMA minimum,
+  measured `EquilibraPool` runtime bytecode is
+  24,125 bytes / 24,576 bytes (451 bytes of headroom; `optimizer.runs = 999`,
+  `viaIR = true`, `metadata.appendCBOR = true`, `evmVersion = "cancun"`,
+  solc 0.8.36). Router runtime is 22,629 bytes.
+- **Test suite**: `npm run test:ci` runs the non-interactive regression
+  profile, excluding heavy matrices and tagged stress cases.
+  `npm test -- all` includes the tracked stress suites. Security tests
+  (`test/security/*`) cover round-trip, batching,
   LP-flux, cross-anchor, repeg conservation, callback misuse,
   fee splittability.
 - **Rust library** (`runtime_quoter::{equilibra_math, equilibra}`,
@@ -34,7 +39,7 @@ W          = WAD = 1e18
   `cargo test --release --lib`; avoid hard-coding counts here because
   they change whenever a regression case is added.
 - **Cross-language parity**: `test/simparity/*` enforces Solidity ==
-  Rust at wei resolution — 16 tests across WETH/WBTC presets, both
+  Rust at wei resolution across WETH/WBTC presets and shared native boundary vectors, both
   swap directions, exact-in/exact-out paths, ramp/opt-out modes.
 - **Dashboard**: `simulator/app-web/` (Runs / Setup / Curve Lab) +
   standalone `simulator/visualizer/` + Curve-Lab-style `simulator/Info/`
@@ -45,6 +50,7 @@ W          = WAD = 1e18
 
 ```bash
 npm run compile       # Clean and compile Solidity contracts (solc 0.8.36, viaIR, evm cancun)
+npm run size          # Compile and show production runtime/initcode sizes in bytes
 npm test              # Interactive menu: pick a section (default = math + periphery + security)
 npm run coverage      # Solidity coverage report (sets SOLIDITY_COVERAGE=true → compiles WITHOUT viaIR)
 npm run lint-fix      # Format .sol and .ts files (prettier + prettier-plugin-solidity)
@@ -56,8 +62,9 @@ npm run lint-fix      # Format .sol and .ts files (prettier + prettier-plugin-so
 > touching pool / library / router internals, run
 > `SOLIDITY_COVERAGE=true npx hardhat compile`; on `Stack too deep`,
 > scope short-lived locals into `{ ... }` blocks instead of re-enabling
-> viaIR. Coverage builds also flip `optimizer.runs` to 1, which keeps
-> even the un-instrumented legacy `EquilibraPool` under EIP-170. The
+> viaIR. Coverage builds also flip `optimizer.runs` to 1. Legacy
+> compilation is checked, but that output may exceed EIP-170; production
+> deployment uses the separately size-checked viaIR artifact. The
 > in-process test network lifts the size cap unconditionally
 > (`allowUnlimitedContractSize`) because the internals-exposing
 > `MockEquilibraPool` legitimately exceeds it, so the deployable viaIR
@@ -68,8 +75,12 @@ npm run lint-fix      # Format .sol and .ts files (prettier + prettier-plugin-so
 > NatSpec comments, the `at` identifier) are suppressed by a small
 > subtask filter in `hardhat.config.ts` (drops warnings from `solady/*`
 > sources plus solc's location-less 256-warnings cap notice, code 4591;
-> no plugin dependency). Warnings from `contracts/` still print — a
-> clean compile is silent.
+> `hardhat-contract-sizer` reports sizes separately). solc can truncate
+> later warnings before this filter runs. Normal compilation independently
+> prints runtime/initcode sizes for Pool, Router, Factory and ParamTimelock;
+> oversize artifacts warn but do not fail compilation (`strict: false`).
+> Mocks are excluded and coverage disables the automatic size table.
+> The existing `BytecodeSize` test remains strict.
 
 Run a single test file:
 
@@ -108,6 +119,13 @@ Three scripts live under `scripts/`:
 # `npm test -- all`, or `npm test -- 5`. Falls back to "default" silently
 # when stdin is not a TTY.
 npm test
+npm run test:ci                # regressions only; no heavy matrices / Monte Carlo
+npm test -- all                # includes the tracked heavy suites (menu item 8)
+npm test -- all --ci --list    # list the CI file selection without executing tests
+
+# Heavy Rust grids are manual; historical witness replay remains in CI:
+cargo test --manifest-path simulator/Cargo.toml --release --test small_lambda_monotonicity -- --ignored
+# Research-only tests and their helpers are archived under gitignored .local/research/.
 
 # Deployment is split into three idempotent steps. All non-secret
 # parameters (WETH9, fee collector, protocol fee, pool specs) live in
@@ -176,7 +194,7 @@ quoter sources live in `simulator/src/runtime_quoter/`:
   `solveLFromState` quadratic, secant exact-in / exact-out solvers,
   `smoothstep_fee_wad`, balanced-depth recovery `2·L`, plus the
   fixed-point transcendentals `ln_wad` / `exp_pos_wad` and
-  `geometric_ema_step` that keep the oracle bit-for-bit with
+  `geometric_ema_log_step` that keep the oracle bit-for-bit with
   Solady's `lnWad` / `expWad`).
 - `curve.rs` — Curve twocrypto port used as a baseline. Mirrors the
   live 2026-05 version (reference pools 0x6563…b9f3 / 0x3136…729a): the
@@ -201,6 +219,71 @@ quoter sources live in `simulator/src/runtime_quoter/`:
 
 ### Simulator configuration — single source of truth
 
+Swaps use the shared checked Solidity/Rust resolver. Equal-K and
+unchanged-counterpart exits apply at every iteration; there is no approximate
+early exit. At the forty-iteration cap, the best absolute K residual is checked
+once at a nominal 0.0001% quote tolerance; an unconfirmed candidate rejects
+SolverDidNotConverge. No unchecked best is returned. A proposed
+nonpositive counterpart takes a half-step, b / 2 + 1, instead of jumping
+to one. The 40-iteration limit is unchanged.
+Certification returns its candidate unchanged. Exact-in subtracts exactly
+one output margin: max(1, floor(rawOutput / 100000000)) in math units (0.000001%).
+Exact-out solves for trialOutput = requestedOutput + max(1, floor(requestedOutput / 99999999)),
+the conservative integer inverse of that same output-margin rule. There is no
+input surcharge: only native conversion and fee gross-up follow, and settlement
+pays the original requested output. A trial output at or above the reserve
+rejects InsufficientLiquidity. The policy applies to every solver exit.
+The 0.0001% cap tolerance and 0.000001% common margin are separate, not a
+combined error guarantee. Integer exits and rounded-K brackets do not prove universal
+agreement with the continuous invariant.
+Quote targets and secant evaluations use K scaled by WAD * 2^18 (262144
+times the former resolution); external K diagnostics still return WAD.
+The seed refines the CP estimate with a frozen-weight linear estimate or
+the small-counterpart tail of the same invariant. Only the linear estimate
+is floored at max(1, floor(CP / 1000)) to limit near-zero cancellation;
+the tail retains its own estimate. This is not a quote bound. Its second point moves
+down by 0.1% except at the opposite squared-distance boundary. The initializer
+does not bypass the solver or native settlement.
+Amplification uses Q128 weights, with a
+WAD precision fallback only at extreme reserve ratios to preserve the existing
+arithmetic domain. Depth recovery uses a normalized Q128 discriminant. L stays Q128 through
+quote K, marginal-price products and LP/repeg valuation; native reserves,
+prices and stored LP-unit values retain their WAD/raw external units.
+Native quotes, swaps and zap previews use the same adjusted math quote.
+One strict LP-depth guard compares fresh Q128 depth before and after native
+rounding and settlement, including LP fees and excluding the protocol cut,
+at the unchanged anchor before repeg. A decrease rejects LpValueDecreased.
+There is no reserve-ratio quantum, conditional repair, solver retry or
+second guard. Nonpositive normalized amounts reject the existing typed
+dust error. Post-depth is reused for LP growth and repeg. The common margin
+is not a fee; exact-out's existing gross +1 fee-rounding bump is unchanged.
+At a positive resolved rate, a fee rounded to zero is raised to one raw
+input unit; already-positive floor-fees are unchanged. Exact-out applies
+this minimum before its separate +1 raw gross-input bump. A zero resolved
+rate remains zero, and protocol-fee splitting still rounds down.
+The minimum margin is one math unit, not one native token unit: native
+floor/ceiling conversion can still dominate on 0–2 decimal tokens.
+Invariant-weight products `x*y` and `(x-y)^2` must fit uint256; overflow
+rejects `MathOutOfRange`, including at solver trial states. The diagonal
+depth shortcut enforces `x=y < 2^128`; off diagonal, neither coordinate is
+individually capped. This shared depth validation covers genesis, liquidity
+changes, settlement and candidate repegs. A numeric error in a repeg candidate
+reverts the entire swap; only economic LP-budget refusals may skip/halve a repeg.
+Specialized product checks preserve the arithmetic domain; an initializer
+range fallback retains the CP guess.
+Rust retains its equivalent checked multiplications and diagnostic errors.
+The factory prepares packed initialization words; the pool stores them
+without changing its storage layout or the public factory creation API.
+
+The benchmark excludes transaction costs unconditionally: no gas config,
+ETH gas-feed dependency, arithmetic or compatibility replay. Both actor
+thresholds default to 1 bps; the profit floor stays 1 USDT. Supplemental
+forward flow totals 15% over three cycles, with a 0.05 USDT minimum; the
+reverse legs add approximately the same volume. Raw results are v4, actor
+v3 and report v3. The WETH and WBTC presets both use a 70% repeg share.
+The contract's price-target probe bound is unchanged; the simulator
+arbitrage search has no new 99% input cap.
+
 `simulator/src/app/config.rs` is the authoritative definition of every
 default the off-chain stack uses. Treat it as **the** source of truth: if
 a number lives in two places (this file and a TS / JSON / UI default),
@@ -208,7 +291,7 @@ this file wins. It owns three things:
 
 1. **The `BenchmarkRunConfig` schema** (`#[derive(Serialize, Deserialize)]`),
    including the per-AMM presets (`EquilibraPresetCfg`, `CurvePresetCfg`,
-   `UniswapV2AmmCfg`), arbitrageur knobs (`gas_used_estimates`,
+   `UniswapV2AmmCfg`), arbitrageur knobs (`probe_trigger_bps`,
    `post_arb_external_swaps`), report-only policies, simulation window,
    parallelism and the
    dynamic-fee triple (`fee_ramp_bps`, `fee_floor_bps`,
@@ -217,19 +300,19 @@ this file wins. It owns three things:
    rejected at parse time so the canonical
    `build_default_config` remains the single source of truth.
 2. **`build_default_config(oracle_start_ts, oracle_end_ts) -> BenchmarkRunConfig`**
-   — produces the canonical defaults (WETH and WBTC presets, gas-used
-   estimates, simulation window, parallelism). Every other component
+   — produces the canonical defaults (WETH and WBTC presets, sensitive
+   arbitrage filters, simulation window, parallelism). Every other component
    must either call this function or load JSON that was originally
    derived from it.
 3. **`validate_run_config(value)`** — strict bounds check + version pin
-   (`BENCHMARK_RUN_CONFIG_VERSION = "benchmark-run-config/v11"`) used by
+   (`BENCHMARK_RUN_CONFIG_VERSION = "benchmark-run-config/v13"`) used by
    the dashboard's HTTP layer before persisting a run. Every older
-   `params.json` version (v4–v10) is rejected outright — there is
+   `params.json` version is rejected outright — there is
    deliberately no migrator: silent field-filling was a reproducibility
    bug class, and archived numbers are unreproducible anyway (pre-v6
    binaries embed a different actor policy and no oracle snapshot). To
    reuse an archived calibration, port its overrides (seed, window,
-   presets) onto fresh v11 defaults by hand. v7 added the required
+   presets) onto fresh v13 defaults by hand. v7 added the required
    per-preset `amms.equilibra.presets.<BASE>.baseTokenPosition` (`"token0"` = base in slot 0,
    matching mainnet address sort — WETH `0xC02a…` and WBTC `0x2260…`
    both sort before USDT `0xdAC1…`; `"token1"` keeps the quote in
@@ -243,23 +326,30 @@ this file wins. It owns three things:
    first stream tick at t = 0, one-year interval cap); v10 keeps the
    schema and pins the WAD fee-rate semantics plus the ramp
    monotonicity guard (previously-valid narrow-ramp presets are
-   rejected); v11 keeps the schema and pins the tightened floors
-   `feeBps >= 5` / `emaPeriod >= 60 s`.
+   rejected); v11 originally pinned `feeBps >= 5` / `emaPeriod >= 60 s`.
+   Current factory parity relaxes the base-fee floor to `feeBps >= 1`;
+   a live ramp still requires `feeFloorBps >= 1`. Pool creation requires
+   `emaPeriod >= 600 s` for public pools and `>= 60 s` for private pools.
+   Rust/Simulator have no private/public mode: their minimum remains 60 s.
+   Only public Solidity genesis additionally requires
+   `1_000_000 < initialPriceScaleWad < 10^30`; Rust and private pools
+   retain the positive-price and mathematical-domain checks without that policy bound.
+   v12 removed transaction-gas modelling;
+   v13 records the probe-profit threshold explicitly.
 
-> Hard limits (e.g. `feeRampBps ∈ [0, 10_000]`, `feeFloorBps ≤ baseFee`,
+> Hard limits (e.g. `feeRampBps ∈ [0, 10_000]`, a live ramp requires
+> `1 ≤ feeFloorBps < baseFee`,
 > the ramp monotonicity guard `feeRampBps · (BPS − baseFee)² ≥
 > FEE_RAMP_GUARD_MULT · BPS · (baseFee − feeFloorBps)²` whenever
 > `feeRampBps != 0`,
 > `repegShareBps + protocolFeePercent · 100 ≤ BPS`, `protocolFee ≤ 25`,
-> and the repeg stall guard `repegThresholdToken1{Up,Down}Wad ≤
-> feeScale · 1e14` — each band independently — whenever
-> `repegShareBps != 0`, where feeScale = `feeFloorBps` with a
-> live ramp and flat `baseFee` otherwise)
+> and the absolute repeg dead-band range `[1, WAD]` independently of fees)
 > are enforced on chain by `EquilibraFactory` / `Constants.sol`. The
 > Rust validator in `simulator/src/app/config.rs::validate_run_config`
-> mirrors every one of those bounds so the simulator never proposes a
-> config the chain would refuse. **When you change a constant on chain,
-> mirror it in `config.rs`.**
+> mirrors the mathematical and private-pool bounds. Public-only admission
+> policy (600-second EMA minimum and the initial-price interval) is deliberately
+> not enforced in Rust or Simulator. Keep these distinctions explicit when
+> changing constants.
 
 #### How a runtime config is formed
 
@@ -299,7 +389,7 @@ this file wins. It owns three things:
 What comes from where, in one sentence each:
 
 - **From `config.rs`**: every default that is not explicitly overridden —
-  presets, `gas_used_estimates`, `progress_interval_sec`, EMA periods,
+  presets, `probe_trigger_bps`, `progress_interval_sec`, EMA periods,
   `repeg_step_wad`, dynamic-fee floor / share, post-arb adaptive gate
   defaults, and the report-only slippage sweep, etc. V7 persisted configs
   are fully materialized: no required runtime field has a serde fallback.
@@ -426,8 +516,8 @@ Key HTTP endpoints (full router in `simulator/src/app/server.rs`):
 
 The visualizer is the **fastest** way to feel out a parameter combo
 before committing a long run: it talks the same `runtime_quoter` math
-kernel that a real run uses, so curves are bit-for-bit identical to a
-benchmark started from the dashboard. Fees, auto-repeg and the EMA
+kernel that a real run uses. Geometry samples are not executable native
+quotes: fees, native settlement, auto-repeg and the EMA
 oracle are intentionally **not** modelled in the visualizer — it
 explores the static curve geometry only, which is what the slider
 sweep is for.
@@ -587,10 +677,10 @@ D          = (y − x)² / (x · y),    W = WAD
 Polynomial degree in `y` (after clearing denominators) is **3**, giving
 a well-conditioned cubic envelope for the secant solver.
 
-- `a` (WAD; bounded by `[A_MIN_WAD, A_MAX_WAD] = [0.1·W, 0.99·W]`) is the
+- `a` (WAD; bounded by `[A_MIN_WAD, A_MAX_WAD] = [0.1·W, W - 1]`) is the
   **depth-at-anchor** knob. At `D = 0` (anchor), `A = a`; larger `a`
   deepens the plateau at the centre.
-- `λ` (WAD; bounded by `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD] = [1e15, 1e18]`)
+- `λ` (WAD; bounded by `[LAMBDA_MIN_WAD, LAMBDA_MAX_WAD] = [1e12, 1e18]`)
   is the **plateau-width** knob. At `λ·D = W`, `A = a/2`
   (half-amplification distance); larger `λ` narrows the plateau.
 - **Decoupling.** `a` alone controls centre depth; `λ` alone controls
@@ -602,8 +692,10 @@ a well-conditioned cubic envelope for the secant solver.
   `solveLFromState` (positive root of `W·L² − A·L·S − (W−A)·N = 0`)
   and frozen for the whole swap leg.
 
-The kernel is monotone in `L` for every reachable `(x, y)`, so the
-secant solver converges on a one-sided bracket.
+Depth recovery is analytic. The bounded counterpart secant does not maintain
+a one-sided root bracket. After the common math margin, the pool and native
+quote path apply one strict post-fee LP-depth guard, with no repair or recheck.
+This is not a one-sided continuous-error certificate for the raw solver.
 
 ### Single-piece K — no segment walker
 
@@ -618,6 +710,17 @@ cache, no anchor walker, and no chicken-and-egg between segments.
 pMarg(x, y; L, a, λ) = ∂K/∂x ÷ ∂K/∂y   // WAD-scaled, math-space
                      = 1.0 when x == y
 ```
+
+Large-coordinate marginal prices (`max(x,y) >= 2^125`) cancel `x` before
+the final ratio, avoiding oversized WAD-scaled derivative products. This is
+an arithmetic branch threshold, not a reserve cap; smaller states retain the
+previous floor order. Spot projection and anchor steps use full-width products.
+The Rust primitives use U512 products. The anchor remains u128 in Rust;
+persistent EMA state is an unbiased i128 logarithm (int256 on chain).
+V3 converters reduce the factory's power-of-ten decimal scales and saturate
+unrepresentable final prices, preserving the Q96 floor and canonical poles.
+An exhausted CP fee proxy or `|xPost-yProxy| >= 2^128` saturates its distance
+at WAD (all permitted ramps have reached their ceiling); ordinary fees are unchanged.
 
 `marginalPriceFromState` recovers `L` internally; `marginalPrice` (with
 `L` supplied) is the cheap variant used by callers that already have
@@ -642,8 +745,10 @@ The `√(priceScale · WAD)` factor is the anchor normaliser — it keeps
 `vp` in consistent units across repegs (otherwise math-space drift
 would mask IL).
 
-Limits: `L → sqrt(x·y)` as `a → 0` (constant-product), `L → (x+y)/2`
-as `a → W` (constant-sum, forbidden by `A_MAX_WAD = 0.99·W`).
+Limits: `L → sqrt(x·y)` as `a → 0` (constant-product). As the local
+amplification `A → W`, `L → (x+y)/2`. With positive lambda the tail
+remains state-dependent even as alpha approaches one. The deploy ceiling
+is `A_MAX_WAD = W - 1`, the largest WAD integer strictly below one.
 Always satisfies `2·L ≤ x + y` by AM-GM.
 
 ---
@@ -664,7 +769,9 @@ with `feeRampWad = feeRampBps · 1e14` (so 10 000 bps == 1 WAD == one
 full state-distance unit). The config stays in integer bps; the pool
 widens it once per swap (`uint16 · 1e14`, `unchecked`) and both
 resolves AND applies the rate at **WAD precision**
-(`fee = amountIn · feeWad / WAD`). A one-ulp rate step therefore moves
+(`fee = max(1, floor(amountIn · feeWad / WAD))` for a positive rate;
+a resolved zero rate still charges zero). Outside the zero-to-positive
+minimum-fee boundary, a one-ulp rate step therefore moves
 the fee by at most `amountIn / 1e18` wei — the gross → clean-input map
 (and hence `quoteExactIn`) is monotone up to a dust residual on that
 order (the CP distance and `r` are WAD-quantized too, so one input wei
@@ -684,10 +791,9 @@ The ramp is bypassed (every swap pays exactly `baseFee`) when:
 
 - `feeRampBps == 0` — explicit per-pool opt-out (flat-fee mode).
 
-Pairing `feeRampBps != 0` with `baseFee == feeFloorBps` is **rejected
-at deploy time** with `FeeRampNoHeadroom`: the smoothstep would have no
-headroom to interpolate into and would silently collapse, so the
-factory fails fast instead of hiding the misconfig in the pool. The
+With `feeRampBps != 0`, a floor outside `1 <= feeFloorBps < baseFee` is
+**rejected at deploy time** with `InvalidFeeFloor`. This excludes both a
+zero effective fee and a ramp with no headroom. The
 opt-out path zeros `_feeRampDistWad` so the hot swap path dispatches
 on a single comparison.
 
@@ -732,12 +838,14 @@ a handful of muls/divs on top of the flat-fee swap.
   `[grossUp(cleanIn, feeFloor), grossUp(cleanIn, baseFee)]`. A
   quasi-convex function attains its maximum over an interval at an
   endpoint, so this value is ≥ the fee `exactInput` independently
-  resolves at the settled gross — which guarantees the user-facing
-  identity `exactInputSingle(quoteExactOut(out)) ≥ out` with no
-  iteration. `quoteExactOut` runs the same resolver, so quote == swap.
-  Trade-off: anchor-crossing exact-out trades are quoted **conservatively**
-  (over-charged by up to the live `baseFee − feeFloor` span), always in
-  the LP-favourable direction. On the **descending branch** of the V the
+  resolves at the settled gross. This bounds the fee rate, not the
+  inversion error of the independently rounded counterpart searches:
+  `exactInputSingle(quoteExactOut(out)) ≥ out` is not an unconditional
+  solver guarantee. `quoteExactOut` and an exact-out swap on the same
+  state run the same resolver, so their required input matches.
+  Trade-off: the endpoint-max fee can overcharge anchor-crossing
+  exact-out trades by up to the live `baseFee − feeFloor` span.
+  On the **descending branch** of the V the
   resolved rate falls as the requested output grows, so `quoteExactOut`
   can require marginally LESS input for one more wei of output — the
   same dust residual on the order of `quotedIn / 1e18`,
@@ -819,7 +927,11 @@ under-pay the pool.
 `quoteExactIn` / `quoteExactOut` reuse the **exact same** resolver as the
 live swap (including the smoothstep ramp), so `quote == output` bit-for-bit.
 This identity is exercised by `test/security/DynamicFee.test.ts` and the
-parity suite under `test/simparity/`.
+parity suite under `test/simparity/`. Internal swap helpers return only their
+consumed scalar results; clean-input arithmetic stays inside the fee resolver,
+without an unused `SwapAmounts` copy. Both repeg paths share the same commit
+helper and geometric-deviation calculation. These structural optimizations do
+not change rounding, solver exits, fees, LP guards or the Rust numeric model.
 
 ### Donation entrypoint
 
@@ -884,6 +996,9 @@ wrapping, batching via `multicall`) **plus** the merged zap entrypoints
 that used to live in a standalone `EquilibraZap` contract:
 
 ```solidity
+// Off-chain view (expensive bounded price-target search; no separate quoter deployment)
+function quoteSwapToPrice(address tokenIn, address tokenOut, uint32 poolIndex, uint160 sqrtPriceTargetX96) view returns (uint256 amountIn, uint256 amountOut, bool crossesAnchor);
+
 // Swaps
 function exactInputSingle (ExactInputSingleParams)  payable returns (uint256);
 function exactOutputSingle(ExactOutputSingleParams) payable returns (uint256);
@@ -914,6 +1029,27 @@ function selfPermitIfNecessary(address token, uint256 value, uint256 deadline, u
 
 Highlights:
 
+- **Price-target quoting** lives in Router, not Pool. Token pair and pair-local
+  index resolve the pool through the same `_resolvePool` helper used by swaps,
+  liquidity, zaps and callbacks. Targets retain canonical
+  `sqrt(token1 raw / token0 raw) * 2^96` units in both directions. The shared
+  quote loader reads typed getters, including `getPriceScale()` without the
+  unused marginal-price/depth work of `getOracleState()`. It never decodes raw
+  storage slots. Token decimal scales mirror initialization and must remain stable.
+  Every probe calls `pool.quoteExactIn`, including its
+  common margin and single LP guard, then evaluates native settled reserves.
+  Expected solver/LP/liquidity/numeric-domain probe refusals narrow toward smaller inputs; dust
+  probes try larger inputs. At most 12 expansion probes (the initial probe
+  plus up to 11 doublings) and 50 refinement probes,
+  with the same ~99% input-reserve cap. Only a checked non-crossing candidate
+  is returned; this best-effort search does not guarantee a maximal fill.
+  Ordinary exact-in/out quotes remain in Pool. Zap-in's protocol-cut projection
+  reads the fee config once, never solves L, and skips normalization entirely
+  for a zero protocol cut or a flat fee. Zap-out still recovers L at its
+  hypothetical post-burn reserves before applying the unchanged LP guard.
+  Price-target noise tolerance uses fullMulDiv so even a saturated uint256
+  target remains usable during refusal recovery. Numeric-domain errors in the
+  original state still propagate; only individual probe failures are recoverable.
 - **Multi-hop path encoding** lives in `libraries/SwapPath.sol`:
   `[token0 (20)][poolIndex (4)][token1 (20)][poolIndex (4)]…`. The 4-byte
   `poolIndex` is the pair-local index under
@@ -960,6 +1096,12 @@ Highlights:
   `_calculateRebalanceSwap`) and several `_zap*` private wrappers are
   factored out so the entry-points fit under the EVM 16-slot stack
   limit even on legacy (non-viaIR) builds.
+  The split uses sqrt(rIn * (rIn + amountIn)) when the product fits uint256,
+  retaining the conservative product of square roots only outside that range.
+  The 0.5% reduction and half-input cap are unchanged. An overflowing sum
+  rejects MathOutOfRange. Zap-in previews mirror the pool's nonzero-leg check
+  after the proportional deposit cap. MockEquilibraRouter exposes the internal
+  split only for boundary tests; no test-only method is added to the production ABI.
 - All ERC20/ETH movements go through Solady's `SafeTransferLib`.
 - OpenZeppelin's `IERC20Metadata` is the router's single ERC-20 read
   interface (`totalSupply`, `balanceOf`, `allowance`, `decimals`) —
@@ -1009,7 +1151,7 @@ immediately after the curve math and before the input transfer:
    and compute:
    * `thresholdWad = vpGenesis +
      lpValueGrowthWad · (BPS − _repegShareBps) / BPS`.
-     `_repegShareBps` is **pre-scaled at `initialize`** to encode the
+     `_repegShareBps` is **pre-scaled by the factory** to encode the
      protocol-fee compensation:
      `stored = ⌊ user_share · BPS / (BPS − protocolFeePercent · 100) ⌋`.
      This bakes the gross-up into the stored value so the hot path
@@ -1144,7 +1286,7 @@ reference twocrypto pools, with the dead-band split by direction):
   direction-split activation dead-bands.** No repeg attempt while the
   geometric deviation `|max(ema, ps)/min(ema, ps) − 1|` is below the
   side's band (`up` while `ema > priceScale`, else `down`). These are
-  the knobs the stall guard applies to — each side independently.
+  independent of the fee settings; each band must be in `[1, WAD]`.
   Under the mainnet base-in-slot-0 layout, token1-DOWN corresponds to
   the base asset rising, so `down < up` biases the anchor toward
   chasing base rallies (momentum asymmetry).
@@ -1182,68 +1324,56 @@ Why the dead-band exists (and must not be removed):
   every swap of the block. Below the quantum a swap pays one SLOAD +
   one mulDiv here and exits.
 
-**Calibration rule: each dead-band `≲ feeFloorBps · 1e14`** — neither
-band should exceed the fee floor (or the flat `baseFee` when the ramp
-is disabled), all read as relative fractions. Rationale: the vp cost
-of a repeg fired at deviation `dev` grows ~quadratically in `dev`
-(move size `dev/5` × reserve imbalance ∝ `dev`), while the fee-funded
-growth budget accrued by the very flow that created the deviation
-grows only ~linearly in `dev`. `cost/budget ∝ dev`, and the dead-band
-pins the *first permitted attempt* on its side at `dev = threshold` —
-set it far above the fee scale and that first move is already
-unaffordable: the post-repeg gate skips (the halving ladder softens
-but cannot remove this — even the smallest rung's cost still scales
-with `dev`), and waiting only worsens the ratio (a stall that
-persists until unrelated volume replenishes the budget). The step cap
-needs no such guard: a large cap only widens the per-commit ceiling
-while the damping `deviation/5` keeps individual moves proportional.
+**Calibration is independent of the fee rate.** A threshold decides when
+an anchor move may be attempted; the step cap, damping and existing LP-budget
+gates decide how far it can move and whether that move is affordable. There
+is no universal requirement that either dead-band be below the swap fee.
+In-range thresholds above the floor or flat fee are valid. A live ramp has
+a minimum 1 bps floor; flat-fee mode ignores the stored floor.
 
-| regime | dead-band                                 | behaviour                                                              |
-| ------ | ----------------------------------------- | ---------------------------------------------------------------------- |
-| quiet  | large (e.g. `5e15` with a 60 bps floor)   | rare, meaningful repegs; anchor lags the EMA by up to one dead-band     |
-| tight  | tiny (e.g. `1e14` and below)              | near-continuous tracking; dust commits at the full cadence once a cushion exists |
+Choose a band for the pair's concentration and desired tracking sensitivity.
+For example, `1e15` WAD is 0.1% (10 bps); `5e14` is 0.05% (5 bps).
+These are one-sided geometric EMA/anchor deviations, not the full width of
+the concentration region. A wider band reduces attempts while the market
+stays inside it, but neither the band nor the fee alone guarantees enough
+budget after a lasting repricing. A zero share still disables all repegs.
+The donation parachute still requires `parachuteBandMult × activeBand`
+of lag in addition to its buffer/solvency checks; changing the band also
+changes that trigger.
 
-Worked check against the bundled presets: WETH (`Up 2.5e15 /
-Down 1.5e15`, floor `136 bps = 1.36e16`) ✓; WBTC (same bands, floor
-`146 bps = 1.46e16`) ✓. A misconfigured sharp-curve pool (floor
-`2 bps = 2e14`, band `1e15`) stalls: at `dev = threshold` the
-forced move already costs ~2× the accrued budget, and the gap only
-widens as `dev` grows.
-
-Two refinements from the 2026-07 stall-risk study (measured through the
-exact kernel):
-
-- **Flat-fee pools need extra margin.** The binding deviation is not
-  `dev = threshold` but `dev ≈ 5·step..20·step` (the damping cap stops
-  shrinking the move there while the budget is still ~linear). For
-  pools with `feeRampBps = 0` use `threshold ≤ 0.7 · baseFee · 1e14`;
-  ramp-enabled pools are rescued by the ramp revenue in exactly that
-  window, so the plain rule holds with margin.
-- **A lower bound exists too.** The anchor's maximum slew rate is
-  `step × commits/day`, so a quantum far below
-  `expected daily |move| / swaps per day` leaves the pool
-  bandwidth-limited: it can never track a fast repricing regardless of
-  budget (it relies on mean reversion instead). This is a tracking-lag
-  trade-off, not a stall — but size it consciously.
+**Runtime policy only:** a timelocked threshold or step update must leave
+both activation bands `<= repegStepWad`. The timelock checks the relation
+against the live state at queue AND execution time, in both update paths
+(`RepegThresholdExceedsStep`). Equality is allowed. Creation remains
+independent: the factory enforces only the existing absolute ranges, so a
+pool created with a band above its step must bring the pair into the
+runtime relation before applying such updates. Fee changes are independent
+of this relation; the existing half/double step-change limit remains.
 
 ### Geometric EMA + oracle protection
 
-`PoolOracle.updateEma` averages in the **log domain** (geometric EMA):
+`PoolOracle.updateEma` keeps the geometric EMA in **persistent log space**:
 
 ```
-ratio  = divWad(cappedSpot, ema)
-ema'   = mulWad(ema, expWad(lnWad(ratio) · (WAD − α) / WAD))
+alpha  = expWad(-elapsed * WAD / tau)
+logNew = logOld + (lnWad(cappedSpot) - logOld) * (WAD - alpha) / WAD
+ema    = max(1, expWad(logNew)) // decoded for views, repegs and events only
 ```
 
-An arithmetic EMA carries a Jensen bias: `EMA(p) · EMA(1/p) ≥ 1`
-(≈ σ²/2 of the mixed ratios), so the same market read through the two
-token orders produces oracles that disagree by the price variance —
-an orientation-dependent repeg subsidy on whichever side is
-convexity-favoured. The log-domain blend removes the bias exactly:
-mirroring every price reciprocates the EMA bit-for-bit (up to
-fixed-point dust), and `spot == ema` is an exact fixed point. The
-Rust kernel (`equilibra_math.rs::geometric_ema_step` over `ln_wad` /
-`exp_pos_wad`) mirrors the same op order for bit-for-bit parity.
+Signed division truncates toward zero. Solidity stores an unbiased int256
+`_emaLogWad`; Rust stores `ema_log_wad: i128` and uses signed 256-bit
+intermediates. Every supported price logarithm fits in i128. A zero logarithm
+means price one, never an empty oracle. Only a zero update timestamp bootstraps.
+The decoder's minimum is one WAD price unit (1e-18 token0 per token1).
+
+Keeping the logarithm prevents repeated updates from discarding sub-price-unit
+movement. Constant spot is an exact fixed point of the stored logarithm;
+decoding ln(price) can differ from that input price by integer rounding dust.
+The geometric average is reciprocal-invariant in real arithmetic, with only
+fixed-point dust in the integer implementation. Rust `geometric_ema_log_step`
+uses the same Solady ln/exp algorithms and signed operation order. Trace replay
+requires the raw signed `equilibraEmaLogWad`; the rounded price is not a state
+substitute. Price getters and event fields continue to return WAD prices.
 
 Protection layers:
 
@@ -1260,7 +1390,7 @@ Protection layers:
    block — never more than one per second — regardless of how the EMA
    moves.
 
-The bootstrap path (no prior EMA) seeds the EMA with the current spot
+The bootstrap path (zero update timestamp) seeds ln(current spot)
 without applying the cap — there is no history to anchor against.
 Same-block re-entries are no-ops by design.
 
@@ -1274,13 +1404,26 @@ Factory owner can pause individual pools:
 - **Allowed when paused:** `removeLiquidity`, `collectProtocolFees`.
 
 ```solidity
-function setPaused(bool paused_) external; // factory owner only
-function paused() external view returns (bool);
+function setPaused(bool paused_, bool stopped_) external; // factory owner only
+function paused() external view returns (bool paused_, bool stopped_);
 ```
 
-`removeLiquidity` stays callable while paused so LPs can always exit;
-the exit also performs its proportional donation-buffer rebalancing
-burn (value-neutral — it only keeps `parked/active` invariant).
+`paused()` returns both flags in one call; there is no separate `stopped()` getter.
+
+`setPaused(true, false)` is reversible; `setPaused(true, true)` permanently
+stops the pool. `(false, true)` always reverts `InvalidPauseState`. Once
+stopped, all other authorized calls are no-ops (no event), even after a
+factory ownership change. `PauseStateChanged` reports both flags.
+
+`removeLiquidity` stays callable in either state and still burns the
+proportional donation-buffer share. A temporary pause keeps LP reanchoring
+and the post-transfer solvency check. A permanent stop skips both: exits
+no longer depend on curve/LP-value arithmetic or surplus backing, and the
+cached LP metrics remain stale. Payouts use recorded reserves; they are
+not prorated against any actual token deficit. Min-out checks and safe token
+transfers still apply, so a partial funded payout can succeed while a
+transfer exceeding the actual balance still reverts atomically.
+`collectProtocolFees` retains its own solvency check.
 Donations are untouched by the pause: the guarded entrypoint is
 `EquilibraRouter.donate` (the router has no pause switch) and the
 primitive is a plain LP transfer to the pool address — neither goes
@@ -1292,17 +1435,17 @@ through a pausable pool function.
 
 | Parameter           | Range                  | Description                                                                                                        |
 | ------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `aWad`              | `[1e17, 99e16]`        | Depth-at-anchor knob (WAD). `A(D=0) = a`; larger `a` deepens the plateau at the centre. Forbidden at WAD (would force constant-sum / ill-conditioned L-quadratic). |
-| `lambdaWad`         | `[1e15, 1e18]`         | Plateau-width knob (WAD). At `λ·D = W`, `A = a/2` (half-amplification distance). Larger `λ` narrows the plateau. Decoupled from `aWad`. |
-| `baseFee`           | `[5, 2000]` bps        | Maximum swap fee = ceiling of the smoothstep ramp.                                                                 |
+| `aWad`              | `[1e17, WAD - 1]`      | Depth-at-anchor knob (WAD). `A(D=0) = a`; larger `a` deepens the plateau at the centre. WAD is excluded because its center has zero price slope. Integer conditioning can still cause a checked quote to reject below the ceiling. |
+| `lambdaWad`         | `[1e12, 1e18]`         | Plateau-width knob (WAD). At `λ·D = W`, `A = a/2` (half-amplification distance). Larger `λ` narrows the plateau. Decoupled from `aWad`. |
+| `baseFee`           | `[1, 2000]` bps        | Maximum swap fee = ceiling of the smoothstep ramp.                                                                 |
 | `feeRampBps`        | `[0, 10000]` bps of WAD | Smoothstep warm-up width. `0` disables the ramp (flat `baseFee`). A live ramp must satisfy `feeRampBps · (BPS − baseFee)² ≥ FEE_RAMP_GUARD_MULT · BPS · (baseFee − feeFloorBps)²` (`FeeRampTooNarrow`) — narrower ramps would make a larger exact-in trade return less output. |
-| `feeFloorBps`       | `[0, baseFee]` bps     | Lower bound of the dynamic fee. Equality with `baseFee` only allowed when `feeRampBps == 0` (factory rejects the misconfig). |
-| `repegShareBps`     | `[0, 10000]` bps       | Share of **total fee** budget the repeg gate may spend. `0` disables auto-repeg; `5000` is the conservative 50/50 reference; the bundled presets use `5500` (WETH) / `7000` (WBTC). Capped by `BPS − protocolFeePercent · 100` (factory revert `RepegShareExceedsBudget`). |
+| `feeFloorBps`       | live: `[1, baseFee)` bps; flat: ignored | Lower bound of the dynamic fee. A live ramp therefore needs `baseFee >= 2`; equality with `baseFee` is only allowed when `feeRampBps == 0`. |
+| `repegShareBps`     | `[0, 10000]` bps       | Share of **total fee** budget the repeg gate may spend. `0` disables auto-repeg; `5000` is the conservative 50/50 reference; the bundled WETH and WBTC presets both use `7000`. Capped by `BPS − protocolFeePercent · 100` (factory revert `RepegShareExceedsBudget`). |
 | `protocolFeePercent`| `[0, 25]`              | Protocol slice of every swap fee, percent (NOT bps). Capped at 25 % so `repegShareBps` and the LP residual always have meaningful budget. |
-| `emaPeriod`         | `[60, 419731]` seconds | Half-life of the price EMA. The factory stores the internal relaxation time `tau = ceil(emaPeriod · 1000 / 694)` (bounded by `MAX_EMA_PERIOD = 7d`, hence the ≈4.86 d input ceiling); `getFeeConfig` returns the half-life back bit-for-bit. |
-| `repegStepWad`      | `[1, WAD]`             | Per-repeg cap on the log-domain `priceScale` step: `applied = min(repegStepWad, deviation / REPEG_DAMPING_DIVISOR)`, committed as `priceScale · expWad(±applied)` at most once per block and never more than once per second (the halving ladder may settle on `applied >> k`, `k ≤ 3`). Bounds the anchor's slew rate (and its manipulability through the EMA). No fee-scale guard applies to the cap. |
-| `repegThresholdToken1UpWad` | `[1, WAD]`     | Activation dead-band while `ema > priceScale` (token1 price rising in token0 terms): short-circuit while the **geometric** deviation `\|max(ema,priceScale)/min(ema,priceScale) − 1\|` is below it. The geometric metric makes a ±2× move read `1.0` WAD both ways, so the full `[1, WAD]` range is usable under the `[ps/2, 2ps]` EMA clamp. When auto-repeg is live (`repegShareBps != 0`) the factory enforces the stall guard `threshold ≤ feeScale · 1e14` per side (revert `RepegThresholdExceedsFeeScale`); with `repegShareBps == 0` both bands are inert and only the `[1, WAD]` range applies. |
-| `repegThresholdToken1DownWad` | `[1, WAD]`   | Same dead-band for the opposite side (`ema < priceScale`, token1 price falling — i.e. the base asset rising under the mainnet base-in-slot-0 layout). Setting `down < up` makes the anchor chase base rallies more eagerly than drawdowns (the bundled presets ship `2.5e15 / 1.5e15`). Same range and per-side stall guard as the `up` band. |
+| `emaPeriod`         | public `[600, 419731]`; private `[60, 419731]` seconds | Half-life of the price EMA. The factory stores the internal relaxation time `tau = ceil(emaPeriod · 1000 / 694)` (bounded by `MAX_EMA_PERIOD = 7d`, hence the ≈4.86 d input ceiling); `getFeeConfig` returns the half-life back bit-for-bit. |
+| `repegStepWad`      | `[1, WAD]`             | Per-repeg cap on the log-domain `priceScale` step: `applied = min(repegStepWad, deviation / REPEG_DAMPING_DIVISOR)`, committed as `priceScale · expWad(±applied)` at most once per block and never more than once per second (the halving ladder may settle on `applied >> k`, `k ≤ 3`). Bounds the anchor's slew rate (and its manipulability through the EMA). At runtime the step cannot be changed below either live activation band. |
+| `repegThresholdToken1UpWad` | `[1, WAD)`     | Activation dead-band while `ema > priceScale` (token1 price rising in token0 terms): short-circuit while the **geometric** deviation `\|max(ema,priceScale)/min(ema,priceScale) − 1\|` is below it. Exact WAD is excluded because decoding the capped log-EMA can round its deviation below WAD. Creation bounds are independent of fees and the step. Timelocked band/step updates require both bands ≤ the live/new step respectively. With `repegShareBps == 0` both bands are inert. |
+| `repegThresholdToken1DownWad` | `[1, WAD)`   | Same dead-band for the opposite side (`ema < priceScale`, token1 price falling — i.e. the base asset rising under the mainnet base-in-slot-0 layout). Setting `down < up` makes the anchor chase base rallies more eagerly than drawdowns (the bundled presets ship `2.5e15 / 1.5e15`). Same absolute range and timelock-only step relation as the `up` band. |
 | `parachuteBandMult` | `[1, 255]`             | Donation-parachute activation multiplier K: the parachute opens only at a geometric deviation ≥ `K × active dead-band`. Per-pool storage seeded at `Constants.REPEG_PARACHUTE_BAND_MULT = 30` for every pool — **never** a creation parameter — and timelock-adjustable (`queueParachuteBandMult` / `executeParachuteBandMult`; zero reverts `InvalidParachuteBandMult`). Exposed as the last field of `getFeeConfig()`. |
 
 ### Runtime-adjustable parameters (param timelock)
@@ -1343,9 +1486,10 @@ the 7-day grace stay identical.
   and LPs keep a full exit
   window between moves), the direction-split dead-band pair
   (`queueRepegThresholds(up, down)` — both bands change together,
-  validated against the factory range and the stall guard on the LIVE
-  fee scale at queue AND execution time), `repegShareBps`
-  (floor `5000` user-space; ceiling `9500`
+  validated against the factory range and the LIVE step cap at queue
+  AND execution time; step changes likewise cannot fall below either band), `repegShareBps`
+  (floor `5000` user-space, with strict increases from a nonzero live
+  share allowed below that floor; ceiling `9500`
   in STORED space, i.e. after the protocol-fee gross-up, so LPs keep
   ≥ 5% of growth at any `protocolFeePercent`; pools created with
   `repegShareBps = 0` keep it immutable in both directions), and
@@ -1367,30 +1511,21 @@ the 7-day grace stay identical.
   No delay bypass exists — every change still waits its full queue window.
 - **Immutable forever:** `aWad`, `lambdaWad` (the curve LPs bought
   into), `emaPeriod` (oracle manipulation-resistance) and
-  `protocolFeePercent`. Fee changes are re-validated against the two
-  stored dead-bands via the stall guard, and threshold changes against
-  the live fee scale — the pair can never drift into a stalling
-  combination through either path.
+  `protocolFeePercent`. Fees are independent of the dead-bands. Timelocked
+  threshold/step changes preserve `Up ≤ step` and `Down ≤ step` against the
+  live state at both queue and execution time.
 - The pool-side setters are bare stores gated to the timelock — the
   same trust split as `initialize` (factory validates, pool stores),
   preserving the pool's scarce bytecode headroom. Every invariant (fee
-  bounds, ramp headroom, stall guard) and every policy rule is
+  bounds, ramp headroom, monotonicity) and every runtime policy rule is
   enforced by the timelock both at queue time and again at execution
   time against the live config.
 
-> Recommended defaults for general-purpose pools: `feeRampBps = 1000`,
-> `feeFloorBps = 20`, `repegShareBps = 5000`. Stable / pegged pools tighten
-> the ramp (`feeRampBps = 50…200`) and shrink both dead-bands to `1e14`
-> (symmetric — the Up/Down split is a momentum knob for volatile pairs,
-> not a pegged-pool tool). The factory **enforces**
-> `repegThresholdToken1{Up,Down}Wad ≤ feeScale · 1e14` per side whenever
-> `repegShareBps != 0` (`RepegThresholdExceedsFeeScale`; feeScale is the
-> floor with a live ramp, flat `baseFee` otherwise) — see "Sizing the
-> repeg knobs" above for the stall mechanics behind the rule. Note the
-> corollary: `feeFloorBps = 0` with a live ramp is undeployable while
-> auto-repeg is enabled (the cap collapses to zero) — raise the floor
-> to at least 1 bps or disable auto-repeg. For flat-fee pools prefer
-> extra margin (`≤ 0.7 · baseFee · 1e14`, see the refinements above).
+> Repeg thresholds are per-pool calibration choices, independent of fees.
+> A live ramp requires a fee floor of at least 1 bps;
+> the existing LP-budget and donation checks still decide whether an
+> attempted move can commit. Threshold/step updates through the timelock
+> additionally require both bands to be no greater than the step cap.
 >
 > **Rebalance cadence is `protocolFeePercent`-independent.** Two pools
 > with the same curve / fee / share settings will fire auto-repegs
@@ -1405,24 +1540,22 @@ Two independent concentration knobs (`aWad`, `lambdaWad`), both
 stored as `uint64` WAD-scaled values. Display values are simply
 `wad / 1e18` (e.g. `aWad = 5e17` ↔ display `0.5`).
 
-| Param       | Contract (WAD)        | Contract (display) | Visualizer (research band) |
+| Param       | Contract (WAD)        | Contract (display) | Visualizer (production bounds) |
 | ----------- | --------------------- | ------------------ | -------------------------- |
-| `aWad`      | `[1e17, 99e16]`       | `[0.1, 0.99]`      | `[0.01, 0.99]`             |
-| `lambdaWad` | `[1e15, 1e18]`        | `[0.001, 1.0]`     | `[0.0001, 10]`             |
+| `aWad`      | `[1e17, WAD - 1]`     | `[0.1, 0.999999999999999999]` | same bounds |
+| `lambdaWad` | `[1e12, 1e18]`        | `[0.000001, 1.0]`     | `[0.000001, 1.0]`            |
 
 Contract bounds (`Constants.A_MIN_WAD` / `A_MAX_WAD` /
 `LAMBDA_MIN_WAD` / `LAMBDA_MAX_WAD`) are enforced by
 `EquilibraFactory` at deploy time (revert with `InvalidA` or
-`InvalidLambda`). The Curve Lab in the visualizer exposes a wider
-research band — values outside the production envelope are
-rejected by the factory but are useful when calibrating new
-presets via the live curve preview.
+`InvalidLambda`). Curve Lab uses the same production bounds. Slider presets and
+API payloads preserve decimal-string WAD values, including WAD - 1.
 
 ---
 
 ## Code conventions
 
-- **PRECISION = 1e18** for all scaled values. `BPS = 10_000`.
+- **Units:** external prices, parameters and LP accounting use WAD=1e18; internal depth L uses Q128=2^128 and quote K uses WAD * 2^18. Native reserves keep token decimals. `BPS = 10_000`.
 - All math goes through Solady's `FixedPointMathLib` (`mulWad`, `mulDiv`,
   `mulDivUp`, `divWad`, `sqrt`, `powWad`, `expWad`).
 - Internal storage uses underscore prefixes (`_reservesPacked`,
@@ -1430,7 +1563,7 @@ presets via the live curve preview.
   and protocol-fee buckets are packed two `uint128`s per slot.
 - Custom errors only — no `require(string)`. Surface lives in
   `libraries/Errors.sol`.
-- Solidity `0.8.36` with `optimizer.runs = 2000`, `viaIR = true`,
+- Solidity `0.8.36` with `optimizer.runs = 999`, `viaIR = true`,
   `evmVersion = "cancun"`.
 - English-only comments and NatSpec.
 - The pool **never** assumes `name` / `symbol` are constants — clones boot
@@ -1458,8 +1591,7 @@ test/
 │                                   #   PriceScaleUpdatedEventArgs, SmoothstepFee, SolveLPostRepeg,
 │                                   #   SqrtPriceX96, SwapMathHelpers, SwapPath, SwapSymmetry,
 │                                   #   TwoKnobIndependence, TwoKnobMonotonicityEdge,
-│                                   #   ArbitrageMath, DistanceFromAnchor, HighPrecisionHarness,
-│                                   #   UsdtWbtcAwayTowardTable.
+│                                   #   ArbitrageMath, DistanceFromAnchor, HighPrecisionHarness.
 ├── periphery/                      # Router integration: factory, multicall, multi-hop, WETH9, zap,
 │                                   # param timelock (10 files):
 │                                   # (FactoryBoostRegistry, FactoryIntegration, FactorySafeSymbol,
@@ -1485,6 +1617,29 @@ test/
     └── GeneralRustParity.test.ts     # Full scenario (quote + swap + add/remove + auto-repeg).
 ```
 
+### Small-lambda regression fixtures
+
+The six `*-monotonicity.json` files preserve historical reversal inputs,
+old outputs and old fees. They are evidence, not current quote expectations;
+do not delete fee-only dust inputs or overwrite the historical reversals.
+
+`equilibra-small-lambda-regression.json` separately pins current native
+quotes/fees, both quote and swap refusals, completed historical cycles,
+and exact dense-grid coverage/refusal totals. Classification digests also
+pin which inputs pass/refuse. Expected output-margin boundary refusals
+are counted separately and never substitute for completed round trips.
+Solidity checks every historical outcome against the same Rust snapshot.
+
+```bash
+npm run simulator:fixtures:small-lambda -- --check  # reproduce without writing
+npm run simulator:fixtures:small-lambda -- --write  # explicit baseline update
+```
+
+The generator reuses the dense/historical test code; invariant checks stay
+enabled while regenerating. Review new refusals and the baseline diff,
+then run the tests. Do not add a percentage cushion to coverage checks.
+Copy the resulting snapshot to the desktop fixture mirror when synchronizing.
+
 ### Internal-helper tests via `MockEquilibraPool`
 
 Some regression tests (e.g. the post-swap-reserves repeg invariant in
@@ -1503,9 +1658,12 @@ the Solidity twin of the corresponding Rust unit test). Tests load it via
 `getContractFactory("MockEquilibraPool")`; production bytecode is
 untouched.
 
-All numbers (presets, gas estimates, prices) used by the parity tests are
+Decimal/coordinate and WAD-K diagnostics live separately in
+`contracts/mocks/SwapMathDiagnostics.sol`, behind the existing harness APIs.
+
+All numbers (presets, prices) used by the parity tests are
 sourced from `simulator/test_helpers/config.ts`, which itself shells out
-to `equilibra-offchain-config-defaults`; gas estimates and Curve donation
+to `equilibra-offchain-config-defaults`; actor and Curve donation
 settings come from that same typed JSON, without source-code parsing. That is by design — the
 on-chain tests cannot drift away from the simulator's single source of
 truth, no matter how the dashboard or hand-edited `params.json` is
