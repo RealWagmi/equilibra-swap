@@ -147,8 +147,8 @@ async function deployQuoterPool(opts: PoolOpts = {}) {
       // checked against a different reference frame. A zero share
       // explicitly disables tracking instead of relying on a large band.
       repegStepWad: WAD,
-      repegThresholdToken1UpWad: WAD,
-      repegThresholdToken1DownWad: WAD,
+      repegThresholdToken1UpWad: WAD - 1n,
+      repegThresholdToken1DownWad: WAD - 1n,
       feeRampBps,
       feeFloorBps,
       repegShareBps: 0,
