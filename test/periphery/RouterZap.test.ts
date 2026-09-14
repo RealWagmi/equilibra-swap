@@ -1278,6 +1278,44 @@ describe("EquilibraRouter: zap operations", function () {
       expect(swapAmount).to.equal(0n);
     });
 
+    for (const decimals of [
+      [18, 18],
+      [18, 6],
+      [8, 6],
+    ] as [number, number][]) {
+      it(`previewZapOut rejects unavailable LP before arithmetic (${decimals.join("/")})`, async function () {
+        const { owner, pool, router, tokens } = await deployNativeRouterFixture({
+          decimals,
+          seedRatio: [500_000n, 500_000n],
+          initialSwap: false,
+        });
+        const poolAddress = await pool.getAddress();
+        const token0 = await tokens[0].getAddress();
+        const token1 = await tokens[1].getAddress();
+        const totalSupply = await pool.totalSupply();
+
+        for (const withParkedShares of [false, true]) {
+          if (withParkedShares) await pool.transfer(poolAddress, totalSupply / 10n);
+          const activeSupply = totalSupply - (await pool.balanceOf(poolAddress));
+          expect(activeSupply).to.be.greaterThan(0n);
+          if (withParkedShares) expect(activeSupply).to.be.lessThan(totalSupply);
+          const invalidAmounts = new Set([activeSupply, activeSupply + 1n, totalSupply, totalSupply + 1n, MaxUint256]);
+
+          for (const tokenOut of [token0, token1]) {
+            for (const liquidity of invalidAmounts) {
+              await expect(router.previewZapOut(token0, token1, 0, liquidity, tokenOut)).to.be.revertedWithCustomError(
+                router,
+                "InsufficientLiquidity"
+              );
+            }
+            expect(await router.previewZapOut(token0, token1, 0, 0n, tokenOut)).to.equal(0n);
+            const validShares = (await pool.balanceOf(owner.address)) / 4n;
+            expect(await router.previewZapOut(token0, token1, 0, validShares, tokenOut)).to.be.greaterThan(0n);
+          }
+        }
+      });
+    }
+
     it("previewZapOut returns 0 for liquidity == 0", async function () {
       const { weth, usdc, router } = await loadFixture(deployFixture);
       const out = await router.previewZapOut(

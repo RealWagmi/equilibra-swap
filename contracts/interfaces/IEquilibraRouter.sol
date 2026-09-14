@@ -453,7 +453,8 @@ interface IEquilibraRouter is IMulticall {
      * the same pre-state on an unpaused pool pays exactly this amount.
      * @dev Point-in-time: any intervening swap or liquidity action invalidates the quote, so
      * callers apply their own margin to `minAmountOut`. Unexecutable dust exits revert here with
-     * the execution path's error. `liquidity == 0` returns `0` as a quote convention while
+     * the execution path's error. A burn at or above the active supply reverts `InsufficientLiquidity`.
+     * `liquidity == 0` returns `0` as a quote convention while
      * execution rejects a zero burn with `ZeroAmount`. Reverts `IdenticalTokens` when
      * `tokenA == tokenB` and `UnsupportedToken` when `tokenOut` is not a pair token.
      * @param tokenA One pair token (either order).

@@ -815,6 +815,7 @@ contract EquilibraRouter is
         (uint256 r0, uint256 r1) = poolI.getReserves();
         uint256 supply = IERC20Metadata(pool).totalSupply() - IERC20Metadata(pool).balanceOf(pool);
         if (supply == 0) return 0;
+        if (liquidity >= supply) revert Errors.InsufficientLiquidity();
 
         uint256 amount0 = liquidity.fullMulDiv(r0, supply);
         uint256 amount1 = liquidity.fullMulDiv(r1, supply);
