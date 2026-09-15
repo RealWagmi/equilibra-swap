@@ -23,8 +23,9 @@ export interface CoreDeployConfig {
   /// value at creation — a post-deploy setter call would leave a
   /// window where pools lock in a zero protocol share forever.
   protocolFeePercent: number;
-  /// Run `verify:verify` for every deployed contract (skipped
-  /// automatically on local dev chains).
+  /// Run Sourcify and `verify:verify` for every deployed contract (skipped
+  /// automatically on local dev chains). When the explorer refuses scripted
+  /// clients, `npm run deploy:verify-inputs` provides the browser fallback.
   verify: boolean;
 }
 

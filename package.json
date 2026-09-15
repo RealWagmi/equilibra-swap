@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "description": "EquilibraSwap - Asymmetric AMM with concentrated liquidity",
+  "author": {
+    "name": "fann95",
+    "email": "fann95@proton.me",
+    "url": "https://wagmi.com/"
+  },
   "scripts": {
     "compile": "hardhat clean && hardhat compile --show-stack-traces",
     "size": "hardhat size-contracts",
@@ -12,6 +17,7 @@
     "deploy": "npx hardhat run ./scripts/deploy/core.ts --network $npm_config_network",
     "deploy:pools": "npx hardhat run ./scripts/deploy/create-pool.ts --network $npm_config_network",
     "deploy:verify": "npx hardhat run ./scripts/deploy/verify.ts --network $npm_config_network",
+    "deploy:verify-inputs": "npx hardhat run ./scripts/deploy/export-verify-inputs.ts --network $npm_config_network",
     "lint-fix": "prettier --write --plugin=prettier-plugin-solidity 'contracts/**/*.sol' && prettier --write 'scripts/**/*.ts' && prettier --write 'test/**/*.ts'",
     "simulator:fixtures:small-lambda": "cargo run --manifest-path simulator/Cargo.toml --release --example update_small_lambda_fixtures --",
     "simulator:clean": "cargo clean --manifest-path simulator/Cargo.toml",

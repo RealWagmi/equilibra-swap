@@ -182,22 +182,23 @@ export function gitCommit(): string {
 //      It is a record in Sourcify's own repository: explorers do not
 //      import it on their own, so it never publishes sources on a
 //      contract page by itself.
-//   2. The explorer's Etherscan-compatible API (Blockscout on Robinhood)
-//      — this is what publishes browsable sources and the Read/Write
-//      tabs. Hosted Blockscout instances rate-limit it aggressively.
+//   2. The explorer's Etherscan-compatible API through hardhat-verify —
+//      this is what publishes browsable sources and the Read/Write tabs.
 //
-// Both are attempted per contract: Sourcify pins an independently
-// checkable record even when the explorer is throttling.
+// Hosted Blockscout instances may refuse scripted clients outright
+// (Cloudflare challenge on Robinhood, per IP, extended by every request
+// made while blocked). When that happens the plugin fails fast here and
+// `npm run deploy:verify-inputs` writes the exact standard JSON inputs plus
+// `artifacts/verify-inputs/<network>/verify.html`, whose pre-filled forms a
+// browser submits itself; that is the path that verified the Robinhood
+// deployment. A Blockscout 500 page in reply to such a form still means
+// the job was accepted (the contract verifies about a minute later).
 // ---------------------------------------------------------------------------
 
 const SOURCIFY_SERVER = "https://sourcify.dev/server";
 const SOURCIFY_POLL_MS = 4_000;
 const SOURCIFY_POLL_ATTEMPTS = 45;
 
-/// Submit one contract to Sourcify's v2 API from its Hardhat build info.
-/// Constructor arguments are recovered by Sourcify from on-chain data, so
-/// none are passed here; without a creating-transaction hash the result
-/// is a runtime match, which is what explorers consume.
 export async function verifyOnSourcify(
   label: string,
   address: string,
@@ -253,6 +254,92 @@ export async function verifyOnSourcify(
   }
 }
 
+/// Trim a standard JSON input to the transitive import closure of one
+/// source, so the explorer compiles (and lists) only what the contract
+/// needs instead of every file of the build, mocks included. Imports are
+/// resolved the way solc does for this project: relative paths against the
+/// importing file, everything else as a direct key of `sources`. Falls back
+/// to the full input if any import cannot be located.
+export function minimalStandardJsonInput<T extends { sources: Record<string, { content: string }> }>(
+  input: T,
+  sourceName: string
+): T {
+  const seen = new Set<string>();
+  const stack = [sourceName];
+  const importRe = /import\s+(?:[^;]*?\s+from\s+)?["']([^"']+)["']\s*;/g;
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    if (seen.has(current)) continue;
+    const entry = input.sources[current];
+    if (!entry) return input;
+    seen.add(current);
+    for (const match of entry.content.matchAll(importRe)) {
+      const target = match[1];
+      stack.push(
+        target.startsWith(".") ? path.posix.normalize(path.posix.join(path.posix.dirname(current), target)) : target
+      );
+    }
+  }
+  const sources: Record<string, { content: string }> = {};
+  for (const name of Object.keys(input.sources).sort()) {
+    if (seen.has(name)) sources[name] = input.sources[name];
+  }
+  return { ...input, sources };
+}
+
+/// ABI-encode constructor arguments from the artifact's constructor
+/// signature; hex without the 0x prefix, empty when there is no
+/// constructor input.
+export async function encodeConstructorArgs(contract: string, constructorArguments: unknown[]): Promise<string> {
+  const artifact = await hre.artifacts.readArtifact(contract);
+  const inputs = (artifact.abi as Array<{ type: string; inputs?: unknown[] }>).find((f) => f.type === "constructor")
+    ?.inputs as Array<Record<string, unknown>> | undefined;
+  if (!inputs || inputs.length === 0) return "";
+  return hre.ethers.AbiCoder.defaultAbiCoder()
+    .encode(
+      inputs.map((i) => hre.ethers.ParamType.from(i)),
+      constructorArguments
+    )
+    .slice(2);
+}
+
+export type VerifyTarget = [label: string, address: string, constructorArguments: unknown[], contract: string];
+
+/// The four core contracts of a deployment in verification order.
+export function coreVerifyTargets(doc: DeploymentsDoc): VerifyTarget[] {
+  const c = doc.contracts;
+  return [
+    ["EquilibraPool (implementation)", c.poolImplementation, [], "contracts/EquilibraPool.sol:EquilibraPool"],
+    [
+      "EquilibraFactory",
+      c.factory,
+      [c.poolImplementation, doc.feeCollector, doc.weth9, doc.protocolFeePercent],
+      "contracts/EquilibraFactory.sol:EquilibraFactory",
+    ],
+    // Deployed from the factory constructor — no constructor arguments.
+    ["EquilibraParamTimelock", c.paramTimelock, [], "contracts/EquilibraParamTimelock.sol:EquilibraParamTimelock"],
+    [
+      "EquilibraRouter",
+      c.router,
+      [c.factory, c.poolImplementation, doc.weth9],
+      "contracts/periphery/EquilibraRouter.sol:EquilibraRouter",
+    ],
+  ];
+}
+
+/// Explorer endpoints of the network from `etherscan.customChains` in
+/// hardhat.config.ts, so the browser page targets the same instance as
+/// hardhat-verify.
+export function explorerUrls(networkName: string): { apiURL: string; browserURL: string } | null {
+  const cfg = (
+    hre.config as unknown as {
+      etherscan?: { customChains?: Array<{ network: string; urls: { apiURL: string; browserURL: string } }> };
+    }
+  ).etherscan;
+  const chain = cfg?.customChains?.find((c) => c.network === networkName);
+  return chain ? { apiURL: chain.urls.apiURL, browserURL: chain.urls.browserURL } : null;
+}
+
 export async function verifyContract(
   label: string,
   address: string,
@@ -272,33 +359,21 @@ export async function verifyContract(
     // the addresses are already persisted, and `npm run deploy:verify`
     // re-runs this step from the document.
     console.error(`VERIFY FAILED for ${label} @ ${address}: ${msg}`);
+    if (/Just a moment|Unexpected token '<'|is not valid JSON|429/i.test(msg)) {
+      console.error(
+        "The explorer is refusing scripted clients (Cloudflare challenge or rate limit). " +
+          "Run `npm run deploy:verify-inputs --network=<network>` and submit artifacts/verify-inputs/<network>/verify.html from a browser."
+      );
+    }
   }
 }
 
 const VERIFY_PACING_MS = 15_000;
 
 export async function verifyCoreFromDoc(doc: DeploymentsDoc): Promise<void> {
-  const c = doc.contracts;
+  const targets = coreVerifyTargets(doc);
   // Hosted explorers rate-limit heavy verification submissions; pace them.
   const pace = () => new Promise((r) => setTimeout(r, VERIFY_PACING_MS));
-  const targets: Array<[string, string, unknown[], string]> = [
-    ["EquilibraPool (implementation)", c.poolImplementation, [], "contracts/EquilibraPool.sol:EquilibraPool"],
-    [
-      "EquilibraFactory",
-      c.factory,
-      [c.poolImplementation, doc.feeCollector, doc.weth9, doc.protocolFeePercent],
-      "contracts/EquilibraFactory.sol:EquilibraFactory",
-    ],
-    // Deployed from the factory constructor — no constructor arguments.
-    ["EquilibraParamTimelock", c.paramTimelock, [], "contracts/EquilibraParamTimelock.sol:EquilibraParamTimelock"],
-    [
-      "EquilibraRouter",
-      c.router,
-      [c.factory, c.poolImplementation, doc.weth9],
-      "contracts/periphery/EquilibraRouter.sol:EquilibraRouter",
-    ],
-  ];
-
   for (const [label, address, constructorArguments, contract] of targets) {
     await verifyOnSourcify(label, address, contract, doc.chainId);
     await verifyContract(label, address, constructorArguments, contract);

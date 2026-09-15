@@ -510,6 +510,13 @@ npm run deploy:pools --network=<hardhat-network>
 # 3. Verification re-run (safe to repeat; already-verified contracts
 #    are skipped) — for when the explorer API flaked during step 1.
 npm run deploy:verify --network=<hardhat-network>
+
+# 3b. Browser fallback when the explorer's edge rejects scripts outright
+#    (Cloudflare challenge): writes the exact standard JSON inputs plus
+#    artifacts/verify-inputs/<network>/verify.html, a page with one
+#    pre-filled form per contract that the browser submits itself. The
+#    explorer may answer with a 500 page and still verify the contract.
+npm run deploy:verify-inputs --network=<hardhat-network>
 ```
 
 Pool specs intentionally have no silent defaults: every parameter of a
