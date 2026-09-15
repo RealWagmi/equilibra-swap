@@ -260,6 +260,14 @@ checking; token transfers, min-out checks, proportional payouts and buffer
 burns remain. Actual token deficits can still prevent transfers larger than
 the remaining balance. Cached LP metrics are not refreshed after these exits.
 
+The factory itself can be retired: the factory owner calls
+`deprecateFactory()` once, after which both `createPoolAndAddLiquidity` and
+`createPrivatePoolAndAddLiquidity` revert `FactoryDeprecated`. The switch is
+irreversible (`deprecated()` reads it) and touches nothing else: existing pools
+keep trading, the registries, whitelist, LP allowlists, Boost bindings and the
+param timelock stay live. It exists so an old factory can be marked invalid
+once a newer version is deployed.
+
 ## Build & test (Solidity)
 
 ```bash
@@ -369,6 +377,12 @@ cargo run --manifest-path simulator/Cargo.toml --bin equilibra-offchain-app --re
 ```
 
 Once the dashboard is up, open <http://127.0.0.1:3100> in your browser.
+
+The full-featured standalone simulator (a desktop application built on the
+same kernel) is distributed as prebuilt releases at
+<https://github.com/RealWagmi/equilibra-simulator-releases>. Download it
+there if you want the complete simulator without building the Rust crate
+from this repository.
 
 Optional environment variables:
 

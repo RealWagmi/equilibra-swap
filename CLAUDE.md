@@ -1429,6 +1429,17 @@ Donations are untouched by the pause: the guarded entrypoint is
 primitive is a plain LP transfer to the pool address — neither goes
 through a pausable pool function.
 
+### Factory deprecation
+
+`EquilibraFactory.deprecateFactory()` (owner only, irreversible, emits
+`FactoryDeprecated`) permanently disables `createPoolAndAddLiquidity` and
+`createPrivatePoolAndAddLiquidity` (`Errors.FactoryDeprecated`, checked
+before config validation). `deprecated()` exposes the flag. Everything else
+on the factory keeps working: existing pools, pair/creator registries,
+whitelist, LP allowlists, Boost bindings, fee-collector and protocol-fee
+setters, and the param timelock. Purpose: mark an old factory invalid once
+a newer deployment exists. A repeated call reverts `FactoryDeprecated`.
+
 ---
 
 ## Key parameters

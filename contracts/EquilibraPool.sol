@@ -395,8 +395,9 @@ contract EquilibraPool is
 
         // Scope 2: Settlement — token transfer, callback, solvency.
         {
-            address tokenIn = zeroForOne ? _token0 : _token1;
-            address tokenOut = zeroForOne ? _token1 : _token0;
+            (address tokenIn, address tokenOut) = zeroForOne
+                ? (_token0, _token1)
+                : (_token1, _token0);
             SafeTransferLib.safeTransfer(tokenOut, recipient, amounts.amountOutRaw);
 
             uint256 balanceBeforeIn = SafeTransferLib.balanceOf(tokenIn, address(this));
@@ -1444,8 +1445,9 @@ contract EquilibraPool is
         MathState memory ms,
         CurveSnapshot memory cs
     ) internal view returns (uint256 feeAmount, uint256 amountInRaw) {
-        uint256 outScale = zeroForOne ? cs.token1Scale : cs.token0Scale;
-        uint256 inScale = zeroForOne ? cs.token0Scale : cs.token1Scale;
+        (uint256 outScale, uint256 inScale) = zeroForOne
+            ? (cs.token1Scale, cs.token0Scale)
+            : (cs.token0Scale, cs.token1Scale);
         uint256 amountInCleanWad;
         {
             uint256 amountOutWad = _toWadByScale(amountOutRaw, outScale);

@@ -83,6 +83,11 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
     address public feeCollector;
 
     /**
+     * @inheritdoc IEquilibraFactory
+     */
+    bool public override deprecated;
+
+    /**
      * @notice Every pool ever created, in deployment order.
      */
     address[] public allPools;
@@ -229,7 +234,9 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         address recipient,
         bool isPrivate
     ) private returns (address pool, uint256 sharesOut) {
-        // Cheapest gate first: config bounds before any pair or storage work.
+        if (deprecated) revert Errors.FactoryDeprecated();
+
+        // Cheapest gate next: config bounds before any pair or storage work.
         _validatePoolConfig(config, isPrivate);
 
         // Symmetric check, so it runs before the sort; it also rejects the all-zero pair.
@@ -587,6 +594,15 @@ contract EquilibraFactory is Ownable, IEquilibraFactory, IEquilibraMintCallback 
         feeCollector = newCollector;
 
         emit FeeCollectorChanged(oldCollector, newCollector);
+    }
+
+    /**
+     * @inheritdoc IEquilibraFactory
+     */
+    function deprecateFactory() external onlyOwner {
+        if (deprecated) revert Errors.FactoryDeprecated();
+        deprecated = true;
+        emit FactoryDeprecated(msg.sender);
     }
 
     /**

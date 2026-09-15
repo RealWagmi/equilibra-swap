@@ -136,6 +136,10 @@ library Errors {
      */
     error PoolExists();
     /**
+     * @notice Pool creation is permanently disabled on this factory, or it is already deprecated.
+     */
+    error FactoryDeprecated();
+    /**
      * @notice Native value was attached but neither token of the pool is WETH9.
      */
     error NoWethLeg();
@@ -203,7 +207,7 @@ library Errors {
     /**
      * @notice The marginal-price denominator is zero.
      */
-    error DivisionByZero();
+    error DegenerateMarginalPrice();
     /**
      * @notice An amount rounds to zero after normalisation, fees or the output margin.
      */

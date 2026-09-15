@@ -79,6 +79,11 @@ interface IEquilibraFactory {
      * @param newCollector New collector.
      */
     event FeeCollectorChanged(address oldCollector, address newCollector);
+    /**
+     * @notice Emitted once, when the owner permanently disables pool creation on this factory.
+     * @param caller Owner that deprecated the factory.
+     */
+    event FactoryDeprecated(address indexed caller);
 
     /**
      * @notice Emitted when the owner binds, rebinds or unbinds the verified Boost wrapper of a
@@ -531,7 +536,26 @@ interface IEquilibraFactory {
      */
     function owner() external view returns (address);
 
+    /**
+     * @notice Whether pool creation has been permanently disabled by {deprecateFactory}.
+     * @dev Existing pools, the registries, the whitelist, the LP allowlists, the Boost bindings
+     * and the param timelock keep working after deprecation; only the two create entrypoints
+     * revert.
+     * @return `true` once the factory is deprecated.
+     */
+    function deprecated() external view returns (bool);
+
     // ============ Admin Functions ============
+
+    /**
+     * @notice Permanently disable pool creation on this factory. Owner only, irreversible.
+     * @dev Intended for retiring this factory in favour of a newer deployment. Both
+     * {createPoolAndAddLiquidity} and {createPrivatePoolAndAddLiquidity} revert
+     * `FactoryDeprecated` afterwards; every other function, including the admin surface for the
+     * existing pools, is unaffected. Reverts `FactoryDeprecated` when already deprecated. Emits
+     * {FactoryDeprecated}.
+     */
+    function deprecateFactory() external;
 
     /**
      * @notice Set the protocol fee percentage. Owner only.

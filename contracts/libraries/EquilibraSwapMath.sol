@@ -207,7 +207,7 @@ library EquilibraSwapMath {
 
         (uint256 xKx, uint256 yKy) = _marginalPriceParts(xMath, yMath, lQ128, aWad, lambdaWad);
 
-        if (yKy == 0) revert Errors.DivisionByZero();
+        if (yKy == 0) revert Errors.DegenerateMarginalPrice();
 
         // Cancel xMath first when WAD-scaled derivative products could overflow; ordinary
         // magnitudes keep the established rounding order.
@@ -577,7 +577,9 @@ library EquilibraSwapMath {
         uint256 numerator;
         uint256 denominator;
         if (kOverS > head) {
-            numerator = kOverS - head;
+            unchecked {
+                numerator = kOverS - head;
+            }
             denominator = FixedPointMathLib.mulDiv(precision - theta, s, precision) + head;
         } else {
             // b ~= lambda*K / (a*L/2 + lambda*s - (1-2*lambda)*K/s).
@@ -585,7 +587,8 @@ library EquilibraSwapMath {
             denominator =
                 FixedPointMathLib.mulDiv(c.a, halfL, Constants.WAD) +
                 FixedPointMathLib.mulDiv(c.lambda, s, Constants.WAD) +
-                2 * numerator;
+                2 *
+                numerator;
             if (denominator <= kOverS) return cp;
             denominator -= kOverS;
         }
