@@ -1,139 +1,78 @@
 # EquilibraSwap
 
-EquilibraSwap is a single-pool concentrated-liquidity AMM. The shape
-of the curve is set by **two independent immutable knobs
-`(aWad, lambdaWad)`** and reshaped on every swap by the pool's own
-off-balance distance `D` in asymmetric (quote-side normalised)
-math-space coordinates:
+EquilibraSwap is an automated market maker for two-token pools that
+keeps liquidity concentrated around the market price without asking
+liquidity providers to manage price ranges. Every pool has an
+**anchor** — the price it is currently concentrated around. Close to
+the anchor the pool trades with the depth of a stable-swap curve; far
+from it the curve relaxes toward constant product, so the pool always
+has a price and never runs dry. The anchor follows the market by
+itself: an on-chain moving average of the pool's own traded prices
+drives an automatic re-anchoring that moves in small, bounded steps
+and is paid for out of accumulated swap fees, never out of LP
+principal.
+
+What that means in practice:
+
+- **Traders** get less slippage than constant product where trading
+  actually happens, and pay a fee that starts at a floor near the
+  anchor and rises smoothly with the imbalance a trade creates.
+- **Liquidity providers** make one deposit of both tokens, with no
+  ranges, no rebalancing and no positions to babysit. Fees accrue into
+  the pool; a configured share of fee growth may be spent on keeping
+  the anchor on-market, the rest is guaranteed to LPs.
+- **Pool creators** choose two immutable curve knobs, `a` and `λ`, and
+  a small set of runtime parameters (fees, re-anchoring step and bands)
+  that change only through a timelock.
+
+The Solidity contracts are the production surface. A Rust simulator in
+`simulator/` is a bit-exact twin of the on-chain math and doubles as a
+benchmark against reference AMMs; the parity tests keep the two in
+lockstep. Contract mechanics, parameter tables and derivations live in
+[`CLAUDE.md`](CLAUDE.md) and the documents listed under
+[Documentation](#documentation).
+
+## The invariant
+
+Reserves are first expressed in **math space**, where the anchor is the
+diagonal:
 
 ```
-priceScaleWad = yWad / xWad  at the anchor      (quote / base, WAD)
-
-xMath = xWad                                    (base, identity)
-yMath = yWad · WAD / priceScaleWad              (quote → base units)
-
-K(x, y; L) = A · L · (x + y) / 2  +  (W − A) · x · y
-A          = a · W / (W + λ · D)
-D          = (y − x)² / (x · y)
-W          = WAD = 1e18
+x = base reserve                       (the reserve of token1, WAD)
+y = quote reserve / priceScale         (token0 reserve, converted into base units)
 ```
 
-At the anchor (`xMath = yMath = L`) the kernel reduces to
-`K = W · L²`. At deep imbalance (`D → ∞`) it collapses to the
-constant-product asymptote `K → W · x · y`, without a finite-price
-liquidity wall in the continuous invariant. Integer execution uses up to
-40 secant iterations. Equal-K and unchanged-counterpart exits apply at every
-iteration; there is no approximate early exit. At the forty-iteration cap,
-the best absolute K residual is checked once at a nominal 0.0001% quote
-tolerance; an unconfirmed candidate rejects SolverDidNotConverge. No unchecked
-best is returned. A proposed
-nonpositive counterpart takes a half-step, b / 2 + 1, instead of jumping
-to one. The curve-aware initializer floors only its linear estimate at
-max(1, floor(CP / 1000)); the small-counterpart tail is unchanged.
-The seed is only a starting guess, not a quote bound or acceptance check.
-Certification returns its candidate unchanged. Exact-in subtracts exactly
-one output margin: max(1, floor(rawOutput / 100000000)) in math units (0.000001%).
-Exact-out solves for trialOutput = requestedOutput + max(1, floor(requestedOutput / 99999999)),
-the conservative integer inverse of that same output-margin rule. There is no
-input surcharge: only native conversion and fee gross-up follow, and settlement
-pays the original requested output. A trial output at or above the reserve
-rejects InsufficientLiquidity. The policy applies to every solver exit.
-The 0.0001% cap tolerance and 0.000001% common margin are separate, not a
-combined error guarantee. Integer exits and rounded-K brackets do not prove universal
-agreement with the continuous invariant.
-Quote K uses WAD * 2^18; diagnostic K getters remain WAD. Internal depth
-and amplification use Q128 through the invariant, marginal price and LP
-valuation. External amounts, prices and LP values retain native/WAD units.
-Native quotes, swaps and zap previews use the same adjusted math quote.
-One strict LP-depth guard compares fresh Q128 depth before and after native
-rounding and settlement, including LP fees and excluding the protocol cut,
-at the unchanged anchor before repeg. A decrease rejects LpValueDecreased.
-There is no reserve-ratio quantum, conditional repair, solver retry or
-second guard. Nonpositive normalized amounts reject the existing typed
-dust error. Post-depth is reused for LP growth and repeg. The common margin
-is not a fee; exact-out's existing gross +1 fee-rounding bump is unchanged.
-At a positive resolved rate, a fee rounded to zero is raised to one raw
-input unit; already-positive floor-fees are unchanged. Exact-out applies
-this minimum before its separate +1 raw gross-input bump. A zero resolved
-rate remains zero, and protocol-fee splitting still rounds down.
-The minimum margin is one math unit, not one native token unit: native
-floor/ceiling conversion can still dominate on 0–2 decimal tokens.
-Invariant-weight products `x*y` and `(x-y)^2` must fit uint256; overflow
-rejects `MathOutOfRange`, including at solver trial states. The diagonal
-depth shortcut also rejects `x=y >= 2^128`. There is no per-coordinate cap
-off diagonal. Genesis, liquidity changes and settlement reuse this depth
-validation; a numeric error during a candidate repeg reverts the entire swap,
-not just the repeg. Economic LP-budget refusals retain the halving/skip policy.
-This does not expand the arithmetic domain or clamp CP starting guesses.
+`priceScale` is the anchor price (quote per base). At the anchor the two
+coordinates are equal, `x = y`. A swap must preserve
 
-Large-coordinate spot ratios reorder their products only above `2^125`;
-ordinary states keep their previous rounding. Oracle/anchor projections use
-full-width products, and V3-price conversions reduce decimal scales before
-multiplication, clamping genuinely unrepresentable final values. CP fee proxies
-with a guaranteed saturated distance return the fee ceiling without squaring
-an oversized difference. The Rust math mirrors these changes; its existing
-anchor remains u128; persistent EMA is an unbiased signed i128 logarithm.
+```
+K = A · L · (x + y) / 2  +  (1 − A) · x · y
 
-`quoteSwapToPrice(tokenIn, tokenOut, poolIndex, sqrtPriceTargetX96)` lives in the Router and is
-intended for off-chain use because its bounded search is expensive. Every probe
-uses the Pool's checked quote and the actual native post-swap reserves. Expected
-quote refusals, including a probe's `MathOutOfRange`, narrow the search toward a smaller input; dust probes try larger
-inputs. The bounded, best-effort search returns only a checked, non-crossing
-candidate, not necessarily the largest possible fill. Normal `quoteExactIn` and
-`quoteExactOut` remain Pool views. No separate quoter deployment is needed.
-The Router resolves the factory's pool from the token pair and pair-local index;
-the target always uses canonical `sqrt(token1 raw / token0 raw) * 2^96` units.
-Quote state is shared with zap previews through typed getters, including the
-lightweight `getPriceScale()` anchor getter. The Router does not decode storage
-slots. Token decimals must remain stable, as required by pool initialization.
-Zap splits use a single product square root when the product fits uint256;
-only oversized products retain the conservative factored estimate. Zap-in
-previews enforce both nonzero deposit legs after the proportional mint cap.
-After genesis, LP shares are priced on token0: its matching token1 payment
-rounds up. If the requested token1 maximum binds, token0 rounds down instead.
-Neither requested maximum is exceeded, and share issuance still rounds down.
-The router's zap-in preview and both Rust copies use the same integer rule.
+D = (y − x)² / (x · y)                 distance from the anchor, 0 on it
+A = a / (1 + λ · D)                    local amplification: a at the anchor, → 0 far away
+```
 
-Repeg activation bands are independent of swap fees: each creation value
-must stay in `[1, WAD]`, but may exceed the floor or flat fee. For example,
-`1e15` means a 0.1% (10 bps) geometric EMA/anchor deviation. Crossing a
-band only permits an attempt; the existing step, cadence and LP-budget gates
-remain. Timelocked threshold/step updates additionally require both bands
-to be no greater than the step cap, checked against the live state at queue
-and execution time. This relation is not a factory creation restriction.
+with the variables:
 
-Highlights:
+| Symbol       | Meaning                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------- |
+| `x`, `y`     | reserves in math space (base units)                                                       |
+| `priceScale` | anchor price; moved by the re-anchoring, immutable during a swap                          |
+| `D`          | how far the current reserves sit from the anchor (relative squared imbalance)             |
+| `A`          | how "stable-swap" the curve is at the current state, between `a` and 0                    |
+| `a`          | **depth-at-anchor knob**, `0.1 ≤ a < 1`: the amplification the pool has when balanced     |
+| `λ`          | **plateau-width knob**, `1e-6 ≤ λ ≤ 1`: how fast `A` decays with imbalance (`A = a/2` at `λ·D = 1`) |
+| `L`          | balance-equivalent depth: the reserve per side the pool would hold if it were exactly balanced with the same `K` (`K = L²` at `x = y = L`) |
 
-- **Two-knob design with full decoupling.** `aWad` ∈ `[0.1·W, W − 1]`
-  controls the depth at anchor (`A(D=0) = a`); `lambdaWad` ∈
-  `[1e12, 1e18]` controls the plateau width (`A = a/2` at `λ·D = W`).
-  Moving one knob never shifts the other's effect — operators can
-  tune centre depth and cliff position independently. The maximum is
-  `999999999999999999` WAD: strictly below one, where the centre slope
-  would vanish. Existing presets retain their previous alpha values;
-  the expanded parameter envelope does not guarantee every quote is executable.
-- **Asymmetric math-space coordinate change.** Only the quote side is
-  normalised by `priceScale`; the base side stays identity. A repeg
-  moves `yMath` only, so off-balance reserves register a genuine
-  math-space displacement after each anchor shift — exactly the IL
-  signal the auto-repeg solvency gate needs.
-- **Anchor that follows the market.** A protected geometric
-  (log-domain) EMA oracle observes every swap; an auto-repeg gate
-  inches `priceScale` toward the EMA in bounded, damped multiplicative
-  steps (`priceScale · exp(±applied)`, with a halving ladder when the
-  budget only affords a partial move), financed entirely by
-  accumulated swap fees. LPs are guaranteed to keep at least
-  `(BPS − repegShareBps) / BPS` of fee growth (the conservative 50 % reference at
-  `repegShareBps = 5 000`).
-- **Dynamic fee.** Smoothstep ramp from `feeFloorBps` near the
-  anchor to `baseFee` at deep imbalance, with a single closed-form
-  prediction per swap. A live ramp requires
-  `1 <= feeFloorBps < baseFee`, so its ceiling is at least 2 bps.
-  Set `feeRampBps = 0` to use a flat fee, including 1 bps.
-- **Bit-exact off-chain twin.** The Rust simulator
-  (`simulator/`) is a byte-for-byte port of the Solidity kernel; the
-  parity tests under `test/simparity/` enforce
-  Solidity == Rust on every PR.
+The invariant is one smooth blend of two familiar curves. The
+`A · L · (x + y) / 2` term is the "sum" curve of a stable-swap: near
+the anchor it dominates and gives deep, near-constant-price liquidity.
+The `(1 − A) · x · y` term is constant product: as the imbalance grows,
+`A` decays through `D` and the constant-product term takes over, so the
+price keeps moving and the pool can never be emptied at a finite price.
+`a` sets how deep the plateau is; `λ` sets how wide it is; the two knobs
+do not interfere with each other. On chain every quantity is WAD
+fixed-point (`1e18` = 1.0).
 
 ---
 

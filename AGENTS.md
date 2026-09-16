@@ -1107,6 +1107,12 @@ Highlights:
   rejects MathOutOfRange. Zap-in previews mirror the pool's nonzero-leg check
   after the proportional deposit cap. MockEquilibraRouter exposes the internal
   split only for boundary tests; no test-only method is added to the production ABI.
+- **Proportional deposits price shares on token0.** After genesis a
+  deposit's share count derives from its token0 leg; the matching
+  token1 payment rounds up. If the requested token1 maximum binds
+  instead, token0 rounds down. Neither requested maximum is exceeded and
+  share issuance still rounds down; the router's zap-in preview and both
+  Rust copies apply the same integer rule.
 - All ERC20/ETH movements go through Solady's `SafeTransferLib`.
 - OpenZeppelin's `IERC20Metadata` is the router's single ERC-20 read
   interface (`totalSupply`, `balanceOf`, `allowance`, `decimals`) —
