@@ -54,14 +54,14 @@ A = a / (1 + λ · D)                    local amplification: a at the anchor, �
 
 with the variables:
 
-| Symbol       | Meaning                                                                                   |
-| ------------ | ----------------------------------------------------------------------------------------- |
-| `x`, `y`     | reserves in math space (base units)                                                       |
-| `priceScale` | anchor price; moved by the re-anchoring, immutable during a swap                          |
-| `D`          | how far the current reserves sit from the anchor (relative squared imbalance)             |
-| `A`          | how "stable-swap" the curve is at the current state, between `a` and 0                    |
-| `a`          | **depth-at-anchor knob**, `0.1 ≤ a < 1`: the amplification the pool has when balanced     |
-| `λ`          | **plateau-width knob**, `1e-6 ≤ λ ≤ 1`: how fast `A` decays with imbalance (`A = a/2` at `λ·D = 1`) |
+| Symbol       | Meaning                                                                                                                                    |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `x`, `y`     | reserves in math space (base units)                                                                                                        |
+| `priceScale` | anchor price; moved by the re-anchoring, immutable during a swap                                                                           |
+| `D`          | how far the current reserves sit from the anchor (relative squared imbalance)                                                              |
+| `A`          | how "stable-swap" the curve is at the current state, between `a` and 0                                                                     |
+| `a`          | **depth-at-anchor knob**, `0.1 ≤ a < 1`: the amplification the pool has when balanced                                                      |
+| `λ`          | **plateau-width knob**, `1e-6 ≤ λ ≤ 1`: how fast `A` decays with imbalance (`A = a/2` at `λ·D = 1`)                                        |
 | `L`          | balance-equivalent depth: the reserve per side the pool would hold if it were exactly balanced with the same `K` (`K = L²` at `x = y = L`) |
 
 The invariant is one smooth blend of two familiar curves. The
@@ -319,19 +319,19 @@ Once the dashboard is up, open <http://127.0.0.1:3100> in your browser.
 
 The full-featured standalone simulator (a desktop application built on the
 same kernel) is distributed as prebuilt releases at
-<https://github.com/RealWagmi/equilibra-simulator-releases>. Download it
+<https://github.com/RealWagmi/equilibra-simulator-releases/releases>. Download it
 there if you want the complete simulator without building the Rust crate
 from this repository.
 
 Optional environment variables:
 
-| Variable                        | Default          | Effect                                               |
-| ------------------------------- | ---------------- | ---------------------------------------------------- |
-| `BENCHMARK_APP_HOST`            | `127.0.0.1`      | Bind host                                            |
-| `BENCHMARK_APP_PORT`            | `3100`           | Bind port                                            |
-| `BENCHMARK_APP_PORT_TRIES`      | `20`             | Adjacent ports to try if the first is busy           |
-| `BENCHMARK_MAX_CONCURRENT_RUNS` | `1`              | How many simulation runs may execute in parallel     |
-| `BENCHMARK_ORACLE_DATA_DIR`     | `simulator/data` | Shared source feed; digested (never copied) per run  |
+| Variable                        | Default          | Effect                                              |
+| ------------------------------- | ---------------- | --------------------------------------------------- |
+| `BENCHMARK_APP_HOST`            | `127.0.0.1`      | Bind host                                           |
+| `BENCHMARK_APP_PORT`            | `3100`           | Bind port                                           |
+| `BENCHMARK_APP_PORT_TRIES`      | `20`             | Adjacent ports to try if the first is busy          |
+| `BENCHMARK_MAX_CONCURRENT_RUNS` | `1`              | How many simulation runs may execute in parallel    |
+| `BENCHMARK_ORACLE_DATA_DIR`     | `simulator/data` | Shared source feed; digested (never copied) per run |
 
 Direct simulator binary (without the dashboard) is also available:
 
